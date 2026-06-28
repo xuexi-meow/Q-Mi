@@ -1,0 +1,9 @@
+bot:
+  qq_number: 0
+  admin_number:
+    - 1234
+netsetting:
+  host: "0.0.0.0"
+  port: 10101
+  token: ""
+  pattern: "/Q-Mi"

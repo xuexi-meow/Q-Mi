@@ -2,9 +2,7 @@ package server
 
 import (
 	"Q-Mi/app"
-	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"strconv"
 
@@ -42,15 +40,13 @@ func handleHttp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bodyBytes, err := io.ReadAll(r.Body)
-	body := io.NopCloser(bytes.NewReader(bodyBytes))
-	var data event.MainEvent
-	err = json.NewDecoder(body).Decode(&data)
-	if err != nil {
-		slog.Error("解析请求失败:", err)
+	if err != nil {}
+	
+	data := event.BaseEvent{
+		RawInfo: bodyBytes,
 	}
-	
-	fmt.Printf("%+v\n", data)
-	
-	slog.Info("（测试用）收到请求", "method", r.Method, "url", r.URL.String(), "消息本体", string(bodyBytes))
 
+	dataHandler := event.MainEvent{}
+	json.Unmarshal(bodyBytes, dataHandler)
+	dataHandler.EventHandle(data)
 }

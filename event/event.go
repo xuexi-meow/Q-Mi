@@ -4,12 +4,13 @@ import (
 	"Q-Mi/event/file"
 	"Q-Mi/event/message"
 	"Q-Mi/event/user"
-	"encoding/json"
 )
 
-var messageEventProcess = make(map[MessageType]EventProcess)
-var noticeEventProcess = make(map[NoticeType]EventProcess)
-var eventProcess = make(map[EventType]EventProcess)
+// ============================================================
+// 本文件只放事件类型常量与结构体定义(纯数据)。
+// 事件处理逻辑统一放在 Q-Mi/handler 包,通过 Register / RegisterTyped 注册。
+// 新增事件:在这里定义结构体,再到 handler 包加一行注册。
+// ============================================================
 
 type MessageType string
 
@@ -43,347 +44,6 @@ const (
 	BotOffline        NoticeType = "bot_offline"
 )
 
-func init() {
-	eventProcess[EventTypeMessage] = &MessageEvent{}
-	eventProcess[EventTypeMessageSent] = &MessageEvent{}
-	eventProcess[EventTypeNotice] = &NoticeEvent{}
-	eventProcess[EventTypeRequest] = &RequsetEvent{}
-	eventProcess[EventTypeMeta] = &OB11BaseMetaEvent{}
-
-	messageEventProcess[PrivateMessage] = &PrivateMessageEvent{}
-	messageEventProcess[GroupMessage] = &GroupMessageEvent{}
-
-	noticeEventProcess[GroupUpload] = &GroupUploadEvent{}
-	noticeEventProcess[GroupAdmin] = &GroupAdminEvent{}
-	noticeEventProcess[GroupDecrease] = &GroupDecreaseEvent{}
-	noticeEventProcess[GroupIncrease] = &GroupIncreaseEvent{}
-	noticeEventProcess[GroupBan] = &GroupBanEvent{}
-	noticeEventProcess[FriendAdd] = &FriendAddEvent{}
-	noticeEventProcess[GroupRecall] = &GroupRecallEvent{}
-	noticeEventProcess[FriendRecall] = &FriendRecallEvent{}
-	noticeEventProcess[GroupCard] = &GroupCardEvent{}
-	noticeEventProcess[GroupMsgEmojiLike] = &GroupMsgEmojiLikeEvent{}
-	noticeEventProcess[GroupEssence] = &GroupEssenceEvent{}
-	noticeEventProcess[BotOffline] = &BotOfflineEvent{}
-	noticeEventProcess[Notify] = &WhyNoticeEvent{}
-}
-
-type BaseEvent struct {
-	RawInfo json.RawMessage `json:"Raw_info"`
-}
-
-type MainEvent struct {
-	Time     float64   `json:"time"`
-	PostType EventType `json:"post_type"`
-	SelfID   int       `json:"self_id"`
-}
-
-type EventProcess interface {
-	EventHandle(data BaseEvent)
-}
-
-func (e *MainEvent) EventHandle(data BaseEvent) {
-	json.Unmarshal(data.RawInfo, &e)
-
-	if handler, ok := eventProcess[e.PostType]; ok {
-		handler.EventHandle(data)
-	}
-}
-
-type MessageEvent struct {
-	MainEvent
-	MessageType MessageType `json:"message_type"`
-}
-
-func (e *MessageEvent) EventHandle(data BaseEvent) {
-	if handler, ok := messageEventProcess[e.MessageType]; ok {
-		handler.EventHandle(data)
-	}
-}
-
-type PrivateMessageEvent struct {
-	MessageEvent
-	SubType    string             `json:"sub_type"`
-	MessageID  int                `json:"message_id"`
-	UserID     int                `json:"user_id"`
-	Message    *message.Message   `json:"message"`
-	RawMessage string             `json:"raw_message"`
-	Font       int                `json:"font"`
-	Sender     *user.FriendSender `json:"sender"`
-	SelfID     int                `json:"self_id"`
-}
-
-func (e *PrivateMessageEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupMessageEvent struct {
-	MessageEvent
-	SubType    string            `json:"sub_type"`
-	MessageID  int               `json:"message_id"`
-	GroupID    int               `json:"group_id"`
-	UserID     int               `json:"user_id"`
-	Message    *message.Message  `json:"message"`
-	RawMessage string            `json:"raw_message"`
-	Font       int               `json:"font"`
-	Sender     *user.GroupSender `json:"sender"`
-	SelfID     int               `json:"self_id"`
-}
-
-func (e *GroupMessageEvent) EventHandle(data BaseEvent) {
-
-}
-
-type NoticeEvent struct {
-	MainEvent
-	NoticeType string `json:"notice_type"`
-}
-
-func (e *NoticeEvent) EventHandle(data BaseEvent) {
-	if handler, ok := noticeEventProcess[NoticeType(e.NoticeType)]; ok {
-		handler.EventHandle(data)
-	}
-}
-
-type WhyNoticeEvent struct {
-	NoticeEvent
-	SubType string `json:"sub_type"`
-}
-
-func (e *WhyNoticeEvent) EventHandle(data BaseEvent) {
-	if handler, ok := noticeEventProcess[NoticeType(e.SubType)]; ok {
-		handler.EventHandle(data)
-	}
-}
-
-type GroupUploadEvent struct {
-	NoticeEvent
-	GroupID int       `json:"group_id"`
-	UserID  int       `json:"user_id"`
-	File    file.File `json:"file"`
-}
-
-func (e *GroupUploadEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupAdminEvent struct {
-	NoticeEvent
-	SubType string `json:"sub_type"`
-	GroupID int    `json:"group_id"`
-	UserID  int    `json:"user_id"`
-}
-
-func (e *GroupAdminEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupDecreaseEvent struct {
-	NoticeEvent
-	SubType    string `json:"sub_type"`
-	GroupID    int    `json:"group_id"`
-	OperatorID int    `json:"operator_id"`
-	UserID     int    `json:"user_id"`
-}
-
-func (e *GroupDecreaseEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupIncreaseEvent struct {
-	NoticeEvent
-	SubType    string `json:"sub_type"`
-	GroupID    int    `json:"group_id"`
-	OperatorID int    `json:"operator_id"`
-	UserID     int    `json:"user_id"`
-}
-
-func (e *GroupIncreaseEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupBanEvent struct {
-	NoticeEvent
-	SubType    string `json:"sub_type"`
-	GroupID    int    `json:"group_id"`
-	OperatorID int    `json:"operator_id"`
-	UserID     int    `json:"user_id"`
-	Duration   int    `json:"duration"`
-}
-
-func (e *GroupBanEvent) EventHandle(data BaseEvent) {
-
-}
-
-type FriendAddEvent struct {
-	NoticeEvent
-	UserID int `json:"user_id"`
-}
-
-func (e *FriendAddEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupRecallEvent struct {
-	NoticeEvent
-	GroupID    int `json:"group_id"`
-	UserID     int `json:"user_id"`
-	OperatorID int `json:"operator_id"`
-	MessageID  int `json:"message_id"`
-}
-
-func (e *GroupRecallEvent) EventHandle(data BaseEvent) {
-
-}
-
-type FriendRecallEvent struct {
-	NoticeEvent
-	UserID    int `json:"user_id"`
-	MessageID int `json:"message_id"`
-}
-
-func (e *FriendRecallEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupCardEvent struct {
-	NoticeEvent
-	GroupID int    `json:"group_id"`
-	UserID  int    `json:"user_id"`
-	CardNew string `json:"card_new"`
-	CardOld string `json:"card_old"`
-}
-
-func (e *GroupCardEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupNameEvent struct {
-	WhyNoticeEvent
-	GroupID int    `json:"group_id"`
-	UserID  int    `json:"user_id"`
-	NameNew string `json:"name_new"`
-}
-
-func (e *GroupNameEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupTitleEvent struct {
-	WhyNoticeEvent
-	GroupID int    `json:"group_id"`
-	UserID  int    `json:"user_id"`
-	Title   string `json:"title"`
-}
-
-func (e *GroupTitleEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupEssenceEvent struct {
-	NoticeEvent
-	MessageID  int    `json:"message_id"`
-	GroupID    int    `json:"group_id"`
-	UserID     int    `json:"user_id"`
-	OperatorID int    `json:"operator_id"`
-	SubType    string `json:"sub_type"`
-	SenderID   int    `json:"sender_id"`
-}
-
-func (e *GroupEssenceEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupGrayTipEvent struct {
-	WhyNoticeEvent
-	GroupID   int    `json:"group_id"`
-	UserID    int    `json:"user_id"`
-	MessageID int    `json:"message_id"`
-	BusiID    string `json:"busi_id"`
-	Content   string `json:"content"`
-	RawInfo   any    `json:"raw_info"`
-}
-
-func (e *GroupGrayTipEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupMsgEmojiLikeEvent struct {
-	NoticeEvent
-	GroupID   int                    `json:"group_id"`
-	UserID    int                    `json:"user_id"`
-	MessageID int                    `json:"message_id"`
-	Likes     []message.MsgEmojiLike `json:"likes"`
-}
-
-func (e *GroupMsgEmojiLikeEvent) EventHandle(data BaseEvent) {
-
-}
-
-type PokeEvent struct {
-	WhyNoticeEvent
-	TargetID int `json:"target_id"`
-	UserID   int `json:"user_id"`
-}
-
-func (e *PokeEvent) EventHandle(data BaseEvent) {
-
-}
-
-type FriendPokeEvent struct {
-	PokeEvent
-	SenderID int `json:"sender_id"`
-	RawInfo  any `json:"raw_info"`
-}
-
-func (e *FriendPokeEvent) EventHandle(data BaseEvent) {
-
-}
-
-type GroupPokeEvent struct {
-	PokeEvent
-	GroupID int `json:"group_id"`
-	RawInfo any `json:"raw_info"`
-}
-
-func (e *GroupPokeEvent) EventHandle(data BaseEvent) {
-
-}
-
-type ProfileLikeEvent struct {
-	WhyNoticeEvent
-	OperatorID   int    `json:"operator_id"`
-	OperatorNick string `json:"operator_nick"`
-	Times        int    `json:"times"`
-	Time         int    `json:"time"`
-}
-
-func (e *ProfileLikeEvent) EventHandle(data BaseEvent) {
-
-}
-
-type InputStatusEvent struct {
-	WhyNoticeEvent
-	UserID    int    `json:"user_id"`
-	EventType string `json:"event_type"`
-	Status    string `json:"status"`
-}
-
-func (e *InputStatusEvent) EventHandle(data BaseEvent) {
-
-}
-
-type BotOfflineEvent struct {
-	NoticeEvent
-	UserID  int    `json:"user_id"`
-	Tag     string `json:"tag"`
-	Message string `json:"message"`
-}
-
-func (e *BotOfflineEvent) EventHandle(data BaseEvent) {
-
-}
-
 type EventType string
 
 const (
@@ -402,35 +62,279 @@ const (
 	LifeCycleSubTypeConnect LifeCycleSubType = "connect"
 )
 
-type HeartbeatStatus struct {
-	Online bool `json:"online"`
-	Good   bool `json:"good"`
+// ============================================================
+// 事件结构体定义(纯数据,json 反序列化用)
+// ============================================================
+
+// MainEvent 事件公共字段,嵌入到所有具体事件中
+type MainEvent struct {
+	Time     float64   `json:"time"`
+	PostType EventType `json:"post_type"`
+	SelfID   int       `json:"self_id"`
 }
 
+// MessageEvent 消息事件公共字段
+type MessageEvent struct {
+	MainEvent
+	MessageType MessageType `json:"message_type"`
+}
+
+// 私聊消息
+type PrivateMessageEvent struct {
+	MessageEvent
+	SubType    string             `json:"sub_type"`
+	MessageID  int                `json:"message_id"`
+	UserID     int                `json:"user_id"`
+	Message    []*message.Message `json:"message"`
+	RawMessage string             `json:"raw_message"`
+	Font       int                `json:"font"`
+	Sender     *user.FriendSender `json:"sender"`
+	SelfID     int                `json:"self_id"`
+}
+
+// 群聊消息
+type GroupMessageEvent struct {
+	MessageEvent
+	SubType    string             `json:"sub_type"`
+	MessageID  int                `json:"message_id"`
+	GroupID    int                `json:"group_id"`
+	UserID     int                `json:"user_id"`
+	Message    []*message.Message `json:"message"`
+	RawMessage string             `json:"raw_message"`
+	Font       int                `json:"font"`
+	Sender     *user.GroupSender  `json:"sender"`
+	SelfID     int                `json:"self_id"`
+}
+
+// MessageSentEvent 机器人自己发出的消息(message_sent)。
+// 注意:发出消息的 user_id 是机器人自身,target_id 是对方(好友 QQ 或群号)。
+// 字段以 NapCat 实际上报为准,接入后先打一条日志核对。
+type MessageSentEvent struct {
+	MessageEvent
+	SubType    string             `json:"sub_type"`
+	MessageID  int                `json:"message_id"`
+	UserID     int                `json:"user_id"`
+	GroupID    int                `json:"group_id"`
+	TargetID   int                `json:"target_id"`
+	Message    []*message.Message `json:"message"`
+	RawMessage string             `json:"raw_message"`
+}
+
+func (e *PrivateMessageEvent) Messages() []*message.Message {
+	return e.Message
+}
+
+func (e *GroupMessageEvent) Messages() []*message.Message {
+	return e.Message
+}
+
+// NoticeEvent 通知事件公共字段
+type NoticeEvent struct {
+	MainEvent
+	NoticeType string `json:"notice_type"`
+}
+
+// WhyNoticeEvent notify 类通知公共字段，notice_type=notify，靠 sub_type 区分。
+// 未知含义，不知道为啥要单独分出来，严重怀疑是QQ的石山代码遗留，所以我给它加了个Why以表示我的疑惑
+type WhyNoticeEvent struct {
+	NoticeEvent
+	SubType string `json:"sub_type"`
+}
+
+// 群文件上传
+type GroupUploadEvent struct {
+	NoticeEvent
+	GroupID int       `json:"group_id"`
+	UserID  int       `json:"user_id"`
+	File    file.File `json:"file"`
+}
+
+// 群管理员变动
+type GroupAdminEvent struct {
+	NoticeEvent
+	SubType string `json:"sub_type"`
+	GroupID int    `json:"group_id"`
+	UserID  int    `json:"user_id"`
+}
+
+// 群成员减少
+type GroupDecreaseEvent struct {
+	NoticeEvent
+	SubType    string `json:"sub_type"`
+	GroupID    int    `json:"group_id"`
+	OperatorID int    `json:"operator_id"`
+	UserID     int    `json:"user_id"`
+}
+
+// 群成员增加
+type GroupIncreaseEvent struct {
+	NoticeEvent
+	SubType    string `json:"sub_type"`
+	GroupID    int    `json:"group_id"`
+	OperatorID int    `json:"operator_id"`
+	UserID     int    `json:"user_id"`
+}
+
+// 群禁言
+type GroupBanEvent struct {
+	NoticeEvent
+	SubType    string `json:"sub_type"`
+	GroupID    int    `json:"group_id"`
+	OperatorID int    `json:"operator_id"`
+	UserID     int    `json:"user_id"`
+	Duration   int    `json:"duration"`
+}
+
+// 好友添加
+type FriendAddEvent struct {
+	NoticeEvent
+	UserID int `json:"user_id"`
+}
+
+// 群消息撤回
+type GroupRecallEvent struct {
+	NoticeEvent
+	GroupID    int `json:"group_id"`
+	UserID     int `json:"user_id"`
+	OperatorID int `json:"operator_id"`
+	MessageID  int `json:"message_id"`
+}
+
+// 好友消息撤回
+type FriendRecallEvent struct {
+	NoticeEvent
+	UserID    int `json:"user_id"`
+	MessageID int `json:"message_id"`
+}
+
+// 群名片变更
+type GroupCardEvent struct {
+	NoticeEvent
+	GroupID int    `json:"group_id"`
+	UserID  int    `json:"user_id"`
+	CardNew string `json:"card_new"`
+	CardOld string `json:"card_old"`
+}
+
+// 群名变更(notify)
+type GroupNameEvent struct {
+	WhyNoticeEvent
+	GroupID int    `json:"group_id"`
+	UserID  int    `json:"user_id"`
+	NameNew string `json:"name_new"`
+}
+
+// 群头衔变更(notify)
+type GroupTitleEvent struct {
+	WhyNoticeEvent
+	GroupID int    `json:"group_id"`
+	UserID  int    `json:"user_id"`
+	Title   string `json:"title"`
+}
+
+// 群精华消息
+type GroupEssenceEvent struct {
+	NoticeEvent
+	MessageID  int    `json:"message_id"`
+	GroupID    int    `json:"group_id"`
+	UserID     int    `json:"user_id"`
+	OperatorID int    `json:"operator_id"`
+	SubType    string `json:"sub_type"`
+	SenderID   int    `json:"sender_id"`
+}
+
+// 群灰条消息
+type GroupGrayTipEvent struct {
+	WhyNoticeEvent
+	GroupID   int    `json:"group_id"`
+	UserID    int    `json:"user_id"`
+	MessageID int    `json:"message_id"`
+	BusiID    string `json:"busi_id"`
+	Content   string `json:"content"`
+	RawInfo   any    `json:"raw_info"`
+}
+
+// 表情回应通知
+type GroupMsgEmojiLikeEvent struct {
+	NoticeEvent
+	GroupID   int                     `json:"group_id"`
+	UserID    int                     `json:"user_id"`
+	MessageID int                     `json:"message_id"`
+	Likes     []*message.MsgEmojiLike `json:"likes"`
+}
+
+// 戳一戳(notify),具体是群戳还是好友戳看原始数据里有没有 group_id / sender_id
+type PokeEvent struct {
+	WhyNoticeEvent
+	TargetID int `json:"target_id"`
+	UserID   int `json:"user_id"`
+	RawInfo  any `json:"raw_info"`
+}
+
+// 好友戳一戳
+type FriendPokeEvent struct {
+	PokeEvent
+	SenderID int `json:"sender_id"`
+	RawInfo  any `json:"raw_info"`
+}
+
+// 群戳一戳
+type GroupPokeEvent struct {
+	PokeEvent
+	GroupID int `json:"group_id"`
+	RawInfo any `json:"raw_info"`
+}
+
+// 个人资料点赞(notify)
+type ProfileLikeEvent struct {
+	WhyNoticeEvent
+	OperatorID   int    `json:"operator_id"`
+	OperatorNick string `json:"operator_nick"`
+	Times        int    `json:"times"`
+	Time         int    `json:"time"`
+}
+
+// 输入状态(notify)
+type InputStatusEvent struct {
+	WhyNoticeEvent
+	UserID     int    `json:"user_id"`
+	EventType  int    `json:"event_type"`
+	StatusText string `json:"status_text"`
+}
+
+// 机器人离线
+type BotOfflineEvent struct {
+	NoticeEvent
+	UserID  int    `json:"user_id"`
+	Tag     string `json:"tag"`
+	Message string `json:"message"`
+}
+
+// 元事件公共字段
 type OB11BaseMetaEvent struct {
 	MainEvent
 	MetaEventType string `json:"meta_event_type"`
 }
 
+// 心跳
 type OB11HeartbeatEvent struct {
 	OB11BaseMetaEvent
 	Status   HeartbeatStatus `json:"status"`
 	Interval int             `json:"interval"`
 }
 
-func (e *OB11HeartbeatEvent) EventHandle(data BaseEvent) {
-
+type HeartbeatStatus struct {
+	Online bool `json:"online"`
+	Good   bool `json:"good"`
 }
 
+// 生命周期
 type OB11LifeCycleEvent struct {
 	OB11BaseMetaEvent
 	SubType LifeCycleSubType `json:"sub_type"`
 }
 
-func (e *OB11LifeCycleEvent) EventHandle(data BaseEvent) {
-
-}
-
+// 请求事件公共字段
 type RequsetEvent struct {
 	MainEvent
 	RequestType string `json:"request_type"`
@@ -438,26 +342,16 @@ type RequsetEvent struct {
 	Flag        string `json:"flag"`
 }
 
-func (r *RequsetEvent) EventHandle(data BaseEvent) {
-
-}
-
+// 好友请求
 type OB11FriendRequestEvent struct {
 	RequsetEvent
 	Comment string `json:"comment"`
 }
 
-func (f *OB11FriendRequestEvent) EventHandle(data BaseEvent) {
-
-}
-
+// 群请求
 type OB11GroupRequestEvent struct {
 	RequsetEvent
 	GroupID int    `json:"group_id"`
 	Comment string `json:"comment"`
 	SubType string `json:"sub_type"`
-}
-
-func (g *OB11GroupRequestEvent) EventHandle(data BaseEvent) {
-
 }

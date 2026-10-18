@@ -4,10 +4,18 @@ import (
 	"Q-Mi/app"
 	"Q-Mi/core"
 	"Q-Mi/core/server"
+	"Q-Mi/storage"
 	"Q-Mi/utils/log"
+	"Q-Mi/utils/request"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+
+	// 注册所有事件处理函数(handler 包的 init 里调用 event.Register)
+	_ "Q-Mi/handler"
 )
 
 func main() {
@@ -18,6 +26,25 @@ func main() {
 
 	appInstance := app.GetApp()
 
+	// 初始化 NapCat API 客户端(失败只告警,收事件不受影响,只是发不出消息)
+	if err := request.Init(appInstance.Config.Napcat); err != nil {
+		slog.Warn("NapCat API 客户端初始化失败,无法发送消息", "err", err)
+	}
+
+	// 打开消息记忆库(失败只告警,本次运行不落库)
+	if appInstance.Config.Storage != nil && appInstance.Config.Storage.Enable {
+		st, err := storage.Open(appInstance.Config.Storage.Path)
+		if err != nil {
+			slog.Warn("记忆库打开失败,本次运行不落库", "err", err)
+		} else {
+			appInstance.Store = st
+			defer st.Close()
+			slog.Info("记忆库已就绪", "path", appInstance.Config.Storage.Path)
+		}
+	}
+
+	slog.Info("准备启动服务器")
+
 	c := &core.Core{
 		Server: &server.Server{
 			Port:    appInstance.Config.NetSetting.Port,
@@ -25,5 +52,13 @@ func main() {
 			Pattern: appInstance.Config.NetSetting.Pattern,
 		},
 	}
+
+	slog.Info("服务器配置完成，正在启动服务器...")
 	c.StartCore()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	<-ctx.Done()
+	slog.Info("收到退出信号，正在关闭程序...")
 }

@@ -4,6 +4,18 @@ bot:
     - 1234
 netsetting:
   host: "0.0.0.0"
-  port: 10101
+  port: 9090
   token: ""
   pattern: "/Q-Mi"
+napcat:
+  ws:
+    enable: false
+    host: "127.0.0.1"
+    port: 8080
+  http:
+    enable: true
+    host: "127.0.0.1"
+    port: 8080
+storage:
+  enable: true
+  path: "Q-Mi.db"

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"Q-Mi/storage"
 	"Q-Mi/utils/config"
 	"sync"
 )
@@ -12,6 +13,7 @@ var (
 
 type App struct {
 	Config *config.Config
+	Store  *storage.Store // nil 表示记忆库未启用
 }
 
 func makeConfig() *config.Config {

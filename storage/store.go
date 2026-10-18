@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // MessageRecord messages 表的一行
@@ -38,7 +39,66 @@ ON CONFLICT(message_id) DO UPDATE SET
 	if err != nil {
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
+	// 同步 FTS 索引(按字分词);先删旧行以支持同 id 覆盖(upsert)
+	if _, err := s.db.Exec("DELETE FROM messages_fts WHERE rowid = ?", r.MessageID); err != nil {
+		return fmt.Errorf("清理 FTS 索引失败: %w", err)
+	}
+	if _, err := s.db.Exec("INSERT INTO messages_fts(rowid, raw_message) VALUES (?, ?)",
+		r.MessageID, ftsIndex(r.RawMessage)); err != nil {
+		return fmt.Errorf("写入 FTS 索引失败: %w", err)
+	}
 	return nil
+}
+
+// ftsIndex 把文本转成按字分词的索引文本:非 ASCII 字符(中文等)两两之间插空格,
+// 使 FTS5 unicode61 分词器按单字建索引;连续 ASCII 字母数字保持完整(英文单词不拆)。
+func ftsIndex(s string) string {
+	var b strings.Builder
+	prevASCIIToken := false
+	for _, r := range s {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) { // 分隔符不入索引
+			prevASCIIToken = false
+			continue
+		}
+		asciiToken := r < 128
+		if b.Len() > 0 && !(prevASCIIToken && asciiToken) {
+			b.WriteByte(' ')
+		}
+		b.WriteRune(r)
+		prevASCIIToken = asciiToken
+	}
+	return b.String()
+}
+
+// ftsQuery 把用户查询转成 FTS5 短语序列:中文按单字、ASCII 连续字母数字为一个词,
+// 每项加引号(顺带规避 FTS 语法注入);多项之间为 AND 语义。
+func ftsQuery(query string) string {
+	var terms []string
+	var run strings.Builder
+	flush := func() {
+		if run.Len() > 0 {
+			terms = append(terms, run.String())
+			run.Reset()
+		}
+	}
+	for _, r := range query {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) { // 与索引侧一致,分隔符丢弃
+			flush()
+			continue
+		}
+		if r < 128 {
+			run.WriteRune(r)
+		} else {
+			flush()
+			terms = append(terms, string(r))
+		}
+	}
+	flush()
+	quoted := make([]string, len(terms))
+	for i, t := range terms {
+		quoted[i] = `"` + t + `"`
+	}
+	return strings.Join(quoted, " ")
 }
 
 func (s *Store) GetMessage(id int64) (*MessageRecord, error) {
@@ -130,6 +190,59 @@ func (s *Store) QueryMessages(f MessageFilter) ([]*MessageRecord, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// SearchMessages FTS5 全文搜索,按时间倒序。
+// 中文按字索引(见 ftsIndex),查询经 ftsQuery 转成短语序列后匹配。
+func (s *Store) SearchMessages(query string, limit int) ([]*MessageRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	q := ftsQuery(query)
+	if q == "" {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`
+SELECT m.message_id, m.direction, m.chat_type, m.chat_id, m.user_id,
+       m.raw_message, m.segments, m.time, m.recalled
+FROM messages_fts f JOIN messages m ON m.message_id = f.rowid
+WHERE messages_fts MATCH ?
+ORDER BY m.time DESC LIMIT ?`, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("搜索消息失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*MessageRecord
+	for rows.Next() {
+		r, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("扫描搜索结果失败: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// NoticeRecord notices 表的一行
+type NoticeRecord struct {
+	NoticeType string
+	SubType    string
+	ChatID     int64
+	UserID     int64
+	Raw        []byte
+	Time       float64
+}
+
+func (s *Store) PutNotice(n *NoticeRecord) error {
+	_, err := s.db.Exec(`
+INSERT INTO notices (notice_type, sub_type, chat_id, user_id, raw, time)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		n.NoticeType, n.SubType, n.ChatID, n.UserID, string(n.Raw), n.Time)
+	if err != nil {
+		return fmt.Errorf("写入通知失败: %w", err)
+	}
+	return nil
 }
 
 // MarkRecalled 撤回只打标记不删行,重复标记幂等

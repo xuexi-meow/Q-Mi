@@ -34,15 +34,12 @@ CREATE TABLE IF NOT EXISTS notices (
     time        REAL NOT NULL
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-    USING fts5(raw_message, content='messages', content_rowid='message_id');
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, raw_message) VALUES (new.message_id, new.raw_message);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, raw_message)
-    VALUES ('delete', old.message_id, old.raw_message);
-END;
+-- FTS5 独立表:索引内容由 PutMessage 在 Go 侧按字分词后写入
+-- (unicode61 分词器会把连续 CJK 当成单个 token,无法子串匹配,
+--  触发器又做不了按字拆分,故弃用 content 表 + 触发器方案)
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(raw_message);
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
 `
 
 type Store struct {

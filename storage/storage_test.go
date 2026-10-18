@@ -193,6 +193,39 @@ func TestMarkRecalled(t *testing.T) {
 	}
 }
 
+func TestSearchMessages(t *testing.T) {
+	s := openTestStore(t)
+	seedMessages(t, s)
+
+	got, err := s.SearchMessages("火锅", 0)
+	if err != nil {
+		t.Fatalf("SearchMessages: %v", err)
+	}
+	if len(got) != 1 || got[0].MessageID != 3 {
+		t.Errorf("搜索结果错误: %+v", ids(got))
+	}
+
+	got, err = s.SearchMessages("不存在的词xyz", 0)
+	if err != nil || len(got) != 0 {
+		t.Errorf("未命中应返回空: %v, %+v", err, ids(got))
+	}
+}
+
+func TestPutNotice(t *testing.T) {
+	s := openTestStore(t)
+	err := s.PutNotice(&NoticeRecord{
+		NoticeType: "notify", SubType: "poke",
+		ChatID: 100, UserID: 11, Raw: []byte(`{"post_type":"notice"}`), Time: 1729200000,
+	})
+	if err != nil {
+		t.Fatalf("PutNotice: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM notices WHERE notice_type = 'notify'").Scan(&n); err != nil || n != 1 {
+		t.Errorf("notice 落库异常: count = %d, err = %v", n, err)
+	}
+}
+
 func ids(rs []*MessageRecord) []int64 {
 	out := make([]int64, len(rs))
 	for i, r := range rs {

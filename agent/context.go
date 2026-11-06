@@ -292,12 +292,18 @@ func imagePart(url string) ContentPart {
 
 // multimodalContent 把行文本与图片 URL 组装成 OpenAI 多模态内容数组：
 // 首项为文本，其后每个 URL 一项 image_url。URL 先经 imageCache 尝试本地
-// 下载转 base64 data URL（P3-3），失败回退原 URL。
+// 下载转 base64 data URL（P3-3）；下载失败的图片直接剔除（文本行已带
+// [图片] 标注）——QQ 旧链接 rkey 过期后原 URL 必然 400，回传会拖垮整个
+// 请求（P3-3 修复前实测）。
 func (b *DefaultBuilder) multimodalContent(text string, urls []string) []ContentPart {
 	parts := make([]ContentPart, 0, len(urls)+1)
 	parts = append(parts, ContentPart{Type: "text", Text: text})
 	for _, u := range urls {
-		parts = append(parts, imagePart(b.images.dataURL(u)))
+		du := b.images.dataURL(u)
+		if du == u { // data URL 与原 URL 永不相等，相等即下载失败
+			continue
+		}
+		parts = append(parts, imagePart(du))
 	}
 	return parts
 }

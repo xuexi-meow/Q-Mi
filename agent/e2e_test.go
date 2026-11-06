@@ -250,10 +250,13 @@ func TestEndToEndGroupImageMessageMultimodal(t *testing.T) {
 	})
 	resetTestState()
 
-	// P3-3：builder 会先尝试本地下载该图片再发给 LLM。指向本机未监听端口
-	// （立即连接拒绝），确定性走"下载失败→回退原 URL"路径，避免测试期间
-	// 访问真实腾讯多媒体域名。
-	const imgURL = "http://127.0.0.1:1/download?appid=1407&fileid=abc"
+	// P3-3：builder 会先本地下载图片转 base64 data URL。本地起一个返回真实
+	// PNG 魔数的图床，断言 LLM 收到 data: 前缀（不访问真实腾讯多媒体域名）。
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("\x89PNG\r\n\x1a\npng-bytes"))
+	}))
+	t.Cleanup(imgSrv.Close)
+	imgURL := imgSrv.URL + "/download?appid=1407&fileid=abc"
 	imgMsg := `{
 		"post_type":"message","message_type":"group","sub_type":"normal",
 		"message_id":1,"group_id":888,"user_id":12345,"self_id":999,
@@ -297,8 +300,8 @@ func TestEndToEndGroupImageMessageMultimodal(t *testing.T) {
 			gotURL, _ = iu["url"].(string)
 		}
 	}
-	if gotURL != imgURL {
-		t.Errorf("image_url = %q, want %q", gotURL, imgURL)
+	if !strings.HasPrefix(gotURL, "data:image/png;base64,") {
+		t.Errorf("image_url = %q, want data:image/png;base64 前缀（本地下载转 base64）", gotURL)
 	}
 	// 回复照常发出
 	if got := sentTextAt(t, napcat.body(0)); got != "图收到了" {

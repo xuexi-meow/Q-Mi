@@ -852,9 +852,9 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 	}
 }
 
-// TestBuildHistoryImageRowFallsBackWhenDownloadFails 图片下载失败（500）时，
-// 带图历史行仍为多模态数组，image_url 部分回退为原始 URL（不拒绝整个请求）。
-func TestBuildHistoryImageRowFallsBackWhenDownloadFails(t *testing.T) {
+// TestBuildHistoryImageRowDropsFailedImage 图片下载失败（500）时，image_url
+// 部分被剔除、仅剩文本行（P3-3 修订：死链回传会拖垮整个请求，绝不回传原 URL）。
+func TestBuildHistoryImageRowDropsFailedImage(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
@@ -883,16 +883,80 @@ func TestBuildHistoryImageRowFallsBackWhenDownloadFails(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("应返回 system+1 条历史, got %d: %+v", len(msgs), msgs)
 	}
-	gotParts, ok := msgs[1].Content.([]ContentPart)
-	if !ok {
-		t.Fatalf("带图历史行 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
-	}
-	if len(gotParts) != 2 || gotParts[1].ImageURL == nil {
-		t.Fatalf("content 应含 1 个 image_url 部分: %#v", gotParts)
-	}
-	if got := gotParts[1].ImageURL.URL; got != imgURL {
-		t.Errorf("下载失败应回退原 url, got %q", got)
+	if gotParts, ok := msgs[1].Content.([]ContentPart); ok {
+		for _, p := range gotParts {
+			if p.Type == "image_url" {
+				t.Errorf("下载失败的图片应被剔除, got image_url: %#v", p)
+			}
+		}
+		if len(gotParts) != 1 || gotParts[0].Type != "text" {
+			t.Fatalf("剔除后应仅剩文本部分: %#v", gotParts)
+		}
+	} else if str, isStr := msgs[1].Content.(string); isStr && !strings.Contains(str, "[图片]") {
+		t.Errorf("剔除后文本应保留 [图片] 标注: %q", str)
 	}
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestMultimodalDropsFailedImages 图片下载失败时该 image_url 部分应被剔除
+// （保留文本行），绝不能把注定加载失败的原始 URL 交给提供商——否则整个请求
+// 被 400 拒绝。混合场景：成功的图保留，失败的图剔除。
+func TestMultimodalDropsFailedImages(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if strings.HasPrefix(r.URL.Path, "/bad") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// 真实 PNG 魔数（嗅探器要求）
+		w.Write([]byte("\x89PNG\r\n\x1a\npng-bytes"))
+	}))
+	defer srv.Close()
+
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+	b := NewDefaultBuilder(s, cfg)
+	b.multimodal = true
+	b.images = newImageCacheWithClient(srv.Client())
+
+	good := srv.URL + "/good.png"
+	bad := srv.URL + "/bad.jpg"
+	segs := []byte(`[{"type":"image","data":{"url":"` + good + `"}},{"type":"image","data":{"url":"` + bad + `"}}]`)
+	rec := &storage.MessageRecord{
+		MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 888, UserID: 10,
+		RawMessage: `[CQ:image,file=x.png][CQ:image,file=y.jpg]`, Segments: segs, Time: 1762400000,
+	}
+	if err := s.PutMessage(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: time.Unix(1762400001, 0)})
+	var userRow ChatMessage
+	for _, m := range msgs {
+		if m.Role == "user" {
+			userRow = m
+		}
+	}
+	parts, ok := userRow.Content.([]ContentPart)
+	if !ok {
+		t.Fatalf("多模态行 content 应为数组, got %T", userRow.Content)
+	}
+	imageCount := 0
+	for _, p := range parts {
+		if p.Type == "image_url" {
+			imageCount++
+			if p.ImageURL == nil || strings.Contains(p.ImageURL.URL, "/bad.jpg") {
+				t.Errorf("失败的图片不应保留原始 URL: %+v", p)
+			}
+		}
+	}
+	if imageCount != 1 {
+		t.Fatalf("image_url 数 = %d, want 1（bad 应被剔除）", imageCount)
+	}
+}

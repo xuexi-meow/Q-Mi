@@ -5,6 +5,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 
 	_ "modernc.org/sqlite"
 )
@@ -24,6 +25,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time DESC);
 
+CREATE TABLE IF NOT EXISTS message_recalls (
+    message_id INTEGER PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS notices (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     notice_type TEXT NOT NULL,
@@ -40,7 +45,10 @@ CREATE TABLE IF NOT EXISTS notices (
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(raw_message);
 DROP TRIGGER IF EXISTS messages_ai;
 DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
 `
+
+var externalContentFTS = regexp.MustCompile(`(?i)\bcontent\s*=`)
 
 type Store struct {
 	db *sql.DB
@@ -56,11 +64,53 @@ func Open(path string) (*Store, error) {
 	}
 	// modernc 驱动多连接写会撞锁,单连接 + WAL 足够本项目的写入量
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if err := initSchema(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("建表失败: %w", err)
+		return nil, fmt.Errorf("初始化数据库失败: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+func initSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
+	var definition string
+	if err := tx.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'").Scan(&definition); err != nil {
+		return err
+	}
+	if externalContentFTS.MatchString(definition) {
+		if _, err := tx.Exec("DROP TABLE messages_fts; CREATE VIRTUAL TABLE messages_fts USING fts5(raw_message)"); err != nil {
+			return fmt.Errorf("重建 FTS 表失败: %w", err)
+		}
+		rows, err := tx.Query("SELECT message_id, raw_message FROM messages")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			var text string
+			if err := rows.Scan(&id, &text); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("INSERT INTO messages_fts(rowid, raw_message) VALUES (?, ?)", id, ftsIndex(text)); err != nil {
+				return fmt.Errorf("迁移 FTS 索引失败: %w", err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error {

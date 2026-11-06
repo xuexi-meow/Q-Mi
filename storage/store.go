@@ -24,28 +24,37 @@ type MessageRecord struct {
 const messageCols = "message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled"
 
 func (s *Store) PutMessage(r *MessageRecord) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开始写入消息事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
 	recalled := 0
 	if r.Recalled {
 		recalled = 1
 	}
-	_, err := s.db.Exec(`
+	_, err = tx.Exec(`
 INSERT INTO messages (message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? OR EXISTS(SELECT 1 FROM message_recalls WHERE message_id = ?))
 ON CONFLICT(message_id) DO UPDATE SET
     direction=excluded.direction, chat_type=excluded.chat_type, chat_id=excluded.chat_id,
     user_id=excluded.user_id, raw_message=excluded.raw_message, segments=excluded.segments,
-    time=excluded.time, recalled=excluded.recalled`,
-		r.MessageID, r.Direction, r.ChatType, r.ChatID, r.UserID, r.RawMessage, string(r.Segments), r.Time, recalled)
+    time=excluded.time, recalled=messages.recalled OR excluded.recalled`,
+		r.MessageID, r.Direction, r.ChatType, r.ChatID, r.UserID, r.RawMessage, string(r.Segments), r.Time, recalled, r.MessageID)
 	if err != nil {
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
 	// 同步 FTS 索引(按字分词);先删旧行以支持同 id 覆盖(upsert)
-	if _, err := s.db.Exec("DELETE FROM messages_fts WHERE rowid = ?", r.MessageID); err != nil {
+	if _, err := tx.Exec("DELETE FROM messages_fts WHERE rowid = ?", r.MessageID); err != nil {
 		return fmt.Errorf("清理 FTS 索引失败: %w", err)
 	}
-	if _, err := s.db.Exec("INSERT INTO messages_fts(rowid, raw_message) VALUES (?, ?)",
+	if _, err := tx.Exec("INSERT INTO messages_fts(rowid, raw_message) VALUES (?, ?)",
 		r.MessageID, ftsIndex(r.RawMessage)); err != nil {
 		return fmt.Errorf("写入 FTS 索引失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交消息事务失败: %w", err)
 	}
 	return nil
 }
@@ -70,7 +79,7 @@ func ftsIndex(s string) string {
 	return b.String()
 }
 
-// ftsQuery 把用户查询转成 FTS5 短语序列:中文按单字、ASCII 连续字母数字为一个词,
+// ftsQuery 把用户查询转成 FTS5 短语序列:连续非 ASCII 字母数字按字组成短语、ASCII 连续字母数字为一个词,
 // 每项加引号(顺带规避 FTS 语法注入);多项之间为 AND 语义。
 func ftsQuery(query string) string {
 	var terms []string
@@ -81,24 +90,29 @@ func ftsQuery(query string) string {
 			run.Reset()
 		}
 	}
+	prevASCIIToken := false
 	for _, r := range query {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) { // 与索引侧一致,分隔符丢弃
 			flush()
 			continue
 		}
-		if r < 128 {
-			run.WriteRune(r)
-		} else {
-			flush()
-			terms = append(terms, string(r))
+		asciiToken := r < 128
+		if run.Len() > 0 {
+			if asciiToken != prevASCIIToken {
+				flush()
+			} else if !asciiToken {
+				run.WriteByte(' ')
+			}
 		}
+		run.WriteRune(r)
+		prevASCIIToken = asciiToken
 	}
 	flush()
 	quoted := make([]string, len(terms))
 	for i, t := range terms {
 		quoted[i] = `"` + t + `"`
 	}
-	return strings.Join(quoted, " ")
+	return strings.Join(quoted, " AND ")
 }
 
 func (s *Store) GetMessage(id int64) (*MessageRecord, error) {
@@ -144,11 +158,19 @@ type MessageFilter struct {
 }
 
 func (s *Store) QueryMessages(f MessageFilter) ([]*MessageRecord, error) {
+	return s.queryMessages(f, "")
+}
+
+func (s *Store) queryMessages(f MessageFilter, query string) ([]*MessageRecord, error) {
 	if f.Limit <= 0 {
 		f.Limit = 50
 	}
 	where := []string{"1=1"}
 	var args []any
+	if query != "" {
+		where = append(where, "message_id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+		args = append(args, query)
+	}
 	if f.ChatType != "" {
 		where = append(where, "chat_type = ?")
 		args = append(args, f.ChatType)
@@ -194,34 +216,12 @@ func (s *Store) QueryMessages(f MessageFilter) ([]*MessageRecord, error) {
 
 // SearchMessages FTS5 全文搜索,按时间倒序。
 // 中文按字索引(见 ftsIndex),查询经 ftsQuery 转成短语序列后匹配。
-func (s *Store) SearchMessages(query string, limit int) ([]*MessageRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+func (s *Store) SearchMessages(query string, f MessageFilter) ([]*MessageRecord, error) {
 	q := ftsQuery(query)
 	if q == "" {
 		return nil, nil
 	}
-	rows, err := s.db.Query(`
-SELECT m.message_id, m.direction, m.chat_type, m.chat_id, m.user_id,
-       m.raw_message, m.segments, m.time, m.recalled
-FROM messages_fts f JOIN messages m ON m.message_id = f.rowid
-WHERE messages_fts MATCH ?
-ORDER BY m.time DESC LIMIT ?`, q, limit)
-	if err != nil {
-		return nil, fmt.Errorf("搜索消息失败: %w", err)
-	}
-	defer rows.Close()
-
-	var out []*MessageRecord
-	for rows.Next() {
-		r, err := scanMessage(rows)
-		if err != nil {
-			return nil, fmt.Errorf("扫描搜索结果失败: %w", err)
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return s.queryMessages(f, q)
 }
 
 // NoticeRecord notices 表的一行
@@ -247,9 +247,20 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 
 // MarkRecalled 撤回只打标记不删行,重复标记幂等
 func (s *Store) MarkRecalled(id int64) error {
-	_, err := s.db.Exec("UPDATE messages SET recalled = 1 WHERE message_id = ?", id)
+	tx, err := s.db.Begin()
 	if err != nil {
+		return fmt.Errorf("开始撤回事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("INSERT INTO message_recalls(message_id) VALUES (?) ON CONFLICT(message_id) DO NOTHING", id); err != nil {
+		return fmt.Errorf("写入撤回记录失败: %w", err)
+	}
+	if _, err := tx.Exec("UPDATE messages SET recalled = 1 WHERE message_id = ?", id); err != nil {
 		return fmt.Errorf("标记撤回失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交撤回事务失败: %w", err)
 	}
 	return nil
 }

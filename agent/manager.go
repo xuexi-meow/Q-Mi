@@ -260,6 +260,15 @@ func (m *Manager) handleTurn(turn *Turn) {
 			return
 		}
 
+		// P2.5 思考链控制台输出：reasoning/content/工具调用/结束全打 Info，
+		// 不截断（要看全文）、不加配置开关。
+		if rc := resp.ReasoningContent(); rc != "" {
+			slog.Info("思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "reasoning", rc)
+		}
+		if content := resp.Content(); content != "" {
+			slog.Info("输出", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "content", content)
+		}
+
 		calls := resp.ToolCalls()
 		if len(calls) == 0 {
 			// 兼容路径：纯文本直接回复
@@ -279,7 +288,14 @@ func (m *Manager) handleTurn(turn *Turn) {
 				finished = true // 只标记，不执行；同批其他工具先执行
 				continue
 			}
-			result := execTool(tools, call)
+			slog.Info("工具调用", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+				"tool", call.Function.Name, "args", call.Function.Arguments)
+			result, toolErr := execTool(tools, call)
+			if toolErr != nil {
+				slog.Info("工具执行失败", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+					"tool", call.Function.Name, "err", toolErr)
+				result = toolErrorJSON(toolErr)
+			}
 			results = append(results, result)
 			msgs = append(msgs, ChatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
 		}
@@ -287,6 +303,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			m.dumpDebug(turn, req, round, resp, results, nil, false)
 		}
 		if finished {
+			slog.Info("结束思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
 			return
 		}
 	}
@@ -308,9 +325,9 @@ func (m *Manager) replyText(turn *Turn, content string) {
 	}
 }
 
-// execTool 按名字执行工具；未知工具 / Run 缺失 / 执行失败统一包成
-// {"error": ...} 返回，思维链继续（模型自行调整）。
-func execTool(tools []Tool, call ToolCall) string {
+// execTool 按名字执行工具；未知工具 / Run 缺失 / 执行失败返回 error，
+// 由调用方包装成 {"error": ...} 回填思维链，并打一条简短 Info 日志。
+func execTool(tools []Tool, call ToolCall) (string, error) {
 	for _, t := range tools {
 		if t.Name != call.Function.Name {
 			continue
@@ -318,13 +335,9 @@ func execTool(tools []Tool, call ToolCall) string {
 		if t.Run == nil {
 			break
 		}
-		out, err := t.Run(json.RawMessage(call.Function.Arguments))
-		if err != nil {
-			return toolErrorJSON(err)
-		}
-		return out
+		return t.Run(json.RawMessage(call.Function.Arguments))
 	}
-	return toolErrorJSON(fmt.Errorf("未知工具 %q", call.Function.Name))
+	return "", fmt.Errorf("未知工具 %q", call.Function.Name)
 }
 
 // toolErrorJSON 工具错误的标准回填形态。

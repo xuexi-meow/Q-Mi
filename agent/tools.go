@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"Q-Mi/api"
-	"Q-Mi/chain"
+	apimsg "Q-Mi/api/message"
 	"Q-Mi/storage"
 	"Q-Mi/utils/request"
 )
@@ -145,17 +145,33 @@ func newToolSet(store *storage.Store, notesPath, statePath string) []Tool {
 		},
 		{
 			Name:        "send_message",
-			Description: "给指定会话发送一条文本消息。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
+			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/dice/rps/json/image），两者二选一。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
 			Parameters: objectParams(map[string]any{
 				"chat_type": strProp("会话类型：private / group"),
 				"chat_id":   intProp("会话 ID：群号；私聊 = 对方 QQ"),
-				"text":      strProp("要发送的文本内容"),
-			}, []string{"chat_type", "chat_id", "text"}),
+				"text":      strProp("要发送的纯文本内容（与 segments 二选一）"),
+				"segments": map[string]any{
+					"type":        "array",
+					"description": "富消息段数组（与 text 二选一），按顺序发送。段类型白名单：text/at/reply/face/dice/rps/json/image",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"type": strProp("段类型：text / at / reply / face / dice / rps / json / image"),
+							"data": map[string]any{
+								"type":        "object",
+								"description": "段参数：text{text} / at{qq} / reply{id} / face{id} / dice{result} / rps{result} / json{data} / image{file, summary?}；image 的 file 只支持 http/https/base64:// 图片链接",
+							},
+						},
+						"required": []string{"type", "data"},
+					},
+				},
+			}, []string{"chat_type", "chat_id"}),
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
-					ChatType string `json:"chat_type"`
-					ChatID   int64  `json:"chat_id"`
-					Text     string `json:"text"`
+					ChatType string         `json:"chat_type"`
+					ChatID   int64          `json:"chat_id"`
+					Text     string         `json:"text"`
+					Segments []segmentParam `json:"segments"`
 				}
 				if err := decodeArgs(args, &p); err != nil {
 					return "", err
@@ -166,14 +182,24 @@ func newToolSet(store *storage.Store, notesPath, statePath string) []Tool {
 				if p.ChatID == 0 {
 					return "", fmt.Errorf("chat_id 不能为 0")
 				}
-				if p.Text == "" {
-					return "", fmt.Errorf("text 不能为空")
+				var segs []*apimsg.Message
+				switch {
+				case p.Text != "" && len(p.Segments) > 0:
+					return "", fmt.Errorf("text 与 segments 只能二选一，避免歧义")
+				case p.Text != "":
+					if n := len([]rune(p.Text)); n > maxSendMessageTextRunes {
+						return "", fmt.Errorf("text 内容 %d 字符，超过单次上限 %d", n, maxSendMessageTextRunes)
+					}
+					segs = []*apimsg.Message{apimsg.Text(p.Text)}
+				case len(p.Segments) > 0:
+					var err error
+					if segs, err = buildSegments(p.Segments); err != nil {
+						return "", err
+					}
+				default:
+					return "", fmt.Errorf("text 与 segments 必须提供一个")
 				}
-				resp, err := sendText(p.ChatType, p.ChatID, p.Text)
-				if err != nil {
-					return "", err
-				}
-				return marshalCompact(map[string]any{"message_id": resp.Data.MessageID})
+				return sendSegments(p.ChatType, p.ChatID, segs)
 			},
 		},
 		{
@@ -302,15 +328,126 @@ func queryMessageRows(store *storage.Store, f storage.MessageFilter, keyword ...
 	return marshalCompact(rows)
 }
 
-// sendText 经 NapCat 发送文本消息并返回响应（含 message_id）。
-// NapCat 调用是短请求，用独立 Background ctx（打断逻辑在 P2 后续处理）。
-func sendText(chatType string, chatID int64, text string) (*api.Response[api.SendMsgData], error) {
-	ctx := context.Background()
-	c := chain.New().Text(text)
-	if chatType == "group" {
-		return request.SendGroupMsg(ctx, chatID, c...)
+// maxSendMessageTextRunes send_message 单次调用 text 内容的累计上限
+// （rune 计），纯 text 与 segments 里的 text 段共用该额度。
+const maxSendMessageTextRunes = 8000
+
+// segmentParam send_message segments 数组里的单个消息段参数。
+type segmentParam struct {
+	Type string         `json:"type"`
+	Data map[string]any `json:"data"`
+}
+
+// buildSegments 把 segments 参数转成消息段数组（P2.6）。只接受白名单类型，
+// 白名单外报错；text 段内容累计超过 maxSendMessageTextRunes 报错；
+// image 的 file 原样透传（http/https/base64:// 由 NapCat 处理，
+// 本地路径不该出现，同样透传让 NapCat 报出明确错误）。
+func buildSegments(segs []segmentParam) ([]*apimsg.Message, error) {
+	out := make([]*apimsg.Message, 0, len(segs))
+	textLen := 0
+	for i, s := range segs {
+		at := i + 1
+		switch s.Type {
+		case "text":
+			v, err := segString(s.Data, "text", at)
+			if err != nil {
+				return nil, err
+			}
+			if v == "" {
+				return nil, fmt.Errorf("第 %d 段 text 不能为空", at)
+			}
+			textLen += len([]rune(v))
+			if textLen > maxSendMessageTextRunes {
+				return nil, fmt.Errorf("text 内容累计 %d 字符，超过单次上限 %d", textLen, maxSendMessageTextRunes)
+			}
+			out = append(out, apimsg.Text(v))
+		case "at":
+			v, err := segString(s.Data, "qq", at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, apimsg.At(v))
+		case "reply":
+			v, err := segString(s.Data, "id", at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, apimsg.Reply(v))
+		case "face":
+			v, err := segString(s.Data, "id", at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, apimsg.Face(v))
+		case "dice":
+			v, err := segString(s.Data, "result", at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, apimsg.Dice(v))
+		case "rps":
+			v, err := segString(s.Data, "result", at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, apimsg.RPS(v))
+		case "json":
+			data, ok := s.Data["data"]
+			if !ok {
+				return nil, fmt.Errorf("第 %d 段 json 缺少 %q 字段", at, "data")
+			}
+			out = append(out, apimsg.Json(data))
+		case "image":
+			file, err := segString(s.Data, "file", at)
+			if err != nil {
+				return nil, err
+			}
+			var summary *string
+			if raw, ok := s.Data["summary"]; ok {
+				str, ok := raw.(string)
+				if !ok {
+					return nil, fmt.Errorf("第 %d 段 image 的 %q 应为字符串", at, "summary")
+				}
+				summary = &str
+			}
+			out = append(out, apimsg.Image(file, summary, nil))
+		default:
+			return nil, fmt.Errorf("第 %d 段不支持的消息段类型 %q，可用：text/at/reply/face/dice/rps/json/image", at, s.Type)
+		}
 	}
-	return request.SendPrivateMsg(ctx, chatID, c...)
+	return out, nil
+}
+
+// segString 取消息段 data 里的必填字符串字段，缺失或类型不符报错。
+func segString(data map[string]any, key string, at int) (string, error) {
+	raw, ok := data[key]
+	if !ok {
+		return "", fmt.Errorf("第 %d 段缺少 %q 字段", at, key)
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("第 %d 段的 %q 应为字符串", at, key)
+	}
+	return s, nil
+}
+
+// sendSegments 经 NapCat 发送消息段链并返回 {"message_id":N}
+// （NapCat 调用是短请求，用独立 Background ctx，打断逻辑在 P2 后续处理）。
+func sendSegments(chatType string, chatID int64, segs []*apimsg.Message) (string, error) {
+	ctx := context.Background()
+	var (
+		resp *api.Response[api.SendMsgData]
+		err  error
+	)
+	if chatType == "group" {
+		resp, err = request.SendGroupMsg(ctx, chatID, segs...)
+	} else {
+		resp, err = request.SendPrivateMsg(ctx, chatID, segs...)
+	}
+	if err != nil {
+		return "", err
+	}
+	return marshalCompact(map[string]any{"message_id": resp.Data.MessageID})
 }
 
 // agentState state.json 的内容结构。

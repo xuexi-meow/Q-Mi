@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +28,14 @@ func twoToolCallResp(id1, name1, args1, id2, name2, args2 string) string {
 	return `{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[` +
 		`{"id":"` + id1 + `","type":"function","function":{"name":"` + name1 + `","arguments":` + strconv.Quote(args1) + `}},` +
 		`{"id":"` + id2 + `","type":"function","function":{"name":"` + name2 + `","arguments":` + strconv.Quote(args2) + `}}]}}]}`
+}
+
+// reasoningToolCallResp 构造带 reasoning/content 与一个 tool_calls 的响应 JSON。
+func reasoningToolCallResp(reasoning, content, id, name, args string) string {
+	return `{"choices":[{"index":0,"message":{"role":"assistant","content":` + strconv.Quote(content) +
+		`,"reasoning_content":` + strconv.Quote(reasoning) + `,"tool_calls":[` +
+		`{"id":"` + id + `","type":"function","function":{"name":"` + name + `","arguments":` +
+		strconv.Quote(args) + `}}]}}]}`
 }
 
 // newLoopManager 构造注入临时 notes/state/debug 路径与真实内存库的 manager。
@@ -189,6 +200,124 @@ func TestHandleTurnPlainTextCompat(t *testing.T) {
 	}
 	if got := napcat.sentText(t, 0); got != "直接回复" {
 		t.Errorf("回复文本 = %q, want 直接回复", got)
+	}
+}
+
+// lockedWriter 并发安全的 bytes.Buffer（handleTurn 的日志在 worker 协程产生，
+// 测试协程读取需要锁）。
+type lockedWriter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *lockedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// captureLogsSync 把默认 slog 输出重定向到并发安全缓冲并返回它
+// （captureLogs 的异步版，供思考循环这类 worker 协程打日志的场景使用）。
+func captureLogsSync(t *testing.T) *lockedWriter {
+	t.Helper()
+	w := &lockedWriter{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return w
+}
+
+// TestHandleTurnSegmentTypeErrorBackfilled send_message 收到白名单外的
+// 段类型时报错并以 {"error":...} 回填思维链，模型可自纠，不发消息。
+func TestHandleTurnSegmentTypeErrorBackfilled(t *testing.T) {
+	b := &stubBuilder{}
+	cfg := testCfg(20 * time.Millisecond)
+	script := []string{
+		toolCallResp("c1", "send_message", `{"chat_type":"group","chat_id":888,"segments":[{"type":"poke","data":{"id":"1"}}]}`),
+		toolCallResp("c2", "finish", ""),
+	}
+	m, f, napcat := newLoopManager(t, cfg, b, nil, script)
+
+	m.Enqueue(msg("group", 888, "在吗"))
+	waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "报错后思维链应继续")
+	time.Sleep(100 * time.Millisecond)
+
+	msgs := f.reqs[1].Messages
+	last := msgs[len(msgs)-1]
+	if last.Role != "tool" || last.ToolCallID != "c1" ||
+		!strings.Contains(last.Content, `"error"`) || !strings.Contains(last.Content, "poke") {
+		t.Errorf("非法段类型应以 error 回填: %+v", last)
+	}
+	if napcat.count() != 0 {
+		t.Errorf("报错路径不应发消息, got %d", napcat.count())
+	}
+}
+
+// TestHandleTurnLogsThinkingChain 每轮拿到 LLM 响应后在控制台输出思考链
+// （P2.5）：reasoning → 「思考」、content → 「输出」、每个工具调用 → 「工具调用」、
+// finish → 「结束思考」，均带 chat_type/chat_id/round 字段；工具执行失败
+// 也有一条简短 Info。
+func TestHandleTurnLogsThinkingChain(t *testing.T) {
+	logs := captureLogsSync(t)
+	b := &stubBuilder{}
+	cfg := testCfg(20 * time.Millisecond)
+	script := []string{
+		// 第 1 轮：带 reasoning + content + 一次工具调用
+		reasoningToolCallResp("用户在打招呼，先查查记录再说", "让我想想", "c1", "get_recent_messages", `{"limit":5}`),
+		// 第 2 轮：工具执行失败（未知工具）→ 简短 Info
+		toolCallResp("c2", "no_such_tool", `{}`),
+		// 第 3 轮：finish → 结束思考
+		toolCallResp("c3", "finish", ""),
+	}
+	m, f, _ := newLoopManager(t, cfg, b, nil, script)
+
+	m.Enqueue(msg("group", 888, "在吗"))
+	waitFor(t, 5*time.Second, func() bool { return f.count() == 3 }, "应依次发出 3 次 LLM 请求")
+	time.Sleep(150 * time.Millisecond)
+
+	all := logs.String()
+	lines := strings.Split(all, "\n")
+	// find 找到含 msg=<msg> 且包含全部 mustContain 片段的日志行。
+	find := func(msg string, mustContain ...string) string {
+		t.Helper()
+		for _, ln := range lines {
+			if !strings.Contains(ln, "msg="+msg) {
+				continue
+			}
+			ok := true
+			for _, s := range mustContain {
+				if !strings.Contains(ln, s) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return ln
+			}
+		}
+		return ""
+	}
+
+	if ln := find("思考", "reasoning=用户在打招呼，先查查记录再说", "chat_type=group", "chat_id=888", "round=1"); ln == "" {
+		t.Errorf("reasoning 应产生「思考」日志行:\n%s", all)
+	}
+	if ln := find("输出", "content=让我想想", "chat_type=group", "chat_id=888", "round=1"); ln == "" {
+		t.Errorf("content 应产生「输出」日志行:\n%s", all)
+	}
+	if ln := find("工具调用", "tool=get_recent_messages", "args=", "chat_type=group", "chat_id=888", "round=1"); ln == "" {
+		t.Errorf("工具调用应产生「工具调用」日志行（含 args）:\n%s", all)
+	}
+	if ln := find("工具执行失败", "tool=no_such_tool", "chat_type=group", "chat_id=888", "round=2"); ln == "" {
+		t.Errorf("工具执行失败应产生简短 Info 日志行:\n%s", all)
+	}
+	if ln := find("结束思考", "chat_type=group", "chat_id=888", "round=3"); ln == "" {
+		t.Errorf("finish 应产生「结束思考」日志行:\n%s", all)
 	}
 }
 

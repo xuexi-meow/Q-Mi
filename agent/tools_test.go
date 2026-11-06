@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -335,6 +336,167 @@ func TestToolErrorShape(t *testing.T) {
 	out, err := tl.Run(json.RawMessage(`{"limit":"abc"}`))
 	if err == nil {
 		t.Fatalf("非法参数应报错, got %q", out)
+	}
+}
+
+// napcatSegments 取假 NapCat 第 i 次请求的 message 段数组（type + data）。
+func napcatSegments(t *testing.T, n *napcatRec, i int) []map[string]any {
+	t.Helper()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	raw, _ := n.bodies[i]["message"].([]any)
+	out := make([]map[string]any, 0, len(raw))
+	for _, seg := range raw {
+		m, ok := seg.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := m["type"].(string)
+		d, _ := m["data"].(map[string]any)
+		out = append(out, map[string]any{"type": typ, "data": d})
+	}
+	return out
+}
+
+// TestSendMessageSegmentsRich segments 富消息链：假 NapCat 断言收到的
+// message 段数组与 data 字段；image 的 file 原样透传（不读本地文件转 base64）。
+func TestSendMessageSegmentsRich(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	napcat := startFakeNapCat(t)
+
+	// at + text（群聊）
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
+		`{"type":"at","data":{"qq":"10001"}},{"type":"text","data":{"text":" 你好啊"}}]}`)
+	if napcat.count() != 1 || napcat.paths[0] != "/send_group_msg" {
+		t.Fatalf("NapCat 应收到 1 次 /send_group_msg, got %v", napcat.paths)
+	}
+	segs := napcatSegments(t, napcat, 0)
+	if len(segs) != 2 {
+		t.Fatalf("at+text 应发出 2 段, got %v", segs)
+	}
+	if segs[0]["type"] != "at" {
+		t.Errorf("段0 类型 = %v, want at", segs[0])
+	}
+	if d, _ := segs[0]["data"].(map[string]any); d["qq"] != "10001" {
+		t.Errorf("段0 at.qq = %v, want 10001", d)
+	}
+	if segs[1]["type"] != "text" {
+		t.Errorf("段1 类型 = %v, want text", segs[1])
+	}
+	if d, _ := segs[1]["data"].(map[string]any); d["text"] != " 你好啊" {
+		t.Errorf("段1 text.text = %v, want ' 你好啊'", d)
+	}
+
+	// reply + text（私聊）
+	runToolOK(t, tools, "send_message", `{"chat_type":"private","chat_id":20002,"segments":[`+
+		`{"type":"reply","data":{"id":"54321"}},{"type":"text","data":{"text":"收到"}}]}`)
+	if napcat.paths[1] != "/send_private_msg" {
+		t.Errorf("私聊应走 /send_private_msg, got %v", napcat.paths[1])
+	}
+	segs = napcatSegments(t, napcat, 1)
+	if len(segs) != 2 || segs[0]["type"] != "reply" || segs[1]["type"] != "text" {
+		t.Fatalf("reply+text 应发出 [reply text], got %v", segs)
+	}
+	if d, _ := segs[0]["data"].(map[string]any); d["id"] != "54321" {
+		t.Errorf("段0 reply.id = %v, want 54321", d)
+	}
+	if d, _ := segs[1]["data"].(map[string]any); d["text"] != "收到" {
+		t.Errorf("段1 text.text = %v, want 收到", d)
+	}
+
+	// image：url + 可选 summary
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
+		`{"type":"image","data":{"file":"https://example.com/a.jpg","summary":"看看"}}]}`)
+	segs = napcatSegments(t, napcat, 2)
+	if len(segs) != 1 || segs[0]["type"] != "image" {
+		t.Fatalf("image 应发出 1 段 image, got %v", segs)
+	}
+	if d, _ := segs[0]["data"].(map[string]any); d["file"] != "https://example.com/a.jpg" || d["summary"] != "看看" {
+		t.Errorf("image 段 data = %v, want file=url summary=看看", d)
+	}
+
+	// image：base64:// 与本地路径形态都原样透传
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
+		`{"type":"image","data":{"file":"base64://AAAA"}}]}`)
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
+		`{"type":"image","data":{"file":"E:/pics/a.png"}}]}`)
+	segs = napcatSegments(t, napcat, 3)
+	if d, _ := segs[0]["data"].(map[string]any); d["file"] != "base64://AAAA" {
+		t.Errorf("base64:// 应原样透传, got %v", d)
+	}
+	segs = napcatSegments(t, napcat, 4)
+	if d, _ := segs[0]["data"].(map[string]any); d["file"] != "E:/pics/a.png" {
+		t.Errorf("本地路径应原样透传（AI 不该给本地路径, 交给 NapCat 报错）, got %v", d)
+	}
+
+	// face / dice / rps / json 全白名单
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
+		`{"type":"face","data":{"id":"14"}},{"type":"dice","data":{"result":"6"}},`+
+		`{"type":"rps","data":{"result":"1"}},{"type":"json","data":{"data":{"foo":"bar"}}}]}`)
+	segs = napcatSegments(t, napcat, 5)
+	wantTypes := []any{"face", "dice", "rps", "json"}
+	for i, want := range wantTypes {
+		if segs[i]["type"] != want {
+			t.Errorf("段%d 类型 = %v, want %v", i, segs[i]["type"], want)
+		}
+	}
+	if d, _ := segs[0]["data"].(map[string]any); d["id"] != "14" {
+		t.Errorf("face.id = %v, want 14", d)
+	}
+	if d, _ := segs[1]["data"].(map[string]any); d["result"] != "6" {
+		t.Errorf("dice.result = %v, want 6", d)
+	}
+	if d, _ := segs[2]["data"].(map[string]any); d["result"] != "1" {
+		t.Errorf("rps.result = %v, want 1", d)
+	}
+	if d, _ := segs[3]["data"].(map[string]any); fmt.Sprint(d["data"]) != "map[foo:bar]" {
+		t.Errorf("json.data = %v, want map[foo:bar]", d)
+	}
+}
+
+// TestSendMessageSegmentsParamErrors 参数校验：text 与 segments 二选一、
+// 白名单外类型、缺字段/字段类型错、text 超长都报 error 且不发消息；
+// 恰好 8000 字符可以发。
+func TestSendMessageSegmentsParamErrors(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	napcat := startFakeNapCat(t)
+
+	for _, bad := range []struct{ name, args string }{
+		{"text 与 segments 同时给出", `{"chat_type":"group","chat_id":888,"text":"hi","segments":[{"type":"text","data":{"text":"x"}}]}`},
+		{"text 与 segments 都缺", `{"chat_type":"group","chat_id":888}`},
+		{"segments 为空数组", `{"chat_type":"group","chat_id":888,"segments":[]}`},
+		{"白名单外类型", `{"chat_type":"group","chat_id":888,"segments":[{"type":"poke","data":{"id":"1"}}]}`},
+		{"at 缺 qq", `{"chat_type":"group","chat_id":888,"segments":[{"type":"at","data":{}}]}`},
+		{"at 的 qq 非字符串", `{"chat_type":"group","chat_id":888,"segments":[{"type":"at","data":{"qq":123}}]}`},
+		{"text 段缺 text", `{"chat_type":"group","chat_id":888,"segments":[{"type":"text","data":{}}]}`},
+		{"text 段为空串", `{"chat_type":"group","chat_id":888,"segments":[{"type":"text","data":{"text":""}}]}`},
+		{"image 缺 file", `{"chat_type":"group","chat_id":888,"segments":[{"type":"image","data":{"summary":"s"}}]}`},
+		{"image summary 非字符串", `{"chat_type":"group","chat_id":888,"segments":[{"type":"image","data":{"file":"https://e.com/a.jpg","summary":1}}]}`},
+		{"json 缺 data", `{"chat_type":"group","chat_id":888,"segments":[{"type":"json","data":{}}]}`},
+		{"text 参数超长", `{"chat_type":"group","chat_id":888,"text":"` + strings.Repeat("长", 8001) + `"}`},
+		{"segments 内 text 累计超长", `{"chat_type":"group","chat_id":888,"segments":[` +
+			`{"type":"text","data":{"text":"` + strings.Repeat("长", 4000) + `"}},` +
+			`{"type":"text","data":{"text":"` + strings.Repeat("长", 4001) + `"}}]}`},
+	} {
+		err := runToolErr(t, tools, "send_message", bad.args)
+		t.Logf("%s -> %v", bad.name, err)
+	}
+	// 关键错误信息可读（回填思维链后模型能自纠）
+	err := runToolErr(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[{"type":"poke","data":{"id":"1"}}]}`)
+	if !strings.Contains(err.Error(), "poke") || !strings.Contains(err.Error(), "不支持") {
+		t.Errorf("白名单外类型报错应含类型名与提示: %v", err)
+	}
+	if err := runToolErr(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"text":"hi","segments":[{"type":"text","data":{"text":"x"}}]}`); !strings.Contains(err.Error(), "二选一") {
+		t.Errorf("同时给出应报二选一: %v", err)
+	}
+	if err := runToolErr(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"text":"`+strings.Repeat("长", 8001)+`"}`); !strings.Contains(err.Error(), "8000") {
+		t.Errorf("超长应提示上限 8000: %v", err)
+	}
+
+	// 恰好 8000 字符可以发
+	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"text":"`+strings.Repeat("长", 8000)+`"}`)
+	if napcat.count() != 1 {
+		t.Errorf("只有边界合法的那次应发出消息, NapCat 收到 %d 次", napcat.count())
 	}
 }
 

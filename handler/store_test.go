@@ -36,11 +36,13 @@ func TestStoreMessageEvents(t *testing.T) {
 	cases := []struct {
 		raw, direction, chatType string
 		id, chatID, userID       int64
+		senderName               string
 	}{
-		{`{"post_type":"message","message_type":"private","self_id":999,"user_id":10,"message_id":11,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "recv", "private", 11, 10, 10},
-		{`{"post_type":"message","message_type":"group","self_id":999,"user_id":10,"group_id":100,"message_id":12,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "recv", "group", 12, 100, 10},
-		{`{"post_type":"message_sent","message_type":"private","self_id":999,"user_id":999,"target_id":10,"message_id":13,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "sent", "private", 13, 10, 999},
-		{`{"post_type":"message_sent","message_type":"group","self_id":999,"user_id":999,"target_id":100,"group_id":100,"message_id":14,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "sent", "group", 14, 100, 999},
+		{`{"post_type":"message","message_type":"private","self_id":999,"user_id":10,"message_id":11,"time":1,"raw_message":"hello","sender":{"user_id":10,"nickname":"小奶猫雪溪"},"message":[{"type":"text","data":{"text":"hello"}}]}`, "recv", "private", 11, 10, 10, "小奶猫雪溪"},
+		{`{"post_type":"message","message_type":"group","self_id":999,"user_id":10,"group_id":100,"message_id":12,"time":1,"raw_message":"hello","sender":{"user_id":10,"nickname":"昵称甲","card":"群名片乙"},"message":[{"type":"text","data":{"text":"hello"}}]}`, "recv", "group", 12, 100, 10, "群名片乙"},
+		{`{"post_type":"message","message_type":"group","self_id":999,"user_id":10,"group_id":100,"message_id":15,"time":1,"raw_message":"hello","sender":{"user_id":10,"nickname":"昵称甲","card":""},"message":[{"type":"text","data":{"text":"hello"}}]}`, "recv", "group", 15, 100, 10, "昵称甲"},
+		{`{"post_type":"message_sent","message_type":"private","self_id":999,"user_id":999,"target_id":10,"message_id":13,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "sent", "private", 13, 10, 999, "我"},
+		{`{"post_type":"message_sent","message_type":"group","self_id":999,"user_id":999,"target_id":100,"group_id":100,"message_id":14,"time":1,"raw_message":"hello","message":[{"type":"text","data":{"text":"hello"}}]}`, "sent", "group", 14, 100, 999, "我"},
 	}
 	for _, tc := range cases {
 		event.Dispatch([]byte(tc.raw))
@@ -51,6 +53,9 @@ func TestStoreMessageEvents(t *testing.T) {
 		}
 		if got.Direction != tc.direction || got.ChatType != tc.chatType || got.ChatID != tc.chatID || got.UserID != tc.userID || got.RawMessage != "hello" || string(got.Segments) != `[{"type":"text","data":{"text":"hello"}}]` {
 			t.Fatalf("message %d mapped incorrectly: %+v", tc.id, got)
+		}
+		if got.SenderName != tc.senderName {
+			t.Fatalf("message %d senderName = %q, want %q", tc.id, got.SenderName, tc.senderName)
 		}
 	}
 }

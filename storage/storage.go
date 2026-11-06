@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS messages (
     raw_message TEXT NOT NULL,
     segments    TEXT NOT NULL,
     time        REAL NOT NULL,
-    recalled    INTEGER NOT NULL DEFAULT 0
+    recalled    INTEGER NOT NULL DEFAULT 0,
+    sender_name TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time DESC);
@@ -79,6 +80,16 @@ func initSchema(db *sql.DB) error {
 	defer tx.Rollback()
 	if _, err := tx.Exec(schema); err != nil {
 		return err
+	}
+	// 旧库迁移:messages 表补 sender_name 列(幂等,事务内)
+	var hasSenderName int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'sender_name'").Scan(&hasSenderName); err != nil {
+		return err
+	}
+	if hasSenderName == 0 {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("迁移 messages.sender_name 列失败: %w", err)
+		}
 	}
 	var definition string
 	if err := tx.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'").Scan(&definition); err != nil {

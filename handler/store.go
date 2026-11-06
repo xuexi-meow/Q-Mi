@@ -76,19 +76,32 @@ func putMessage(r *storage.MessageRecord) {
 
 func privateRecord(e *event.PrivateMessageEvent) *storage.MessageRecord {
 	segs, _ := json.Marshal(e.Message) // Message.Parsed 是 json.RawMessage,重编即原始段 JSON
+	var senderName string
+	if e.Sender != nil {
+		senderName = e.Sender.Nickname
+	}
 	return &storage.MessageRecord{
 		MessageID: int64(e.MessageID), Direction: "recv", ChatType: "private",
 		ChatID: int64(e.UserID), UserID: int64(e.UserID),
 		RawMessage: e.RawMessage, Segments: segs, Time: e.Time,
+		SenderName: senderName,
 	}
 }
 
 func groupRecord(e *event.GroupMessageEvent) *storage.MessageRecord {
 	segs, _ := json.Marshal(e.Message)
+	var senderName string
+	if e.Sender != nil {
+		senderName = e.Sender.Card // 群名片优先,空则回退昵称
+		if senderName == "" {
+			senderName = e.Sender.Nickname
+		}
+	}
 	return &storage.MessageRecord{
 		MessageID: int64(e.MessageID), Direction: "recv", ChatType: "group",
 		ChatID: int64(e.GroupID), UserID: int64(e.UserID),
 		RawMessage: e.RawMessage, Segments: segs, Time: e.Time,
+		SenderName: senderName,
 	}
 }
 
@@ -100,6 +113,7 @@ func sentRecord(e *event.MessageSentEvent, chatType string) *storage.MessageReco
 		MessageID: int64(e.MessageID), Direction: "sent", ChatType: chatType,
 		UserID: int64(e.UserID), // 发出消息 user_id = 机器人自身
 		RawMessage: e.RawMessage, Segments: segs, Time: e.Time,
+		SenderName: "我",
 	}
 	if chatType == "group" {
 		r.ChatID = int64(e.GroupID)

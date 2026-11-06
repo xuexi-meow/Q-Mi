@@ -19,9 +19,10 @@ type MessageRecord struct {
 	Segments   []byte // 原始消息段 JSON
 	Time       float64
 	Recalled   bool
+	SenderName string // 发送者昵称;群聊为群名片(空则昵称);发出 = "我";旧行为空串
 }
 
-const messageCols = "message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled"
+const messageCols = "message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled, sender_name"
 
 func (s *Store) PutMessage(r *MessageRecord) error {
 	tx, err := s.db.Begin()
@@ -35,13 +36,13 @@ func (s *Store) PutMessage(r *MessageRecord) error {
 		recalled = 1
 	}
 	_, err = tx.Exec(`
-INSERT INTO messages (message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? OR EXISTS(SELECT 1 FROM message_recalls WHERE message_id = ?))
+INSERT INTO messages (message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled, sender_name)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ? OR EXISTS(SELECT 1 FROM message_recalls WHERE message_id = ?), ?)
 ON CONFLICT(message_id) DO UPDATE SET
     direction=excluded.direction, chat_type=excluded.chat_type, chat_id=excluded.chat_id,
     user_id=excluded.user_id, raw_message=excluded.raw_message, segments=excluded.segments,
-    time=excluded.time, recalled=messages.recalled OR excluded.recalled`,
-		r.MessageID, r.Direction, r.ChatType, r.ChatID, r.UserID, r.RawMessage, string(r.Segments), r.Time, recalled, r.MessageID)
+    time=excluded.time, recalled=messages.recalled OR excluded.recalled, sender_name=excluded.sender_name`,
+		r.MessageID, r.Direction, r.ChatType, r.ChatID, r.UserID, r.RawMessage, string(r.Segments), r.Time, recalled, r.MessageID, r.SenderName)
 	if err != nil {
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
@@ -135,7 +136,7 @@ func scanMessage(row scanner) (*MessageRecord, error) {
 	var segments []byte
 	var recalled int
 	if err := row.Scan(&r.MessageID, &r.Direction, &r.ChatType, &r.ChatID, &r.UserID,
-		&r.RawMessage, &segments, &r.Time, &recalled); err != nil {
+		&r.RawMessage, &segments, &r.Time, &recalled, &r.SenderName); err != nil {
 		return nil, err
 	}
 	r.Segments = segments

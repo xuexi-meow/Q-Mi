@@ -356,6 +356,144 @@ END;`)
 	}
 }
 
+func TestNewSchemaHasSenderName(t *testing.T) {
+	s := openTestStore(t)
+	var notnull int
+	var dflt string
+	if err := s.db.QueryRow(`SELECT "notnull", dflt_value FROM pragma_table_info('messages')
+		WHERE name = 'sender_name'`).Scan(&notnull, &dflt); err != nil {
+		t.Fatalf("新库 messages 表缺少 sender_name 列: %v", err)
+	}
+	if notnull != 1 || dflt != "''" {
+		t.Errorf("sender_name 列定义错误: notnull=%d, dflt=%q", notnull, dflt)
+	}
+}
+
+func TestSenderNameRoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	want := testRecord(1, 9527, 1729200000)
+	want.SenderName = "香菜不吃屿烬燃"
+	if err := s.PutMessage(want); err != nil {
+		t.Fatalf("PutMessage: %v", err)
+	}
+	got, err := s.GetMessage(1)
+	if err != nil || got == nil {
+		t.Fatalf("GetMessage: %v, %v", got, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("roundtrip 不一致:\n want %+v\n got  %+v", want, got)
+	}
+
+	// 未显式设置时落库为空串
+	if err := s.PutMessage(testRecord(2, 9527, 1729200001)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetMessage(2); err != nil || got == nil || got.SenderName != "" {
+		t.Errorf("缺省 SenderName 应为空串: got=%+v, err=%v", got, err)
+	}
+
+	// 查询路径同样带出 SenderName
+	recent, err := s.RecentMessages("group", 9527, 10)
+	if err != nil || len(recent) != 2 || recent[0].SenderName != "" || recent[1].SenderName != "香菜不吃屿烬燃" {
+		t.Errorf("查询应返回 SenderName: %+v, err=%v", recent, err)
+	}
+}
+
+func TestOpenMigratesMissingSenderName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE messages (
+    message_id  INTEGER PRIMARY KEY,
+    direction   TEXT NOT NULL,
+    chat_type   TEXT NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    raw_message TEXT NOT NULL,
+    segments    TEXT NOT NULL,
+    time        REAL NOT NULL,
+    recalled    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_messages_chat_time ON messages(chat_id, time DESC);
+CREATE TABLE message_recalls (message_id INTEGER PRIMARY KEY);
+CREATE TABLE notices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    notice_type TEXT NOT NULL,
+    sub_type    TEXT,
+    chat_id     INTEGER,
+    user_id     INTEGER,
+    raw         TEXT NOT NULL,
+    time        REAL NOT NULL
+);
+CREATE VIRTUAL TABLE messages_fts USING fts5(raw_message);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages
+		(message_id, direction, chat_type, chat_id, user_id, raw_message, segments, time, recalled)
+		VALUES (1, 'recv', 'group', 100, 11, '旧消息', '[]', 1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := openFileStore(t, path)
+
+	// 列已自动补齐
+	var notnull int
+	var dflt string
+	if err := s.db.QueryRow(`SELECT "notnull", dflt_value FROM pragma_table_info('messages')
+		WHERE name = 'sender_name'`).Scan(&notnull, &dflt); err != nil {
+		t.Fatalf("旧库迁移后缺少 sender_name 列: %v", err)
+	}
+	if notnull != 1 || dflt != "''" {
+		t.Errorf("迁移后的 sender_name 列定义错误: notnull=%d, dflt=%q", notnull, dflt)
+	}
+
+	// 旧行昵称为空
+	got, err := s.GetMessage(1)
+	if err != nil || got == nil {
+		t.Fatalf("GetMessage(1): %v, %v", got, err)
+	}
+	if got.SenderName != "" {
+		t.Errorf("旧行 SenderName 应为空串, 得到 %q", got.SenderName)
+	}
+
+	// 新写入正常
+	r := testRecord(2, 100, 2)
+	r.SenderName = "小奶猫雪溪"
+	if err := s.PutMessage(r); err != nil {
+		t.Fatalf("迁移后 PutMessage: %v", err)
+	}
+	if got, err := s.GetMessage(2); err != nil || got == nil || got.SenderName != "小奶猫雪溪" {
+		t.Errorf("迁移后新写入丢失昵称: got=%+v, err=%v", got, err)
+	}
+
+	// 再次打开幂等,不重复迁移
+	var version int
+	if err := s.db.QueryRow("PRAGMA schema_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openFileStore(t, path)
+	var changes, gotVersion int
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("PRAGMA schema_version").Scan(&gotVersion); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 0 || gotVersion != version {
+		t.Errorf("已迁移库再次 Open 产生变更: changes=%d, version=%d, want %d", changes, gotVersion, version)
+	}
+}
+
 func seedMessages(t *testing.T, s *Store) {
 	t.Helper()
 	// 两个群、一个私聊,时间乱序插入,其中一条已撤回

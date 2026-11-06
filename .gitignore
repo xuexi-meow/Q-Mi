@@ -6,3 +6,5 @@ Q-Mi.zip
 npm_install_log.txt
 .continue/
 .vscode/
+agent/debug/
+Config.yaml

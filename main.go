@@ -17,6 +17,8 @@ import (
 
 	// 注册所有事件处理函数(handler 包的 init 里调用 event.Register)
 	_ "Q-Mi/handler"
+	// agent 包在 init 里注册消息事件,把 AI 成员接入管线
+	_ "Q-Mi/agent"
 )
 
 func main() {

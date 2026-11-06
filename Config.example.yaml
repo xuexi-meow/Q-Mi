@@ -1,0 +1,34 @@
+bot:
+  qq_number: 0            # 机器人自己的 QQ 号(agent 的 @检测与上下文都用它)
+  admin_number:
+    - 1234
+netsetting:
+  host: "172.25.240.1"    # WSL 宿主网卡地址(wsl -d Ubuntu -- hostname -I 看对端;每次 WSL 重启可能变化)
+  port: 9090
+  token: "填一个随机hex,需与 NapCat httpClients 的 token 一致"
+  pattern: "/Q-Mi"
+napcat:
+  ws:
+    enable: false
+    host: "127.0.0.1"
+    port: 8080
+  http:
+    enable: true
+    host: "172.25.x.x"    # WSL 内 NapCat 的地址(wsl 里 ip addr show eth0)
+    port: 8080
+    token: "填一个随机hex,需与 NapCat httpServers 的 token 一致"
+storage:
+  enable: true
+  path: "Q-Mi.db"
+agent:
+  enable: false
+  base_url: "https://api.example.com/v1"   # OpenAI 兼容地址,含 /v1
+  api_key: "sk-..."
+  model: "deepseek-chat"
+  persona_file: "agent/persona.md"
+  debounce: 3s
+  temperature: 0.8
+  debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/
+  history:
+    max: 40
+    trim: 20

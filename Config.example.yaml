@@ -29,6 +29,7 @@ agent:
   debounce: 3s
   temperature: 0.8
   debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/
+  max_tool_rounds: 10    # 思考轮数上限(工具调用循环,finish 提前终止)
   history:
     max: 40
     trim: 20

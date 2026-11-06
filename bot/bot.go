@@ -5,6 +5,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	apimsg "Q-Mi/api/message"
@@ -39,6 +40,14 @@ func AtMe(msgs []*evmsg.Message) bool {
 	if self == 0 {
 		return false
 	}
+	return AtUserID(msgs, int64(self))
+}
+
+// AtUserID 判断消息是否@了指定 QQ(推荐用事件自带的 self_id,不依赖配置填写)。
+func AtUserID(msgs []*evmsg.Message, selfID int64) bool {
+	if selfID == 0 {
+		return false
+	}
 	for _, m := range msgs {
 		if m == nil || m.Type != string(apimsg.TypeAt) {
 			continue
@@ -48,7 +57,7 @@ func AtMe(msgs []*evmsg.Message) bool {
 				continue
 			}
 		}
-		if at, ok := m.Data.(evmsg.At); ok && at.QQ == fmt.Sprint(self) {
+		if at, ok := m.Data.(evmsg.At); ok && at.QQ == strconv.FormatInt(selfID, 10) {
 			return true
 		}
 	}

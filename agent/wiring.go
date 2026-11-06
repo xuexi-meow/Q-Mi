@@ -52,8 +52,9 @@ func init() {
 		if m == nil || e.Sender == nil {
 			return
 		}
-		// 群聊仅响应 @机器人(未 @ 交给 P2 判断模型)
-		if !bot.AtMe(e.Message) {
+		// 群聊仅响应 @机器人(未 @ 交给 P2 判断模型);
+		// self_id 取事件自带字段,不依赖配置的 qq_number
+		if !bot.AtUserID(e.Message, int64(e.SelfID)) {
 			return
 		}
 		m.Enqueue(IncomingMessage{

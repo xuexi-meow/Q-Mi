@@ -79,6 +79,21 @@ func TestAtMeMatchesSelfQQOnly(t *testing.T) {
 	}
 }
 
+func TestAtUserIDMatchesGivenSelfID(t *testing.T) {
+	msgs := []*message.Message{
+		seg(t, `{"type":"at","data":{"qq":"1661489232"}}`),
+	}
+	if !AtUserID(msgs, 1661489232) {
+		t.Error("@给定 self_id 应命中")
+	}
+	if AtUserID(msgs, 0) || AtUserID(msgs, 42) {
+		t.Error("self_id 不符不应命中")
+	}
+	if AtUserID(nil, 1661489232) {
+		t.Error("空消息不应命中")
+	}
+}
+
 func TestIsAdmin(t *testing.T) {
 	setBotConfig(t, 999, []int{1234, 5678})
 	if !IsAdmin(1234) {

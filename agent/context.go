@@ -1,5 +1,5 @@
-// agent/context.go 实现上下文组装（spec 第 7/9 节）：缓存分层
-// system(纯静态) → 历史(只追加) → 本轮新消息(末尾,含当前时间)。
+// agent/context.go 实现上下文组装（spec P2 §2.2/§3.5）：缓存分层
+// system(纯静态) → 全会话混合历史(只追加,块裁剪) → [思考笔记]+本轮新消息(末尾,含当前时间)。
 // ContextBuilder 是可替换接缝，DefaultBuilder 为默认实现。
 package agent
 
@@ -17,18 +17,21 @@ import (
 // fallbackPersona persona 文件缺失时的内置兜底提示词。
 const fallbackPersona = "你是一个QQ群聊/私聊里的AI成员，用中文自然交流。"
 
-// Turn 进 builder 的一轮输入：chat 上下文、本轮新消息、当前时间。
+// Turn 进 builder 的一轮输入：chat 上下文、思考笔记、本轮新消息、当前时间。
 // 携带全部原料，任何自定义 builder 都能拿到。
 type Turn struct {
-	ChatType    string // "private" / "group"
-	ChatID      int64  // 群号；私聊 = 对方 QQ
+	ChatType    string // 本轮新消息所属会话类型，"private" / "group"（SendLLM 回复用）
+	ChatID      int64  // 本轮新消息所属会话：群号；私聊 = 对方 QQ
 	SelfID      int64  // 机器人自身 QQ
 	Now         time.Time
-	NewMessages []TurnMessage
+	Notes       []Note        // 思考笔记（manager 从 notes.json 读出），注入末尾 user 块头部
+	NewMessages []TurnMessage // 每条自带所属会话（历史已跨会话混合）
 }
 
 // TurnMessage 本轮防抖窗口内的一条新消息。
 type TurnMessage struct {
+	ChatType   string // 该消息所属会话类型 "private" / "group"
+	ChatID     int64  // 该消息所属会话 ID：群号；私聊 = 对方 QQ
 	SenderID   int64
 	SenderName string
 	Text       string
@@ -93,16 +96,40 @@ func truncateContent(s string) string {
 	return string(runes[:maxContentRunes]) + truncationMark
 }
 
-// formatChatLine 统一的消息行格式：[MM-DD HH:MM] <QQ号或'我'> 内容
-func formatChatLine(ts time.Time, label, content string) string {
-	return "[" + ts.Format(timeLayout) + "] <" + label + "> " + content
+// formatChatLine 统一消息行格式：[MM-DD HH:MM] [来源] <发送者> 内容
+func formatChatLine(ts time.Time, source, label, content string) string {
+	return "[" + ts.Format(timeLayout) + "] " + source + " <" + label + "> " + content
 }
 
-// Build 组装消息序列：
+// chatSource 来源标签：[群:928952016] / [私聊:3394859101]；未知类型原样展示。
+func chatSource(chatType string, chatID int64) string {
+	name := chatType
+	switch chatType {
+	case "group":
+		name = "群"
+	case "private":
+		name = "私聊"
+	}
+	return "[" + name + ":" + strconv.FormatInt(chatID, 10) + "]"
+}
+
+// senderLabel 发送者标签：自己 → "我"；有昵称 → "昵称(QQ号)"；否则 QQ号。
+func senderLabel(senderID int64, senderName string, isSelf bool) string {
+	if isSelf {
+		return "我"
+	}
+	id := strconv.FormatInt(senderID, 10)
+	if senderName == "" {
+		return id
+	}
+	return senderName + "(" + id + ")"
+}
+
+// Build 组装消息序列（spec P2 §2.2）：
 //
-//	system:  persona + 机器人自身QQ号          ← 完全静态，缓存锚点
-//	历史:    user/assistant 按时间正序          ← 只追加
-//	user:   本轮新消息逐条 + 当前时间(首条头部)  ← 每次变，放末尾
+//	system:  persona + 机器人自身QQ号                 ← 完全静态，缓存锚点
+//	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加
+//	user:   [思考笔记] + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
 func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
 	system := ChatMessage{
 		Role:    "system",
@@ -114,16 +141,15 @@ func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
 	return msgs
 }
 
-// appendHistory 查询并追加历史消息，按时间正序（旧→新）。
-// 默认排除已撤回；查询失败时告警，本轮不带历史继续对话。
+// appendHistory 查询并追加跨会话混合的历史消息（不按 chat 过滤，全局按时间
+// 取最近 N 条），按时间正序（旧→新）。默认排除已撤回；查询失败时告警，
+// 本轮不带历史继续对话。
 func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 	if b.store == nil {
 		return
 	}
 	records, err := b.store.QueryMessages(storage.MessageFilter{
-		ChatType: turn.ChatType,
-		ChatID:   turn.ChatID,
-		Limit:    b.max + b.trim,
+		Limit: b.max + b.trim,
 	})
 	if err != nil {
 		slog.Warn("查询历史消息失败，本轮不带历史上下文", "err", err)
@@ -142,31 +168,32 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		records = records[drop:]
 	}
 	for _, r := range records {
-		label := strconv.FormatInt(r.UserID, 10)
+		isSelf := r.Direction == "sent"
 		role := "user"
-		if r.Direction == "sent" {
-			label = "我"
+		if isSelf {
 			role = "assistant"
 		}
 		*msgs = append(*msgs, ChatMessage{
-			Role:    role,
-			Content: formatChatLine(time.Unix(int64(r.Time), 0), label, truncateContent(r.RawMessage)),
+			Role: role,
+			Content: formatChatLine(time.Unix(int64(r.Time), 0), chatSource(r.ChatType, r.ChatID),
+				senderLabel(r.UserID, r.SenderName, isSelf), truncateContent(r.RawMessage)),
 		})
 	}
 }
 
 // appendNewMessages 把本轮新消息以 user 角色逐条追加在末尾（保留原始节奏，
-// 不做文本拼接）；当前时间只出现在首条新消息的头部，随消息放末尾，
-// 不进 system——否则缓存前缀随时间失效。
+// 不做文本拼接），行格式与历史一致（含来源标签）；当前时间只出现在首条新
+// 消息的头部，思考笔记若有则以 "[思考笔记]" 块作为首条新消息的前缀（在当前
+// 时间之前）——不进 system，否则缓存前缀随笔记/时间失效。
 func appendNewMessages(msgs []ChatMessage, turn *Turn) []ChatMessage {
 	for i, m := range turn.NewMessages {
-		label := strconv.FormatInt(m.SenderID, 10)
-		if m.IsSelf {
-			label = "我"
-		}
-		content := formatChatLine(m.Time, label, truncateContent(m.Text))
+		content := formatChatLine(m.Time, chatSource(m.ChatType, m.ChatID),
+			senderLabel(m.SenderID, m.SenderName, m.IsSelf), truncateContent(m.Text))
 		if i == 0 {
 			content = "当前时间: " + turn.Now.Format(nowLayout) + "\n" + content
+			if len(turn.Notes) > 0 {
+				content = FormatNotes(turn.Notes) + "\n\n" + content
+			}
 		}
 		msgs = append(msgs, ChatMessage{Role: "user", Content: content})
 	}

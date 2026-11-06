@@ -56,7 +56,7 @@ func TestBuildEmptyTurnReturnsOnlySystem(t *testing.T) {
 
 	msgs := b.Build(&Turn{
 		ChatType: "group",
-		ChatID:   123456,
+		ChatID:   928952016,
 		SelfID:   9527,
 		Now:      time.Unix(1762400000, 0),
 	})
@@ -117,7 +117,7 @@ func TestNewDefaultBuilderMissingPersonaWarnsOnceAndFallsBack(t *testing.T) {
 }
 
 // putRecord 写入一条消息记录。
-func putRecord(t *testing.T, s *storage.Store, id int64, direction, chatType string, chatID, userID int64, raw string, sec int64) {
+func putRecord(t *testing.T, s *storage.Store, id int64, direction, chatType string, chatID, userID int64, senderName, raw string, sec int64) {
 	t.Helper()
 	err := s.PutMessage(&storage.MessageRecord{
 		MessageID:  id,
@@ -125,6 +125,7 @@ func putRecord(t *testing.T, s *storage.Store, id int64, direction, chatType str
 		ChatType:   chatType,
 		ChatID:     chatID,
 		UserID:     userID,
+		SenderName: senderName,
 		RawMessage: raw,
 		Time:       float64(sec),
 	})
@@ -146,9 +147,10 @@ func assertMessages(t *testing.T, got, want []ChatMessage) {
 	}
 }
 
-// TestBuildHistoryFormatAndRoles 历史按时间正序、格式 "[MM-DD HH:MM] <QQ号或'我'> 内容"、
-// sent 记 own 为 assistant，CQ 码原样透传不解析。
-func TestBuildHistoryFormatAndRoles(t *testing.T) {
+// TestBuildHybridHistoryFormatAndRoles 历史跨会话混合、按时间正序，行格式
+// "[MM-DD HH:MM] [群:ID 或 私聊:ID] <昵称(QQ号)/QQ号/'我'> 内容"；
+// sent 记 own 为 assistant 且标签"我"；昵称空回退 QQ号；CQ 码原样透传。
+func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
@@ -159,17 +161,23 @@ func TestBuildHistoryFormatAndRoles(t *testing.T) {
 	t1 := time.Unix(1762400000, 0)
 	t2 := t1.Add(60 * time.Second)
 	t3 := t2.Add(60 * time.Second)
-	putRecord(t, s, 1, "recv", "group", 123456, 10001, "你好", t1.Unix())
-	putRecord(t, s, 2, "sent", "group", 123456, 9527, "你好呀", t2.Unix())
-	putRecord(t, s, 3, "recv", "group", 123456, 10002, "[CQ:face,id=1]哈哈", t3.Unix())
+	t4 := t3.Add(60 * time.Second)
+	t5 := t4.Add(60 * time.Second)
+	putRecord(t, s, 1, "recv", "group", 928952016, 3929930584, "香菜不吃屿烬燃", "这个我不背锅！！！！", t1.Unix())
+	putRecord(t, s, 2, "recv", "private", 3394859101, 3394859101, "小奶猫雪溪", "在吗", t2.Unix())
+	putRecord(t, s, 3, "sent", "group", 928952016, 9527, "我", "收到", t3.Unix())
+	putRecord(t, s, 4, "recv", "group", 928952016, 10086, "", "旧库没存昵称", t4.Unix())
+	putRecord(t, s, 5, "recv", "group", 928952016, 10002, "路人", "[CQ:face,id=1]哈哈", t5.Unix())
 
-	msgs := b.Build(&Turn{ChatType: "group", ChatID: 123456, SelfID: 9527, Now: t3.Add(time.Minute)})
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t5.Add(time.Minute)})
 
 	assertMessages(t, msgs, []ChatMessage{
 		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] <10001> 你好"},
-		{Role: "assistant", Content: "[" + t2.Format("01-02 15:04") + "] <我> 你好呀"},
-		{Role: "user", Content: "[" + t3.Format("01-02 15:04") + "] <10002> [CQ:face,id=1]哈哈"},
+		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <香菜不吃屿烬燃(3929930584)> 这个我不背锅！！！！"},
+		{Role: "user", Content: "[" + t2.Format("01-02 15:04") + "] [私聊:3394859101] <小奶猫雪溪(3394859101)> 在吗"},
+		{Role: "assistant", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <我> 收到"},
+		{Role: "user", Content: "[" + t4.Format("01-02 15:04") + "] [群:928952016] <10086> 旧库没存昵称"},
+		{Role: "user", Content: "[" + t5.Format("01-02 15:04") + "] [群:928952016] <路人(10002)> [CQ:face,id=1]哈哈"},
 	})
 }
 
@@ -185,19 +193,19 @@ func TestBuildHistoryExcludesRecalled(t *testing.T) {
 	t1 := time.Unix(1762400000, 0)
 	t2 := t1.Add(60 * time.Second)
 	t3 := t2.Add(60 * time.Second)
-	putRecord(t, s, 1, "recv", "group", 123456, 10001, "第一条", t1.Unix())
-	putRecord(t, s, 2, "recv", "group", 123456, 10001, "会被撤回", t2.Unix())
-	putRecord(t, s, 3, "recv", "group", 123456, 10001, "第三条", t3.Unix())
+	putRecord(t, s, 1, "recv", "group", 928952016, 10001, "群友A", "第一条", t1.Unix())
+	putRecord(t, s, 2, "recv", "group", 928952016, 10001, "群友A", "会被撤回", t2.Unix())
+	putRecord(t, s, 3, "recv", "group", 928952016, 10001, "群友A", "第三条", t3.Unix())
 	if err := s.MarkRecalled(2); err != nil {
 		t.Fatalf("MarkRecalled: %v", err)
 	}
 
-	msgs := b.Build(&Turn{ChatType: "group", ChatID: 123456, SelfID: 9527, Now: t3.Add(time.Minute)})
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t3.Add(time.Minute)})
 
 	assertMessages(t, msgs, []ChatMessage{
 		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] <10001> 第一条"},
-		{Role: "user", Content: "[" + t3.Format("01-02 15:04") + "] <10001> 第三条"},
+		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第一条"},
+		{Role: "user", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第三条"},
 	})
 }
 
@@ -221,9 +229,9 @@ func TestBuildWithNilStoreReturnsOnlySystem(t *testing.T) {
 	}
 }
 
-// TestBuildTrimsHistoryInBlocks 历史超过 history.max 时按 history.trim
-// 从头整块砍掉（Max=4/Trim=2，6 条 → 保留最近 4 条 m3..m6）。
-func TestBuildTrimsHistoryInBlocks(t *testing.T) {
+// TestBuildTrimsHistoryAcrossChatsInBlocks 全局历史超过 history.max 时按
+// history.trim 从头整块砍掉（Max=4/Trim=2，群+私聊混合 6 条 → 保留最近 4 条 m3..m6）。
+func TestBuildTrimsHistoryAcrossChatsInBlocks(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
@@ -233,30 +241,32 @@ func TestBuildTrimsHistoryInBlocks(t *testing.T) {
 
 	base := time.Unix(1762400000, 0)
 	for i := 1; i <= 6; i++ {
-		direction, userID := "recv", int64(10001)
+		direction, userID := "recv", int64(20001)
+		chatType, chatID, name := "private", int64(20001), "私聊B"
 		if i%2 == 0 {
 			direction, userID = "sent", int64(9527)
+			chatType, chatID, name = "group", int64(928952016), "我"
 		}
-		putRecord(t, s, int64(i), direction, "group", 123456, userID,
+		putRecord(t, s, int64(i), direction, chatType, chatID, userID, name,
 			fmt.Sprintf("m%d", i), base.Add(time.Duration(i)*time.Second).Unix())
 	}
 
-	msgs := b.Build(&Turn{ChatType: "group", ChatID: 123456, SelfID: 9527, Now: base.Add(7 * time.Second)})
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(7 * time.Second)})
 
 	if len(msgs) != 5 {
 		t.Fatalf("裁剪后消息条数 = %d, want 5 (system+4): %+v", len(msgs), msgs)
 	}
 	assertMessages(t, msgs, []ChatMessage{
 		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + base.Add(3*time.Second).Format("01-02 15:04") + "] <10001> m3"},
-		{Role: "assistant", Content: "[" + base.Add(4*time.Second).Format("01-02 15:04") + "] <我> m4"},
-		{Role: "user", Content: "[" + base.Add(5*time.Second).Format("01-02 15:04") + "] <10001> m5"},
-		{Role: "assistant", Content: "[" + base.Add(6*time.Second).Format("01-02 15:04") + "] <我> m6"},
+		{Role: "user", Content: "[" + base.Add(3*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m3"},
+		{Role: "assistant", Content: "[" + base.Add(4*time.Second).Format("01-02 15:04") + "] [群:928952016] <我> m4"},
+		{Role: "user", Content: "[" + base.Add(5*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m5"},
+		{Role: "assistant", Content: "[" + base.Add(6*time.Second).Format("01-02 15:04") + "] [群:928952016] <我> m6"},
 	})
 }
 
-// TestBuildHistoryPrefixStableAcrossCalls 回归：41→42 条时按块跳删保证
-// 非 system 部分前缀字节级一致（prompt cache 前缀不失效）。
+// TestBuildHistoryPrefixStableAcrossCalls 回归：群+私聊混合 41→42 条时按块
+// 跳删保证非 system 部分前缀字节级一致（prompt cache 前缀不失效）。
 func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
@@ -267,17 +277,21 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 
 	base := time.Unix(1762400000, 0)
 	for i := 1; i <= 41; i++ {
-		putRecord(t, s, int64(i), "recv", "group", 123456, 10001,
+		chatType, chatID, userID, name := "group", int64(928952016), int64(10001), "群友A"
+		if i%2 == 1 {
+			chatType, chatID, userID, name = "private", int64(20001), int64(20001), "私聊B"
+		}
+		putRecord(t, s, int64(i), "recv", chatType, chatID, userID, name,
 			fmt.Sprintf("m%02d", i), base.Add(time.Duration(i)*time.Second).Unix())
 	}
 
-	first := b.Build(&Turn{ChatType: "group", ChatID: 123456, SelfID: 9527, Now: base.Add(time.Minute)})
+	first := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
 	if len(first) != 22 {
 		t.Fatalf("41 条历史裁剪后应剩 21 条 (共 22), got %d", len(first))
 	}
 
-	putRecord(t, s, 42, "recv", "group", 123456, 10001, "m42", base.Add(42*time.Second).Unix())
-	second := b.Build(&Turn{ChatType: "group", ChatID: 123456, SelfID: 9527, Now: base.Add(time.Minute)})
+	putRecord(t, s, 42, "recv", "group", 928952016, 10001, "群友A", "m42", base.Add(42*time.Second).Unix())
+	second := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
 
 	if len(second) != 23 {
 		t.Fatalf("42 条历史裁剪后应剩 22 条 (共 23), got %d", len(second))
@@ -287,13 +301,14 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 			t.Fatalf("messages[%d] 前缀被破坏:\nfirst:  %+v\nsecond: %+v", i, first[i], second[i])
 		}
 	}
-	if second[22].Content != "["+base.Add(42*time.Second).Format("01-02 15:04")+"] <10001> m42" {
-		t.Errorf("新消息应原样追加在末尾: %+v", second[22])
+	if second[22].Content != "["+base.Add(42*time.Second).Format("01-02 15:04")+"] [群:928952016] <群友A(10001)> m42" {
+		t.Errorf("新历史应原样追加在末尾: %+v", second[22])
 	}
 }
 
 // TestBuildAppendsNewMessagesWithTimeHeader 本轮新消息以 user 角色逐条追加在
-// 末尾，首条头部带当前时间（2006-01-02 15:04），格式与历史一致（用QQ号不用昵称）。
+// 末尾，行格式与历史一致（含来源标签，昵称空回退 QQ号）；首条头部带当前时间
+// （2006-01-02 15:04），时间只出现一次。
 func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
@@ -304,34 +319,97 @@ func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 
 	t1 := time.Unix(1762400000, 0)
 	t2 := t1.Add(60 * time.Second)
-	putRecord(t, s, 1, "recv", "group", 123456, 10001, "早", t1.Unix())
-	putRecord(t, s, 2, "sent", "group", 123456, 9527, "早呀", t2.Unix())
+	putRecord(t, s, 1, "recv", "group", 928952016, 10001, "群友A", "早", t1.Unix())
+	putRecord(t, s, 2, "sent", "group", 928952016, 9527, "我", "早呀", t2.Unix())
 
 	now := t2.Add(5 * time.Minute)
 	m1t := now.Add(-30 * time.Second)
 	m2t := now.Add(-10 * time.Second)
 	msgs := b.Build(&Turn{
 		ChatType: "group",
-		ChatID:   123456,
+		ChatID:   928952016,
 		SelfID:   9527,
 		Now:      now,
 		NewMessages: []TurnMessage{
-			{SenderID: 10001, SenderName: "小明", Text: "在吗", Time: m1t},
-			{SenderID: 10003, SenderName: "小红", Text: "来打游戏", Time: m2t},
+			{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: m1t},
+			{ChatType: "group", ChatID: 928952016, SenderID: 10003, SenderName: "", Text: "来打游戏", Time: m2t},
 		},
 	})
 
 	assertMessages(t, msgs, []ChatMessage{
 		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] <10001> 早"},
-		{Role: "assistant", Content: "[" + t2.Format("01-02 15:04") + "] <我> 早呀"},
-		{Role: "user", Content: "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" + m1t.Format("01-02 15:04") + "] <10001> 在吗"},
-		{Role: "user", Content: "[" + m2t.Format("01-02 15:04") + "] <10003> 来打游戏"},
+		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 早"},
+		{Role: "assistant", Content: "[" + t2.Format("01-02 15:04") + "] [群:928952016] <我> 早呀"},
+		{Role: "user", Content: "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" + m1t.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 在吗"},
+		{Role: "user", Content: "[" + m2t.Format("01-02 15:04") + "] [群:928952016] <10003> 来打游戏"},
 	})
 }
 
+// TestBuildInjectsNotesBeforeFirstNewMessage 思考笔记以 "[思考笔记]" 块注入
+// 最终 user 消息块头部（首条新消息内容前缀，位于当前时间之前）；笔记不进
+// system；无笔记时不注入。
+func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	now := time.Unix(1762400000, 0)
+	noteT := now.Add(-10 * time.Minute)
+	newT := now.Add(-30 * time.Second)
+	withNotes := b.Build(&Turn{
+		ChatType: "group",
+		ChatID:   928952016,
+		SelfID:   9527,
+		Now:      now,
+		Notes: []Note{
+			{Time: noteT, Text: "上轮决定先查群名片"},
+			{Time: noteT.Add(time.Minute), Text: "他在开玩笑，别当真"},
+		},
+		NewMessages: []TurnMessage{
+			{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: newT},
+			{ChatType: "group", ChatID: 928952016, SenderID: 10003, SenderName: "小红", Text: "来打游戏", Time: now.Add(-10 * time.Second)},
+		},
+	})
+
+	if len(withNotes) != 3 {
+		t.Fatalf("无历史时有笔记应返回 system+2 条新消息, got %d: %+v", len(withNotes), withNotes)
+	}
+	wantFirst := "[思考笔记]\n[" + noteT.Format("01-02 15:04") + "] 上轮决定先查群名片\n[" +
+		noteT.Add(time.Minute).Format("01-02 15:04") + "] 他在开玩笑，别当真\n\n" +
+		"当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
+		newT.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 在吗"
+	if withNotes[1].Content != wantFirst {
+		t.Errorf("首条新消息未带笔记前缀:\ngot:  %q\nwant: %q", withNotes[1].Content, wantFirst)
+	}
+	if strings.Contains(withNotes[2].Content, "思考笔记") {
+		t.Errorf("笔记只应出现在首条新消息前: %q", withNotes[2].Content)
+	}
+	if strings.Contains(withNotes[0].Content, "思考笔记") {
+		t.Errorf("笔记不应进 system: %q", withNotes[0].Content)
+	}
+
+	withoutNotes := b.Build(&Turn{
+		ChatType: "group",
+		ChatID:   928952016,
+		SelfID:   9527,
+		Now:      now,
+		NewMessages: []TurnMessage{
+			{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: newT},
+		},
+	})
+	if strings.Contains(withoutNotes[len(withoutNotes)-1].Content, "思考笔记") {
+		t.Errorf("无笔记时不应注入: %q", withoutNotes[len(withoutNotes)-1].Content)
+	}
+	if !strings.HasPrefix(withoutNotes[len(withoutNotes)-1].Content, "当前时间: ") {
+		t.Errorf("无笔记时首条新消息应以当前时间开头: %q", withoutNotes[len(withoutNotes)-1].Content)
+	}
+}
+
 // TestBuildSystemStaticAcrossNow 两次不同 Now 的 Build 产出 system 完全相同
-// （时间只进末尾新消息，system 是纯静态缓存锚点）。
+// （时间与笔记只进末尾新消息，system 是纯静态缓存锚点）。
 func TestBuildSystemStaticAcrossNow(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
@@ -341,16 +419,16 @@ func TestBuildSystemStaticAcrossNow(t *testing.T) {
 	b := NewDefaultBuilder(s, cfg)
 
 	base := time.Unix(1762400000, 0)
-	putRecord(t, s, 1, "recv", "group", 123456, 10001, "早", base.Unix())
+	putRecord(t, s, 1, "recv", "group", 928952016, 10001, "群友A", "早", base.Unix())
 
 	turn := func(now time.Time) *Turn {
 		return &Turn{
 			ChatType: "group",
-			ChatID:   123456,
+			ChatID:   928952016,
 			SelfID:   9527,
 			Now:      now,
 			NewMessages: []TurnMessage{
-				{SenderID: 10001, Text: "在吗", Time: now},
+				{ChatType: "group", ChatID: 928952016, SenderID: 10001, Text: "在吗", Time: now},
 			},
 		}
 	}
@@ -381,26 +459,26 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 
 	base := time.Unix(1762400000, 0)
 	long := strings.Repeat("长", 25000)
-	putRecord(t, s, 1, "recv", "group", 123456, 10001, long, base.Unix())
+	putRecord(t, s, 1, "recv", "group", 928952016, 10001, "", long, base.Unix())
 
 	now := base.Add(time.Minute)
 	msgs := b.Build(&Turn{
 		ChatType: "group",
-		ChatID:   123456,
+		ChatID:   928952016,
 		SelfID:   9527,
 		Now:      now,
 		NewMessages: []TurnMessage{
-			{SenderID: 10001, Text: strings.Repeat("新", 21000), Time: now},
+			{ChatType: "group", ChatID: 928952016, SenderID: 10001, Text: strings.Repeat("新", 21000), Time: now},
 		},
 	})
 
 	wantTail := strings.Repeat("长", 20000) + "...(截断)"
-	wantHistory := "[" + base.Format("01-02 15:04") + "] <10001> " + wantTail
+	wantHistory := "[" + base.Format("01-02 15:04") + "] [群:928952016] <10001> " + wantTail
 	if msgs[1].Content != wantHistory {
 		t.Errorf("超长历史未按 20000 字符截断: rune 数 = %d", len([]rune(msgs[1].Content)))
 	}
 	wantNew := "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
-		now.Format("01-02 15:04") + "] <10001> " + strings.Repeat("新", 20000) + "...(截断)"
+		now.Format("01-02 15:04") + "] [群:928952016] <10001> " + strings.Repeat("新", 20000) + "...(截断)"
 	if msgs[2].Content != wantNew {
 		t.Errorf("超长新消息未按 20000 字符截断: rune 数 = %d", len([]rune(msgs[2].Content)))
 	}

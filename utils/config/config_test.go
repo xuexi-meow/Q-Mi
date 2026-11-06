@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validConfigYAML = `bot:
@@ -32,6 +33,21 @@ napcat:
 storage:
   enable: true
   path: "Q-Mi.db"
+`
+
+// agentConfigYAML 在有效配置上追加启用的 agent 块，供 agent 相关测试复用。
+const agentConfigYAML = validConfigYAML + `agent:
+  enable: true
+  base_url: "https://api.example.com/v1"
+  api_key: "sk-test"
+  model: "deepseek-chat"
+  persona_file: "agent/persona.md"
+  debounce: 3s
+  temperature: 0.8
+  debug: false
+  history:
+    max: 40
+    trim: 20
 `
 
 func configTestDir(t *testing.T) string {
@@ -104,6 +120,7 @@ func TestLoadConfigCurrentConfiguration(t *testing.T) {
 			HTTP: NapcatConn{Enable: true, Host: "127.0.0.1", Port: 8080},
 		},
 		Storage: &Storage{Enable: true, Path: "Q-Mi.db"},
+		Agent:   &AgentConfig{},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("LoadConfig = %+v, want %+v", got, want)
@@ -209,5 +226,155 @@ func TestLoadConfigAcceptsValidBoundariesAndDisabledServices(t *testing.T) {
 				t.Fatal("valid configuration was rejected")
 			}
 		})
+	}
+}
+
+func TestLoadConfigDefaultAgentValues(t *testing.T) {
+	configTestDir(t)
+	got := new(Config).LoadConfig()
+	if got == nil {
+		t.Fatal("LoadConfig returned nil")
+	}
+	want := &AgentConfig{
+		Enable:      false,
+		BaseURL:     "",
+		APIKey:      "",
+		Model:       "",
+		PersonaFile: "agent/persona.md",
+		Debounce:    3 * time.Second,
+		Temperature: 0.8,
+		Debug:       false,
+		History:     AgentHistory{Max: 40, Trim: 20},
+	}
+	if !reflect.DeepEqual(got.Agent, want) {
+		t.Errorf("default agent config = %+v, want %+v", got.Agent, want)
+	}
+}
+
+func TestLoadConfigAgentBlock(t *testing.T) {
+	filename := configTestDir(t)
+	writeTestConfig(t, filename, agentConfigYAML)
+	got := new(Config).LoadConfig()
+	if got == nil {
+		t.Fatal("LoadConfig returned nil for valid agent configuration")
+	}
+	want := &AgentConfig{
+		Enable:      true,
+		BaseURL:     "https://api.example.com/v1",
+		APIKey:      "sk-test",
+		Model:       "deepseek-chat",
+		PersonaFile: "agent/persona.md",
+		Debounce:    3 * time.Second,
+		Temperature: 0.8,
+		Debug:       false,
+		History:     AgentHistory{Max: 40, Trim: 20},
+	}
+	if !reflect.DeepEqual(got.Agent, want) {
+		t.Errorf("agent config = %+v, want %+v", got.Agent, want)
+	}
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != agentConfigYAML {
+		t.Error("loading modified the existing configuration")
+	}
+}
+
+func TestLoadConfigRejectsInvalidAgentConfiguration(t *testing.T) {
+	cases := []struct {
+		name  string
+		old   string
+		new   string
+		field string
+	}{
+		{"base_url without scheme", `base_url: "https://api.example.com/v1"`, `base_url: "api.example.com/v1"`, "agent.base_url"},
+		{"base_url with ftp scheme", `base_url: "https://api.example.com/v1"`, `base_url: "ftp://api.example.com/v1"`, "agent.base_url"},
+		{"base_url without host", `base_url: "https://api.example.com/v1"`, `base_url: "http://"`, "agent.base_url"},
+		{"empty base_url", `base_url: "https://api.example.com/v1"`, `base_url: ""`, "agent.base_url"},
+		{"blank base_url", `base_url: "https://api.example.com/v1"`, `base_url: "  "`, "agent.base_url"},
+		{"empty model", `model: "deepseek-chat"`, `model: ""`, "agent.model"},
+		{"blank model", `model: "deepseek-chat"`, `model: "  "`, "agent.model"},
+		{"empty api_key", `api_key: "sk-test"`, `api_key: ""`, "agent.api_key"},
+		{"blank api_key", `api_key: "sk-test"`, `api_key: "  "`, "agent.api_key"},
+		{"empty persona_file", `persona_file: "agent/persona.md"`, `persona_file: ""`, "agent.persona_file"},
+		{"history max below trim", "max: 40", "max: 10", "agent.history.max"},
+		{"zero history trim", "trim: 20", "trim: 0", "agent.history.trim"},
+		{"negative history trim", "trim: 20", "trim: -1", "agent.history.trim"},
+		{"zero debounce", "debounce: 3s", "debounce: 0s", "agent.debounce"},
+		{"negative debounce", "debounce: 3s", "debounce: -1s", "agent.debounce"},
+		{"non-duration debounce", "debounce: 3s", "debounce: fast", "agent"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			filename := configTestDir(t)
+			content := strings.Replace(agentConfigYAML, tc.old, tc.new, 1)
+			if content == agentConfigYAML {
+				t.Fatal("test replacement did not modify the fixture")
+			}
+			writeTestConfig(t, filename, content)
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			if got := new(Config).LoadConfig(); got != nil {
+				t.Error("invalid agent configuration was accepted")
+			}
+			if !strings.Contains(logs.String(), tc.field) {
+				t.Errorf("error log must identify %q, got %q", tc.field, logs.String())
+			}
+			got, err := os.ReadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Error("invalid existing config was overwritten")
+			}
+		})
+	}
+}
+
+func TestLoadConfigAcceptsValidAgentBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"history max equals trim", "max: 40", "max: 20"},
+		{"minimum positive trim", "trim: 20", "trim: 1"},
+		{"short debounce", "debounce: 3s", "debounce: 1ms"},
+		{"http scheme base_url", `base_url: "https://api.example.com/v1"`, `base_url: "http://127.0.0.1:8000/v1"`},
+		{"base_url without path", `base_url: "https://api.example.com/v1"`, `base_url: "https://api.example.com"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filename := configTestDir(t)
+			writeTestConfig(t, filename, strings.Replace(agentConfigYAML, tc.old, tc.new, 1))
+			if new(Config).LoadConfig() == nil {
+				t.Fatal("valid agent configuration was rejected")
+			}
+		})
+	}
+}
+
+func TestLoadConfigSkipsAgentValidationWhenDisabled(t *testing.T) {
+	filename := configTestDir(t)
+	// agent.enable=false 时其余 agent 字段即使非法也不阻断启动。
+	content := strings.Replace(validConfigYAML, "storage:", `agent:
+  enable: false
+  base_url: "not a url"
+  api_key: ""
+  model: ""
+  persona_file: ""
+  debounce: 0s
+  history:
+    max: 0
+    trim: 0
+storage:`, 1)
+	if content == validConfigYAML {
+		t.Fatal("test replacement did not modify the fixture")
+	}
+	writeTestConfig(t, filename, content)
+	if new(Config).LoadConfig() == nil {
+		t.Fatal("disabled agent with invalid values must not be rejected")
 	}
 }

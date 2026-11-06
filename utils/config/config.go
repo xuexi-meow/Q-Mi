@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/spf13/viper"
@@ -34,6 +35,18 @@ napcat:
 storage:
   enable: true
   path: "Q-Mi.db"
+agent:
+  enable: false
+  base_url: ""
+  api_key: ""
+  model: ""
+  persona_file: "agent/persona.md"
+  debounce: 3s
+  temperature: 0.8
+  debug: false
+  history:
+    max: 40
+    trim: 20
 `
 
 type Config struct {
@@ -41,6 +54,7 @@ type Config struct {
 	NetSetting *NetSetting
 	Napcat     *Napcat
 	Storage    *Storage
+	Agent      *AgentConfig
 }
 
 // Storage 消息记忆库配置
@@ -75,6 +89,27 @@ type NapcatConn struct {
 	Token  string `yaml:"token"`
 }
 
+// AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
+// 注意：viper UnmarshalKey 走 mapstructure，多单词键需 mapstructure 标签。
+// P2 预留：judge 判断模型块（judge.base_url/api_key/model），未配置回退主模型。
+type AgentConfig struct {
+	Enable      bool          `yaml:"enable" mapstructure:"enable"`
+	BaseURL     string        `yaml:"base_url" mapstructure:"base_url"`
+	APIKey      string        `yaml:"api_key" mapstructure:"api_key"`
+	Model       string        `yaml:"model" mapstructure:"model"`
+	PersonaFile string        `yaml:"persona_file" mapstructure:"persona_file"`
+	Debounce    time.Duration `yaml:"debounce" mapstructure:"debounce"`
+	Temperature float64       `yaml:"temperature" mapstructure:"temperature"`
+	Debug       bool          `yaml:"debug" mapstructure:"debug"`
+	History     AgentHistory  `yaml:"history" mapstructure:"history"`
+}
+
+// AgentHistory 上下文历史携带策略。
+type AgentHistory struct {
+	Max  int `yaml:"max" mapstructure:"max"`
+	Trim int `yaml:"trim" mapstructure:"trim"`
+}
+
 func (c *Config) LoadConfig() *Config {
 	v := viper.New()
 	v.SetConfigName("Config")
@@ -98,11 +133,11 @@ func (c *Config) LoadConfig() *Config {
 		}
 	}
 
-	bot, netSetting, napcat, storageCfg := initConfig(*v)
-	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil {
+	bot, netSetting, napcat, storageCfg, agentCfg := initConfig(*v)
+	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil || agentCfg == nil {
 		return nil
 	}
-	if err := validateConfig(netSetting, napcat, storageCfg); err != nil {
+	if err := validateConfig(netSetting, napcat, storageCfg, agentCfg); err != nil {
 		slog.Error("配置校验失败", "err", err)
 		return nil
 	}
@@ -113,6 +148,7 @@ func (c *Config) LoadConfig() *Config {
 		NetSetting: netSetting,
 		Napcat:     napcat,
 		Storage:    storageCfg,
+		Agent:      agentCfg,
 	}
 }
 
@@ -131,7 +167,7 @@ func makeNewConfig() bool {
 	return true
 }
 
-func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage) error {
+func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, agent *AgentConfig) error {
 	if err := validateHostPort("netsetting", netSetting.Host, netSetting.Port); err != nil {
 		return err
 	}
@@ -153,6 +189,42 @@ func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage) er
 			return err
 		}
 	}
+	if agent.Enable {
+		if err := validateAgentConfig(agent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAgentConfig 校验启用的 agent 块。
+func validateAgentConfig(agent *AgentConfig) error {
+	baseURL := strings.TrimSpace(agent.BaseURL)
+	u, err := url.ParseRequestURI(baseURL)
+	if err != nil {
+		return fmt.Errorf("agent.base_url: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("agent.base_url %q must be a valid http(s) URL", agent.BaseURL)
+	}
+	if strings.TrimSpace(agent.Model) == "" {
+		return fmt.Errorf("agent.model must not be empty when agent is enabled")
+	}
+	if strings.TrimSpace(agent.APIKey) == "" {
+		return fmt.Errorf("agent.api_key must not be empty when agent is enabled")
+	}
+	if strings.TrimSpace(agent.PersonaFile) == "" {
+		return fmt.Errorf("agent.persona_file must not be empty when agent is enabled")
+	}
+	if agent.Debounce <= 0 {
+		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)
+	}
+	if agent.History.Trim <= 0 {
+		return fmt.Errorf("agent.history.trim must be positive, got %d", agent.History.Trim)
+	}
+	if agent.History.Max < agent.History.Trim {
+		return fmt.Errorf("agent.history.max %d must be >= agent.history.trim %d", agent.History.Max, agent.History.Trim)
+	}
 	return nil
 }
 
@@ -166,26 +238,31 @@ func validateHostPort(name, host string, port int) error {
 	return nil
 }
 
-func initConfig(v viper.Viper) (*Bot, *NetSetting, *Napcat, *Storage) {
+func initConfig(v viper.Viper) (*Bot, *NetSetting, *Napcat, *Storage, *AgentConfig) {
 	var bot Bot
 	if err := v.UnmarshalKey("bot", &bot); err != nil {
 		slog.Error("解析 bot 配置失败", "err", err)
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	var netSetting NetSetting
 	if err := v.UnmarshalKey("netsetting", &netSetting); err != nil {
 		slog.Error("解析 netsetting 配置失败", "err", err)
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	var napcat Napcat
 	if err := v.UnmarshalKey("napcat", &napcat); err != nil {
 		slog.Error("解析 napcat 配置失败", "err", err)
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	var storage Storage
 	if err := v.UnmarshalKey("storage", &storage); err != nil {
 		slog.Error("解析 storage 配置失败", "err", err)
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
-	return &bot, &netSetting, &napcat, &storage
+	var agent AgentConfig
+	if err := v.UnmarshalKey("agent", &agent); err != nil {
+		slog.Error("解析 agent 配置失败", "err", err)
+		return nil, nil, nil, nil, nil
+	}
+	return &bot, &netSetting, &napcat, &storage, &agent
 }

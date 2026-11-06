@@ -11,6 +11,7 @@ import (
 	"Q-Mi/app"
 	"Q-Mi/bot"
 	"Q-Mi/event"
+	evmsg "Q-Mi/event/message"
 	"Q-Mi/storage"
 	"Q-Mi/utils/config"
 )
@@ -30,6 +31,15 @@ func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
 	return NewManager(NewDefaultBuilder(store, cfg), NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store)
 }
 
+// urgentFromEvent 判定消息紧急度（spec §5 插话打断）：
+// 私聊一律紧急；群聊仅当消息 @ 了机器人自身（按事件自带 self_id）才紧急。
+func urgentFromEvent(chatType string, msgs []*evmsg.Message, selfID int64) bool {
+	if chatType == "private" {
+		return true
+	}
+	return bot.AtUserID(msgs, selfID)
+}
+
 func init() {
 	event.RegisterTyped("message.private", func(e *event.PrivateMessageEvent) {
 		m := getManager()
@@ -45,6 +55,7 @@ func init() {
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
 			Time:       unixTime(e.Time),
+			Urgent:     urgentFromEvent("private", e.Message, int64(e.SelfID)),
 		})
 	})
 	event.RegisterTyped("message.group", func(e *event.GroupMessageEvent) {
@@ -62,6 +73,7 @@ func init() {
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
 			Time:       unixTime(e.Time),
+			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),
 		})
 	})
 }

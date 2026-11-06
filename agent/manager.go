@@ -1,13 +1,14 @@
 // manager.go 实现会话队列与防抖（spec 第 6/9/10 节）：
 // 以 (chat_type, chat_id) 为键，每会话一个懒创建的串行 worker；
 // 消息先进 pending 缓冲，debounce 定时器到期后合并成一个 Turn 投递；
-// worker 忙则排队不打断，panic 自兜底存活。
-// handleTurn 为 P2 思考循环（spec §4）：LLM + 工具调用，finish/轮数上限终止。
+// worker 忙则排队，紧急消息（私聊/群@）可打断正在思考的 turn 立即重开（spec §5），
+// panic 自兜底存活。handleTurn 为 P2 思考循环（spec §4）：LLM + 工具调用，finish/轮数上限终止。
 package agent
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -32,6 +33,7 @@ type IncomingMessage struct {
 	SenderName string
 	Text       string
 	Time       time.Time
+	Urgent     bool // 紧急（私聊/群@，wiring 判定）：思考中收到则打断当前 turn（spec §5）
 }
 
 // defaultDebounce 防抖窗口默认值（cfg.Debounce 非正时兜底）。
@@ -54,6 +56,9 @@ type session struct {
 	ch      chan *Turn
 	pending []TurnMessage
 	timer   *time.Timer
+	// currentCancel 正在思考的 turn 的取消函数（spec §5 插话打断）；
+	// nil = worker 空闲。仅该会话的串行 worker 写入，Enqueue(urgent) 读取并调用。
+	currentCancel context.CancelFunc
 }
 
 // Manager 会话队列：防抖合并、串行处理、思考循环（工具调用）、回复、debug 落盘。
@@ -93,6 +98,9 @@ func sessionKey(chatType string, chatID int64) string {
 
 // Enqueue 追加一条消息进所属会话的 pending 缓冲，并重置防抖 timer。
 // timer 到期后把 pending 快照合并成一个 Turn 投给该会话的串行 worker。
+// 紧急消息（私聊/群@，spec §5）且该会话 worker 正在思考时打断：
+// 取消当前 turn 的 LLM 请求，把 pending 全部内容立即合并成一个新 Turn 投递；
+// worker 空闲时紧急消息仍走正常防抖（合并语义不变）。
 func (m *Manager) Enqueue(msg IncomingMessage) {
 	debounce := m.cfg.Debounce
 	if debounce <= 0 {
@@ -100,6 +108,8 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 	}
 
 	key := sessionKey(msg.ChatType, msg.ChatID)
+	var flushTurn *Turn
+
 	m.mu.Lock()
 	s, ok := m.sessions[key]
 	if !ok {
@@ -113,36 +123,78 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 		Text:       msg.Text,
 		Time:       msg.Time,
 	})
-	if s.timer != nil {
-		s.timer.Stop()
-	}
-	chatType, chatID, selfID := msg.ChatType, msg.ChatID, msg.SelfID
-	s.timer = time.AfterFunc(debounce, func() {
-		m.mu.Lock()
-		// 每条 TurnMessage 自带所属会话（session 键即会话，二者恒一致）
-		for i := range s.pending {
-			s.pending[i].ChatType = chatType
-			s.pending[i].ChatID = chatID
+
+	if msg.Urgent && s.currentCancel != nil {
+		// 插话打断：取消正在思考的 turn，pending 全部内容立即重开（spec §5）
+		s.currentCancel()
+		if s.timer != nil {
+			s.timer.Stop()
 		}
-		turn := &Turn{
-			ChatType:    chatType,
-			ChatID:      chatID,
-			SelfID:      selfID,
+		for i := range s.pending {
+			s.pending[i].ChatType = msg.ChatType
+			s.pending[i].ChatID = msg.ChatID
+		}
+		flushTurn = &Turn{
+			ChatType:    msg.ChatType,
+			ChatID:      msg.ChatID,
+			SelfID:      msg.SelfID,
 			Now:         time.Now(),
 			NewMessages: s.pending,
 		}
 		s.pending = nil
 		s.timer = nil
-		m.mu.Unlock()
-		s.ch <- turn // 有缓冲;worker 忙则排队,不打断正在进行的生成
-	})
+	} else {
+		if s.timer != nil {
+			s.timer.Stop()
+		}
+		chatType, chatID, selfID := msg.ChatType, msg.ChatID, msg.SelfID
+		s.timer = time.AfterFunc(debounce, func() {
+			m.mu.Lock()
+			if len(s.pending) == 0 {
+				// pending 已被紧急 flush 提前取走（timer 来不及 Stop），本次触发作废
+				s.timer = nil
+				m.mu.Unlock()
+				return
+			}
+			// 每条 TurnMessage 自带所属会话（session 键即会话，二者恒一致）
+			for i := range s.pending {
+				s.pending[i].ChatType = chatType
+				s.pending[i].ChatID = chatID
+			}
+			turn := &Turn{
+				ChatType:    chatType,
+				ChatID:      chatID,
+				SelfID:      selfID,
+				Now:         time.Now(),
+				NewMessages: s.pending,
+			}
+			s.pending = nil
+			s.timer = nil
+			m.mu.Unlock()
+			s.ch <- turn // 有缓冲;worker 忙则排队,不打断正在进行的生成
+		})
+	}
 	m.mu.Unlock()
+
+	if flushTurn != nil {
+		s.ch <- flushTurn // 有缓冲;被打断的 turn 收尾后 worker 立即接手
+	}
 }
 
 // workerLoop 长驻消费循环：逐个处理 turn，panic 自兜底继续（不依赖外层 recover）。
 func (m *Manager) workerLoop(key string, ch <-chan *Turn) {
 	for turn := range ch {
 		m.handleTurn(turn)
+	}
+}
+
+// setCurrentCancel 记录/清除会话当前 turn 的取消函数（spec §5 插话打断）。
+// 只有该会话的串行 worker（handleTurn）写入；Enqueue(urgent) 读取并调用。
+func (m *Manager) setCurrentCancel(key string, cancel context.CancelFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[key]; ok {
+		s.currentCancel = cancel
 	}
 }
 
@@ -153,8 +205,14 @@ func (m *Manager) workerLoop(key string, ch <-chan *Turn) {
 //   - 纯文本响应：视为直接回复发出（兼容不会用工具的模型），结束
 //   - finish：结束
 //   - 轮数耗尽 / LLM 错误：强制结束，记日志
+//   - ctx 被取消（spec §5 插话打断）：本轮不补处理、不回复，pending 已合并成新 turn
 func (m *Manager) handleTurn(turn *Turn) {
+	key := sessionKey(turn.ChatType, turn.ChatID)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.setCurrentCancel(key, cancel)
 	defer func() {
+		m.setCurrentCancel(key, nil)
+		cancel()
 		if r := recover(); r != nil {
 			slog.Error("agent worker panic，已恢复继续服务",
 				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "panic", r)
@@ -184,10 +242,18 @@ func (m *Manager) handleTurn(turn *Turn) {
 			Temperature: m.cfg.Temperature,
 			Tools:       defs,
 		}
-		resp, chatErr := m.client.Chat(context.Background(), req)
+		resp, chatErr := m.client.Chat(ctx, req)
 		if chatErr != nil {
+			interrupted := errors.Is(chatErr, context.Canceled)
 			if m.cfg.Debug {
-				m.dumpDebug(turn, req, round, nil, nil, chatErr, false)
+				m.dumpDebug(turn, req, round, nil, nil, chatErr, interrupted)
+			}
+			if interrupted {
+				// 插话打断（spec §5）：不按普通错误刷屏，不补处理、不回复；
+				// 消息都在 storage，新 turn 上下文自然包含
+				slog.Info("本轮思考被紧急消息打断，等待新 turn 重开",
+					"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
+				return
 			}
 			slog.Warn("LLM 请求失败，本轮思考结束，不重试",
 				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "err", chatErr)

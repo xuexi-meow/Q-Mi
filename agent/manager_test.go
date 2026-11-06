@@ -53,7 +53,8 @@ func (b *stubBuilder) turn(i int) *Turn {
 
 // fakeLLM 假 OpenAI:记录每个请求体与到达时间,返回固定 content。
 // script 非空时按序循环返回脚本里的原始响应 JSON(用于思考循环测试);
-// hook 非空时在记录请求后、返回响应前调用(可阻塞模拟慢响应)。
+// hook 非空时在记录请求后、返回响应前调用(可阻塞模拟慢响应,可经
+// r.Context() 观察客户端取消,用于插话打断测试)。
 // 请求逐个串行处理(模拟真实客户端等响应才发下一请求),
 // 到达时间因此可用来断言"串行不打断"。
 type fakeLLM struct {
@@ -62,7 +63,7 @@ type fakeLLM struct {
 	reqs    []ChatRequest
 	arrival []time.Time
 	script  []string
-	hook    func(idx int)
+	hook    func(idx int, r *http.Request)
 }
 
 func newFakeLLM(t *testing.T, content string) (*fakeLLM, *httptest.Server) {
@@ -81,7 +82,7 @@ func newFakeLLM(t *testing.T, content string) (*fakeLLM, *httptest.Server) {
 		hook := f.hook
 		f.mu.Unlock()
 		if hook != nil {
-			hook(idx)
+			hook(idx, r)
 		}
 		resp := map[string]any{}
 		var body []byte
@@ -253,7 +254,7 @@ func TestWorkerSerializesTurnsWithoutInterruption(t *testing.T) {
 	started := make(chan struct{})
 	released := make(chan struct{})
 	f.mu.Lock()
-	f.hook = func(idx int) {
+	f.hook = func(idx int, r *http.Request) {
 		if idx == 0 {
 			close(started)
 			<-released

@@ -337,3 +337,17 @@ func TestToolErrorShape(t *testing.T) {
 		t.Fatalf("非法参数应报错, got %q", out)
 	}
 }
+
+// TestToolDefsSchemaNoNulls 无参工具（finish/help 等）的参数 schema 不得包含
+// null 字段——部分 OpenAI 兼容提供商（实测 400：null is not of type "array"）
+// 要求 required 必须是数组或省略，properties 不能是 null。
+func TestToolDefsSchemaNoNulls(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	data, err := json.Marshal(toolDefs(tools))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "null") {
+		t.Errorf("工具 schema 序列化含 null，会被提供商拒绝:\n%s", data)
+	}
+}

@@ -46,12 +46,20 @@ func toolDefs(tools []Tool) []ToolDef {
 }
 
 // objectParams 生成 {"type":"object","properties":...} 形态的参数 schema。
+// required 为空时省略（部分 OpenAI 兼容提供商拒绝 "required": null），
+// properties 为空时给空对象（同样不能是 null）。
 func objectParams(properties map[string]any, required []string) map[string]any {
-	return map[string]any{
+	if properties == nil {
+		properties = map[string]any{}
+	}
+	schema := map[string]any{
 		"type":       "object",
 		"properties": properties,
-		"required":   required,
 	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
 }
 
 // strProp / intProp 属性快捷构造。

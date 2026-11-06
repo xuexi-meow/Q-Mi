@@ -52,6 +52,7 @@ func (b *stubBuilder) turn(i int) *Turn {
 }
 
 // fakeLLM 假 OpenAI:记录每个请求体与到达时间,返回固定 content。
+// script 非空时按序循环返回脚本里的原始响应 JSON(用于思考循环测试);
 // hook 非空时在记录请求后、返回响应前调用(可阻塞模拟慢响应)。
 // 请求逐个串行处理(模拟真实客户端等响应才发下一请求),
 // 到达时间因此可用来断言"串行不打断"。
@@ -60,6 +61,7 @@ type fakeLLM struct {
 	serial  sync.Mutex
 	reqs    []ChatRequest
 	arrival []time.Time
+	script  []string
 	hook    func(idx int)
 }
 
@@ -75,18 +77,26 @@ func newFakeLLM(t *testing.T, content string) (*fakeLLM, *httptest.Server) {
 		idx := len(f.reqs)
 		f.reqs = append(f.reqs, req)
 		f.arrival = append(f.arrival, time.Now())
+		script := f.script
 		hook := f.hook
 		f.mu.Unlock()
 		if hook != nil {
 			hook(idx)
 		}
-		resp := map[string]any{
-			"choices": []map[string]any{
-				{"index": 0, "message": map[string]any{"role": "assistant", "content": content}},
-			},
+		resp := map[string]any{}
+		var body []byte
+		if len(script) > 0 {
+			body = []byte(script[idx%len(script)])
+		} else {
+			resp = map[string]any{
+				"choices": []map[string]any{
+					{"index": 0, "message": map[string]any{"role": "assistant", "content": content}},
+				},
+			}
+			body, _ = json.Marshal(resp)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		_, _ = w.Write(body)
 	}))
 	t.Cleanup(srv.Close)
 	return f, srv
@@ -171,7 +181,9 @@ func testCfg(debounce time.Duration) config.AgentConfig {
 func newTestManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder) (*Manager, *fakeLLM) {
 	t.Helper()
 	f, srv := newFakeLLM(t, "pong")
-	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg)
+	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
+	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	t.Cleanup(func() { srv.Close() })
 	return m, f
 }
@@ -215,6 +227,11 @@ func TestEnqueueDebouncesIntoSingleTurn(t *testing.T) {
 	}
 	if len(turn.NewMessages) != 3 {
 		t.Fatalf("turn 应合并 3 条新消息,得到 %d", len(turn.NewMessages))
+	}
+	for i, tm := range turn.NewMessages {
+		if tm.ChatType != "group" || tm.ChatID != 888 {
+			t.Errorf("新消息[%d] 应自带会话 group/888, got %s/%d", i, tm.ChatType, tm.ChatID)
+		}
 	}
 	for i, want := range []string{"一", "二", "三"} {
 		if turn.NewMessages[i].Text != want {
@@ -347,7 +364,9 @@ func TestEmptyContentNotSent(t *testing.T) {
 	b := &stubBuilder{}
 	cfg := testCfg(20 * time.Millisecond)
 	emptyF, emptySrv := newFakeLLM(t, "   ")
-	m := NewManager(b, NewClient(emptySrv.URL, "sk-test", 5*time.Second), cfg)
+	m := NewManager(b, NewClient(emptySrv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
+	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	napcat := startFakeNapCat(t)
 
 	m.Enqueue(msg("private", 111, "你好"))

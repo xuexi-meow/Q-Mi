@@ -7,4 +7,6 @@ npm_install_log.txt
 .continue/
 .vscode/
 agent/debug/
+agent/notes.json
+agent/state.json
 Config.yaml

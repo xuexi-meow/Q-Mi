@@ -45,6 +45,7 @@ const agentConfigYAML = validConfigYAML + `agent:
   debounce: 3s
   temperature: 0.8
   debug: false
+  max_tool_rounds: 5
   history:
     max: 40
     trim: 20
@@ -236,15 +237,16 @@ func TestLoadConfigDefaultAgentValues(t *testing.T) {
 		t.Fatal("LoadConfig returned nil")
 	}
 	want := &AgentConfig{
-		Enable:      false,
-		BaseURL:     "",
-		APIKey:      "",
-		Model:       "",
-		PersonaFile: "agent/persona.md",
-		Debounce:    3 * time.Second,
-		Temperature: 0.8,
-		Debug:       false,
-		History:     AgentHistory{Max: 40, Trim: 20},
+		Enable:        false,
+		BaseURL:       "",
+		APIKey:        "",
+		Model:         "",
+		PersonaFile:   "agent/persona.md",
+		Debounce:      3 * time.Second,
+		Temperature:   0.8,
+		Debug:         false,
+		MaxToolRounds: 10,
+		History:       AgentHistory{Max: 40, Trim: 20},
 	}
 	if !reflect.DeepEqual(got.Agent, want) {
 		t.Errorf("default agent config = %+v, want %+v", got.Agent, want)
@@ -259,15 +261,16 @@ func TestLoadConfigAgentBlock(t *testing.T) {
 		t.Fatal("LoadConfig returned nil for valid agent configuration")
 	}
 	want := &AgentConfig{
-		Enable:      true,
-		BaseURL:     "https://api.example.com/v1",
-		APIKey:      "sk-test",
-		Model:       "deepseek-chat",
-		PersonaFile: "agent/persona.md",
-		Debounce:    3 * time.Second,
-		Temperature: 0.8,
-		Debug:       false,
-		History:     AgentHistory{Max: 40, Trim: 20},
+		Enable:        true,
+		BaseURL:       "https://api.example.com/v1",
+		APIKey:        "sk-test",
+		Model:         "deepseek-chat",
+		PersonaFile:   "agent/persona.md",
+		Debounce:      3 * time.Second,
+		Temperature:   0.8,
+		Debug:         false,
+		MaxToolRounds: 5,
+		History:       AgentHistory{Max: 40, Trim: 20},
 	}
 	if !reflect.DeepEqual(got.Agent, want) {
 		t.Errorf("agent config = %+v, want %+v", got.Agent, want)
@@ -304,6 +307,8 @@ func TestLoadConfigRejectsInvalidAgentConfiguration(t *testing.T) {
 		{"zero debounce", "debounce: 3s", "debounce: 0s", "agent.debounce"},
 		{"negative debounce", "debounce: 3s", "debounce: -1s", "agent.debounce"},
 		{"non-duration debounce", "debounce: 3s", "debounce: fast", "agent"},
+		{"zero max_tool_rounds", "max_tool_rounds: 5", "max_tool_rounds: 0", "agent.max_tool_rounds"},
+		{"negative max_tool_rounds", "max_tool_rounds: 5", "max_tool_rounds: -1", "agent.max_tool_rounds"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -342,6 +347,7 @@ func TestLoadConfigAcceptsValidAgentBoundaries(t *testing.T) {
 	}{
 		{"history max equals trim", "max: 40", "max: 20"},
 		{"minimum positive trim", "trim: 20", "trim: 1"},
+		{"minimum max_tool_rounds", "max_tool_rounds: 5", "max_tool_rounds: 1"},
 		{"short debounce", "debounce: 3s", "debounce: 1ms"},
 		{"http scheme base_url", `base_url: "https://api.example.com/v1"`, `base_url: "http://127.0.0.1:8000/v1"`},
 		{"base_url without path", `base_url: "https://api.example.com/v1"`, `base_url: "https://api.example.com"`},

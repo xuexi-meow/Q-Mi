@@ -1,0 +1,339 @@
+package agent
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"Q-Mi/storage"
+)
+
+// agentStateFile state.json 的内容结构（与实现一致）。
+type agentStateFile struct {
+	Mood    string    `json:"mood"`
+	Updated time.Time `json:"updated"`
+}
+
+func readState(t *testing.T, path string) (agentStateFile, error) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agentStateFile{}, err
+	}
+	var s agentStateFile
+	err = json.Unmarshal(data, &s)
+	return s, err
+}
+
+func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
+
+// testToolSet 用临时 notes/state 路径构造工具集，避免测试污染 agent/ 目录。
+func testToolSet(t *testing.T, store *storage.Store) ([]Tool, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	notesPath := filepath.Join(dir, "notes.json")
+	statePath := filepath.Join(dir, "state.json")
+	return newToolSet(store, notesPath, statePath), notesPath, statePath
+}
+
+// findTool 按名字取工具。
+func findTool(t *testing.T, tools []Tool, name string) Tool {
+	t.Helper()
+	for _, tl := range tools {
+		if tl.Name == name {
+			return tl
+		}
+	}
+	t.Fatalf("工具集中没有 %q", name)
+	return Tool{}
+}
+
+// runToolOK 执行工具并要求成功，返回输出。
+func runToolOK(t *testing.T, tools []Tool, name, args string) string {
+	t.Helper()
+	tl := findTool(t, tools, name)
+	if tl.Run == nil {
+		t.Fatalf("工具 %q 没有 Run", name)
+	}
+	out, err := tl.Run(json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("%s(%s) 应成功, got err: %v", name, args, err)
+	}
+	return out
+}
+
+// runToolErr 执行工具并要求返回 error。
+func runToolErr(t *testing.T, tools []Tool, name, args string) error {
+	t.Helper()
+	tl := findTool(t, tools, name)
+	out, err := tl.Run(json.RawMessage(args))
+	if err == nil {
+		t.Fatalf("%s(%s) 应报错, got output %q", name, args, out)
+	}
+	return err
+}
+
+// wantToolNames P2 全部工具名。
+var wantToolNames = []string{
+	"get_recent_messages", "search_messages",
+	"send_message", "think", "update_mood", "finish", "help",
+}
+
+// TestToolSetContainsAllTools 工具集包含全部 7 个工具，finish 无 Run（纯终止标记）。
+func TestToolSetContainsAllTools(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	got := make([]string, 0, len(tools))
+	for _, tl := range tools {
+		got = append(got, tl.Name)
+		if tl.Description == "" {
+			t.Errorf("工具 %q 缺少描述", tl.Name)
+		}
+		if tl.Parameters == nil {
+			t.Errorf("工具 %q 缺少参数 schema", tl.Name)
+		}
+	}
+	if !reflect.DeepEqual(got, wantToolNames) {
+		t.Errorf("工具名 = %v, want %v", got, wantToolNames)
+	}
+	if findTool(t, tools, "finish").Run != nil {
+		t.Error("finish 不应有 Run（只作循环终止标记）")
+	}
+}
+
+// TestHelpToolDescribesAllTools help 从工具定义生成全部工具的
+// 名称+描述+参数 schema（单一源头），JSON 数组、无空白。
+func TestHelpToolDescribesAllTools(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "help", "")
+	if strings.ContainsAny(out, "\n\t") || strings.Contains(out, ": ") {
+		t.Errorf("help 输出应为紧凑 JSON: %q", out)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		t.Fatalf("help 输出不是 JSON 数组: %v (%s)", err, out)
+	}
+	if len(items) != len(wantToolNames) {
+		t.Fatalf("help 条目数 = %d, want %d", len(items), len(wantToolNames))
+	}
+	seen := map[string]bool{}
+	for _, it := range items {
+		name, _ := it["name"].(string)
+		desc, _ := it["description"].(string)
+		if name == "" || desc == "" {
+			t.Errorf("help 条目缺 name/description: %v", it)
+		}
+		if _, ok := it["parameters"]; !ok {
+			t.Errorf("help 条目 %q 缺 parameters", name)
+		}
+		seen[name] = true
+	}
+	for _, name := range wantToolNames {
+		if !seen[name] {
+			t.Errorf("help 未列出工具 %q", name)
+		}
+	}
+}
+
+// TestGetRecentMessagesTool 查询结果为紧凑 JSON 数组、按时间正序，
+// 字段含 message_id/chat_type/chat_id/sender_name/text/time；支持
+// chat_type/chat_id 过滤与 limit。
+func TestGetRecentMessagesTool(t *testing.T) {
+	s := openTestStore(t)
+	tools, _, _ := testToolSet(t, s)
+
+	t1 := time.Unix(1762400000, 0)
+	putRecord(t, s, 1, "recv", "group", 888, 10001, "群友A", "第一条", t1.Unix())
+	putRecord(t, s, 2, "recv", "private", 20002, 20002, "私聊B", "第二条", t1.Add(time.Minute).Unix())
+	putRecord(t, s, 3, "recv", "group", 888, 10003, "群友C", "第三条", t1.Add(2*time.Minute).Unix())
+
+	out := runToolOK(t, tools, "get_recent_messages", `{"limit":2}`)
+	if strings.ContainsAny(out, "\n\t") || strings.Contains(out, ": ") {
+		t.Errorf("输出应为紧凑 JSON: %q", out)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("输出不是 JSON 数组: %v (%s)", err, out)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("limit=2 应返回 2 条, got %d: %s", len(rows), out)
+	}
+	// 正序：最新的第 3 条在前? 不——正序 = 旧→新，取最近 2 条即第 2、3 条
+	want := []struct {
+		id     float64
+		chat   string
+		chatID float64
+		name   string
+		text   string
+	}{
+		{2, "private", 20002, "私聊B", "第二条"},
+		{3, "group", 888, "群友C", "第三条"},
+	}
+	for i, w := range want {
+		if rows[i]["message_id"] != w.id || rows[i]["chat_type"] != w.chat ||
+			rows[i]["chat_id"] != w.chatID || rows[i]["sender_name"] != w.name ||
+			rows[i]["text"] != w.text {
+			t.Errorf("rows[%d] = %v, want id=%v chat=%v chat_id=%v name=%q text=%q",
+				i, rows[i], w.id, w.chat, w.chatID, w.name, w.text)
+		}
+	}
+	wantTime := t1.Add(time.Minute).Format("01-02 15:04")
+	if rows[0]["time"] != wantTime {
+		t.Errorf("rows[0].time = %v, want %q", rows[0]["time"], wantTime)
+	}
+
+	// chat_type 过滤
+	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","limit":10}`)
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("group 过滤应返回 2 条, got %d: %s", len(rows), out)
+	}
+	for _, r := range rows {
+		if r["chat_type"] != "group" {
+			t.Errorf("过滤后仍含非 group 行: %v", r)
+		}
+	}
+
+	// 超上限 clamp 到 100（3 条全出，不报错）
+	out = runToolOK(t, tools, "get_recent_messages", `{"limit":999}`)
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("limit=999 应 clamp 并返回全部 3 条, got %d", len(rows))
+	}
+}
+
+// TestSearchMessagesTool 全文搜索走 FTS，空 query 报错。
+func TestSearchMessagesTool(t *testing.T) {
+	s := openTestStore(t)
+	tools, _, _ := testToolSet(t, s)
+
+	t1 := time.Unix(1762400000, 0)
+	putRecord(t, s, 1, "recv", "group", 888, 10001, "群友A", "今晚一起打游戏吗", t1.Unix())
+	putRecord(t, s, 2, "recv", "group", 888, 10003, "群友C", "不了我要写代码", t1.Add(time.Minute).Unix())
+
+	out := runToolOK(t, tools, "search_messages", `{"query":"游戏","limit":10}`)
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("输出不是 JSON 数组: %v (%s)", err, out)
+	}
+	if len(rows) != 1 || rows[0]["text"] != "今晚一起打游戏吗" {
+		t.Errorf("搜索结果 = %v, want 命中「今晚一起打游戏吗」", rows)
+	}
+
+	runToolErr(t, tools, "search_messages", `{"query":""}`)
+}
+
+// TestSendMessageTool 经 NapCat 发出并返回 {"message_id":N}；
+// 参数缺失/非法报 error。
+func TestSendMessageTool(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	napcat := startFakeNapCat(t)
+
+	out := runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"text":"大家好"}`)
+	if out != `{"message_id":1}` {
+		t.Errorf("send_message 输出 = %q, want {\"message_id\":1}", out)
+	}
+	if napcat.count() != 1 || napcat.paths[0] != "/send_group_msg" {
+		t.Fatalf("NapCat 应收到 1 次 /send_group_msg, got %v", napcat.paths)
+	}
+	if got := napcat.sentText(t, 0); got != "大家好" {
+		t.Errorf("发送文本 = %q, want 大家好", got)
+	}
+
+	runToolOK(t, tools, "send_message", `{"chat_type":"private","chat_id":20002,"text":"在吗"}`)
+	if napcat.paths[1] != "/send_private_msg" {
+		t.Errorf("私聊应走 /send_private_msg, got %v", napcat.paths[1])
+	}
+
+	for _, bad := range []string{
+		`{"chat_type":"group","chat_id":0,"text":"hi"}`,
+		`{"chat_type":"channel","chat_id":888,"text":"hi"}`,
+		`{"chat_type":"group","chat_id":888,"text":""}`,
+		`{"chat_type":"group","chat_id":888}`,
+		`{}`,
+	} {
+		runToolErr(t, tools, "send_message", bad)
+	}
+	if napcat.count() != 2 {
+		t.Errorf("非法参数不应发消息, NapCat 收到 %d 次", napcat.count())
+	}
+}
+
+// TestThinkToolAppendsNote think 把笔记追加到 notes.json；空 note 报错。
+func TestThinkToolAppendsNote(t *testing.T) {
+	tools, notesPath, _ := testToolSet(t, nil)
+
+	runToolOK(t, tools, "think", `{"note":"他在开玩笑，别当真"}`)
+	runToolOK(t, tools, "think", `{"note":"先查群名片"}`)
+
+	notes, err := LoadNotes(notesPath)
+	if err != nil {
+		t.Fatalf("LoadNotes: %v", err)
+	}
+	if len(notes) != 2 || notes[0].Text != "他在开玩笑，别当真" || notes[1].Text != "先查群名片" {
+		t.Errorf("笔记未按序落盘: %+v", notes)
+	}
+
+	runToolErr(t, tools, "think", `{"note":""}`)
+	runToolErr(t, tools, "think", `{}`)
+}
+
+// TestUpdateMoodToolWritesStateAndSkipsSame mood 变化时写 state.json
+// （含 updated 时间戳），mood 与现值相同则不写盘。
+func TestUpdateMoodToolWritesStateAndSkipsSame(t *testing.T) {
+	tools, _, statePath := testToolSet(t, nil)
+
+	runToolOK(t, tools, "update_mood", `{"mood":"开心"}`)
+	data1, err := readState(t, statePath)
+	if err != nil {
+		t.Fatalf("state.json 应已写入: %v", err)
+	}
+	if data1.Mood != "开心" || data1.Updated.IsZero() {
+		t.Errorf("state 内容 = %+v, want mood=开心 且 updated 非零", data1)
+	}
+
+	// 相同 mood：不写盘（mtime 不变）
+	info1, err := osStat(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	runToolOK(t, tools, "update_mood", `{"mood":"开心"}`)
+	info2, err := osStat(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info2.ModTime().Equal(info1.ModTime()) {
+		t.Error("相同 mood 不应重写 state.json")
+	}
+
+	// 不同 mood：更新
+	runToolOK(t, tools, "update_mood", `{"mood":"困了"}`)
+	data3, err := readState(t, statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data3.Mood != "困了" {
+		t.Errorf("mood = %q, want 困了", data3.Mood)
+	}
+
+	runToolErr(t, tools, "update_mood", `{"mood":""}`)
+}
+
+// TestToolErrorShape 工具报错路径：未知工具与非法参数都由调用方包成 {"error"}。
+func TestToolErrorShape(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	tl := findTool(t, tools, "get_recent_messages")
+	out, err := tl.Run(json.RawMessage(`{"limit":"abc"}`))
+	if err == nil {
+		t.Fatalf("非法参数应报错, got %q", out)
+	}
+}

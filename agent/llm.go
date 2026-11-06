@@ -13,26 +13,65 @@ import (
 	"time"
 )
 
-// ChatMessage 一条对话消息。
+// ToolFunction 一次工具调用的函数部分；Arguments 是 JSON 字符串。
+type ToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolCall 模型响应里的一次工具调用（OpenAI 格式）。
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolSchema 发给模型的单个工具 schema。
+type ToolSchema struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
+}
+
+// ToolDef chat/completions 请求 tools 数组的一项。
+type ToolDef struct {
+	Type     string     `json:"type"`
+	Function ToolSchema `json:"function"`
+}
+
+// ChatMessage 一条对话消息。ToolCalls 用于 assistant 回填工具调用，
+// ToolCallID 用于 role=tool 的结果消息。
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // ChatRequest chat/completions 请求体。
-// MaxTokens/Temperature 仅在非零时序列化（omitempty）。
+// MaxTokens/Temperature/Tools 仅在非零/非空时序列化（omitempty）。
 type ChatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []ChatMessage `json:"messages"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Temperature float64       `json:"temperature,omitempty"`
+	Tools       []ToolDef     `json:"tools,omitempty"`
+}
+
+// responseMessage 响应 choices[].message：比请求消息多 reasoning_content
+// （DeepSeek 系思维链，仅捕获不注入上下文）。
+type responseMessage struct {
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ToolCalls        []ToolCall `json:"tool_calls"`
+	ReasoningContent string     `json:"reasoning_content"`
 }
 
 // ChatResponse chat/completions 响应体，仅解析用到的字段。
 type ChatResponse struct {
 	Choices []struct {
-		Index   int         `json:"index"`
-		Message ChatMessage `json:"message"`
+		Index   int             `json:"index"`
+		Message responseMessage `json:"message"`
 	} `json:"choices"`
 }
 
@@ -42,6 +81,22 @@ func (r *ChatResponse) Content() string {
 		return ""
 	}
 	return r.Choices[0].Message.Content
+}
+
+// ToolCalls 返回 choices[0].message.tool_calls。
+func (r *ChatResponse) ToolCalls() []ToolCall {
+	if r == nil || len(r.Choices) == 0 {
+		return nil
+	}
+	return r.Choices[0].Message.ToolCalls
+}
+
+// ReasoningContent 返回 choices[0].message.reasoning_content（仅捕获，不注入上下文）。
+func (r *ChatResponse) ReasoningContent() string {
+	if r == nil || len(r.Choices) == 0 {
+		return ""
+	}
+	return r.Choices[0].Message.ReasoningContent
 }
 
 // Client OpenAI 兼容 chat/completions 客户端。无全局状态，可并发使用。

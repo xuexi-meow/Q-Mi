@@ -44,6 +44,7 @@ agent:
   debounce: 3s
   temperature: 0.8
   debug: false
+  max_tool_rounds: 10
   history:
     max: 40
     trim: 20
@@ -91,17 +92,17 @@ type NapcatConn struct {
 
 // AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
 // 注意：viper UnmarshalKey 走 mapstructure，多单词键需 mapstructure 标签。
-// P2 预留：judge 判断模型块（judge.base_url/api_key/model），未配置回退主模型。
 type AgentConfig struct {
-	Enable      bool          `yaml:"enable" mapstructure:"enable"`
-	BaseURL     string        `yaml:"base_url" mapstructure:"base_url"`
-	APIKey      string        `yaml:"api_key" mapstructure:"api_key"`
-	Model       string        `yaml:"model" mapstructure:"model"`
-	PersonaFile string        `yaml:"persona_file" mapstructure:"persona_file"`
-	Debounce    time.Duration `yaml:"debounce" mapstructure:"debounce"`
-	Temperature float64       `yaml:"temperature" mapstructure:"temperature"`
-	Debug       bool          `yaml:"debug" mapstructure:"debug"`
-	History     AgentHistory  `yaml:"history" mapstructure:"history"`
+	Enable        bool          `yaml:"enable" mapstructure:"enable"`
+	BaseURL       string        `yaml:"base_url" mapstructure:"base_url"`
+	APIKey        string        `yaml:"api_key" mapstructure:"api_key"`
+	Model         string        `yaml:"model" mapstructure:"model"`
+	PersonaFile   string        `yaml:"persona_file" mapstructure:"persona_file"`
+	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
+	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
+	Debug         bool          `yaml:"debug" mapstructure:"debug"`
+	MaxToolRounds int           `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
+	History       AgentHistory  `yaml:"history" mapstructure:"history"`
 }
 
 // AgentHistory 上下文历史携带策略。
@@ -218,6 +219,9 @@ func validateAgentConfig(agent *AgentConfig) error {
 	}
 	if agent.Debounce <= 0 {
 		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)
+	}
+	if agent.MaxToolRounds <= 0 {
+		return fmt.Errorf("agent.max_tool_rounds must be positive, got %d", agent.MaxToolRounds)
 	}
 	if agent.History.Trim <= 0 {
 		return fmt.Errorf("agent.history.trim must be positive, got %d", agent.History.Trim)

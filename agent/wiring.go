@@ -27,7 +27,7 @@ var (
 
 // defaultNewManager 用真实配置组装默认实现:DefaultBuilder + OpenAI 客户端(120s 超时)。
 func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
-	return NewManager(NewDefaultBuilder(store, cfg), NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg)
+	return NewManager(NewDefaultBuilder(store, cfg), NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store)
 }
 
 func init() {
@@ -52,11 +52,8 @@ func init() {
 		if m == nil || e.Sender == nil {
 			return
 		}
-		// 群聊仅响应 @机器人(未 @ 交给 P2 判断模型);
-		// self_id 取事件自带字段,不依赖配置的 qq_number
-		if !bot.AtUserID(e.Message, int64(e.SelfID)) {
-			return
-		}
+		// P2 起群聊不再设 @ 门槛（spec §3）：未 @ 也入队进思考循环，
+		// 回不回由模型自决；self_id 取事件自带字段,不依赖配置的 qq_number
 		m.Enqueue(IncomingMessage{
 			ChatType:   "group",
 			ChatID:     int64(e.GroupID),

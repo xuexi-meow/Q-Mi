@@ -28,8 +28,8 @@ func resetTestState() {
 
 // e2eRecorder 记录假服务的请求。
 type e2eRecorder struct {
-	mu    sync.Mutex
-	paths []string
+	mu     sync.Mutex
+	paths  []string
 	bodies []map[string]any
 }
 
@@ -64,7 +64,8 @@ func (r *e2eRecorder) handle(w http.ResponseWriter, req *http.Request, respBody 
 
 // TestEndToEndGroupAtMessageReplies 端到端:Dispatch 真实结构的群消息 JSON
 // (含 @机器人)→ 防抖合并 → LLM → 假 NapCat 收到回复;
-// 再 Dispatch 一条未 @ 的群消息,断言请求数不变。
+// 再 Dispatch 一条未 @ 的群消息,P2 起同样入队进思考循环(spec §3),
+// 断言两次都触发 LLM 请求与回复。
 func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 	// app.GetApp() 找不到 Config.yaml 会尝试在 cwd(agent/)创建默认文件;
 	// 先放一份最小配置挡住,测试结束删掉。
@@ -148,7 +149,7 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 		t.Errorf("假 OpenAI 请求数 = %d, want 1", got)
 	}
 
-	// 未 @ 的群消息:应被忽略
+	// 未 @ 的群消息:P2 起同样入队进思考循环,模型(此处为纯文本兼容路径)直接回复
 	noAtMsg := `{
 		"post_type":"message","message_type":"group","sub_type":"normal",
 		"message_id":2,"group_id":888,"user_id":12345,"self_id":999,
@@ -159,12 +160,17 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 	}`
 	event.Dispatch([]byte(noAtMsg))
 	event.Wait()
-	time.Sleep(150 * time.Millisecond) // 等过防抖窗口
-	if got := napcat.count(); got != 1 {
-		t.Errorf("未 @ 消息不应触发回复,NapCat 请求数 = %d", got)
+	waitFor(t, 5*time.Second, func() bool { return openai.count() == 2 }, "未 @ 消息也应触发思考循环")
+	waitFor(t, 5*time.Second, func() bool { return napcat.count() == 2 }, "未 @ 消息的回复也应发出")
+	if got := napcat.path(1); got != "/send_group_msg" {
+		t.Errorf("第二次回复 path = %q, want /send_group_msg", got)
 	}
-	if got := openai.count(); got != 1 {
-		t.Errorf("未 @ 消息不应调 LLM,请求数 = %d", got)
+	if got := sentTextAt(t, napcat.body(1)); got != "pong-reply" {
+		t.Errorf("第二次回复内容 = %q, want %q", got, "pong-reply")
+	}
+	// 请求应携带工具定义（思考循环生效的标志）
+	if tools, ok := openai.body(1)["tools"].([]any); !ok || len(tools) == 0 {
+		t.Errorf("LLM 请求应携带 tools 定义, got %v", openai.body(1)["tools"])
 	}
 }
 

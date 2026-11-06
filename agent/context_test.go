@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,9 +68,42 @@ func TestBuildEmptyTurnReturnsOnlySystem(t *testing.T) {
 	if msgs[0].Role != "system" {
 		t.Errorf("messages[0].Role = %q, want %q", msgs[0].Role, "system")
 	}
-	want := "你是QQ上的AI成员。\n当前账号QQ: 9527"
+	want := "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"
 	if msgs[0].Content != want {
 		t.Errorf("system content = %q, want %q", msgs[0].Content, want)
+	}
+}
+
+// TestBuildSystemContainsMoodAndAgentGuide system 拼上静态 agent 格式说明段
+// 与当前情绪状态行（spec §2.2）；无 mood 时不带情绪行，mood 只追加在尾部
+// （缓存前缀稳定）。
+func TestBuildSystemContainsMoodAndAgentGuide(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+	b := NewDefaultBuilder(s, cfg)
+	now := time.Unix(1762400000, 0)
+
+	withMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now, Mood: "有点开心"})
+	sys := withMood[0].Content
+	if !strings.Contains(sys, "当前情绪状态: 有点开心") {
+		t.Errorf("system 未携带情绪状态: %q", sys)
+	}
+	for _, keyword := range []string{"send_message", "finish", "help", "think", "update_mood"} {
+		if !strings.Contains(sys, keyword) {
+			t.Errorf("agent 格式说明未提及工具 %s: %q", keyword, sys)
+		}
+	}
+
+	withoutMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now})
+	if strings.Contains(withoutMood[0].Content, "当前情绪状态") {
+		t.Errorf("无 mood 时不应有情绪行: %q", withoutMood[0].Content)
+	}
+	// mood 只追加在 system 尾部，前缀不变
+	if !strings.HasPrefix(sys, withoutMood[0].Content+"\n当前情绪状态: 有点开心") {
+		t.Errorf("情绪行应只追加在 system 尾部:\nsys:   %q\nbase:  %q", sys, withoutMood[0].Content)
 	}
 }
 
@@ -141,7 +175,7 @@ func assertMessages(t *testing.T, got, want []ChatMessage) {
 		t.Fatalf("消息条数 = %d, want %d\ngot:  %+v\nwant: %+v", len(got), len(want), got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("messages[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -172,7 +206,7 @@ func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t5.Add(time.Minute)})
 
 	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
+		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
 		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <香菜不吃屿烬燃(3929930584)> 这个我不背锅！！！！"},
 		{Role: "user", Content: "[" + t2.Format("01-02 15:04") + "] [私聊:3394859101] <小奶猫雪溪(3394859101)> 在吗"},
 		{Role: "assistant", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <我> 收到"},
@@ -203,7 +237,7 @@ func TestBuildHistoryExcludesRecalled(t *testing.T) {
 	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t3.Add(time.Minute)})
 
 	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
+		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
 		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第一条"},
 		{Role: "user", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第三条"},
 	})
@@ -222,7 +256,7 @@ func TestBuildWithNilStoreReturnsOnlySystem(t *testing.T) {
 	msgs := b.Build(&Turn{ChatType: "private", ChatID: 10001, SelfID: 9527, Now: time.Unix(1762400000, 0)})
 
 	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
+		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
 	})
 	if strings.Contains(logs.String(), "ERROR") {
 		t.Errorf("store 为 nil 不应产生错误日志: %s", logs.String())
@@ -257,7 +291,7 @@ func TestBuildTrimsHistoryAcrossChatsInBlocks(t *testing.T) {
 		t.Fatalf("裁剪后消息条数 = %d, want 5 (system+4): %+v", len(msgs), msgs)
 	}
 	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
+		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
 		{Role: "user", Content: "[" + base.Add(3*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m3"},
 		{Role: "assistant", Content: "[" + base.Add(4*time.Second).Format("01-02 15:04") + "] [群:928952016] <我> m4"},
 		{Role: "user", Content: "[" + base.Add(5*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m5"},
@@ -297,7 +331,7 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 		t.Fatalf("42 条历史裁剪后应剩 22 条 (共 23), got %d", len(second))
 	}
 	for i := range first {
-		if first[i] != second[i] {
+		if !reflect.DeepEqual(first[i], second[i]) {
 			t.Fatalf("messages[%d] 前缀被破坏:\nfirst:  %+v\nsecond: %+v", i, first[i], second[i])
 		}
 	}
@@ -337,7 +371,7 @@ func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 	})
 
 	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n当前账号QQ: 9527"},
+		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
 		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 早"},
 		{Role: "assistant", Content: "[" + t2.Format("01-02 15:04") + "] [群:928952016] <我> 早呀"},
 		{Role: "user", Content: "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" + m1t.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 在吗"},
@@ -384,10 +418,10 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 	if withNotes[1].Content != wantFirst {
 		t.Errorf("首条新消息未带笔记前缀:\ngot:  %q\nwant: %q", withNotes[1].Content, wantFirst)
 	}
-	if strings.Contains(withNotes[2].Content, "思考笔记") {
+	if strings.Contains(withNotes[2].Content, "[思考笔记]") {
 		t.Errorf("笔记只应出现在首条新消息前: %q", withNotes[2].Content)
 	}
-	if strings.Contains(withNotes[0].Content, "思考笔记") {
+	if strings.Contains(withNotes[0].Content, "[思考笔记]") {
 		t.Errorf("笔记不应进 system: %q", withNotes[0].Content)
 	}
 
@@ -400,7 +434,7 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 			{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: newT},
 		},
 	})
-	if strings.Contains(withoutNotes[len(withoutNotes)-1].Content, "思考笔记") {
+	if strings.Contains(withoutNotes[len(withoutNotes)-1].Content, "[思考笔记]") {
 		t.Errorf("无笔记时不应注入: %q", withoutNotes[len(withoutNotes)-1].Content)
 	}
 	if !strings.HasPrefix(withoutNotes[len(withoutNotes)-1].Content, "当前时间: ") {
@@ -436,7 +470,7 @@ func TestBuildSystemStaticAcrossNow(t *testing.T) {
 	first := b.Build(turn(base))
 	second := b.Build(turn(base.Add(time.Hour)))
 
-	if first[0] != second[0] {
+	if !reflect.DeepEqual(first[0], second[0]) {
 		t.Fatalf("system 应与 Now 无关:\nfirst:  %+v\nsecond: %+v", first[0], second[0])
 	}
 	if strings.Contains(first[0].Content, "2026") || strings.Contains(first[0].Content, "当前时间") {

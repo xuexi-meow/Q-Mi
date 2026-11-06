@@ -17,6 +17,15 @@ import (
 // fallbackPersona persona 文件缺失时的内置兜底提示词。
 const fallbackPersona = "你是一个QQ群聊/私聊里的AI成员，用中文自然交流。"
 
+// agentGuideText system 中的静态 agent 格式说明段（spec §2.2/§3）：
+// 只写行为准则，保持字节稳定以命中 prompt cache；工具的详细用法由 help 工具提供。
+const agentGuideText = `[Agent 工作方式]
+你在思考循环中：可先调用工具查资料、记笔记、调整状态，再决定是否回复。
+- 要说话必须调用 send_message（可多次调用，分条发送）；不调用即本轮不回复。
+- think(note) 记录思考笔记，下一轮对话可见；update_mood(mood) 更新你的情绪。
+- 查历史用 get_recent_messages，搜历史用 search_messages；用法不确定先调 help。
+- 想结束本轮思考就调用 finish；finish 前已发出的消息均已生效。`
+
 // Turn 进 builder 的一轮输入：chat 上下文、思考笔记、本轮新消息、当前时间。
 // 携带全部原料，任何自定义 builder 都能拿到。
 type Turn struct {
@@ -24,6 +33,7 @@ type Turn struct {
 	ChatID      int64  // 本轮新消息所属会话：群号；私聊 = 对方 QQ
 	SelfID      int64  // 机器人自身 QQ
 	Now         time.Time
+	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入 system 尾部
 	Notes       []Note        // 思考笔记（manager 从 notes.json 读出），注入末尾 user 块头部
 	NewMessages []TurnMessage // 每条自带所属会话（历史已跨会话混合）
 }
@@ -127,15 +137,15 @@ func senderLabel(senderID int64, senderName string, isSelf bool) string {
 
 // Build 组装消息序列（spec P2 §2.2）：
 //
-//	system:  persona + 机器人自身QQ号                 ← 完全静态，缓存锚点
+//	system:  persona + agent格式说明 + 机器人自身QQ号 (+当前情绪状态) ← 静态,缓存锚点
 //	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加
 //	user:   [思考笔记] + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
 func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
-	system := ChatMessage{
-		Role:    "system",
-		Content: b.persona + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10),
+	system := b.persona + "\n" + agentGuideText + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
+	if turn.Mood != "" {
+		system += "\n当前情绪状态: " + turn.Mood
 	}
-	msgs := []ChatMessage{system}
+	msgs := []ChatMessage{{Role: "system", Content: system}}
 	b.appendHistory(&msgs, turn)
 	msgs = appendNewMessages(msgs, turn)
 	return msgs

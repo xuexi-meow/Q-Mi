@@ -127,13 +127,150 @@ func TestChatOmitsZeroValueFields(t *testing.T) {
 	}
 
 	body := captured.jsonBody(t)
-	for _, key := range []string{"max_tokens", "temperature"} {
+	for _, key := range []string{"max_tokens", "temperature", "tools"} {
 		if _, present := body[key]; present {
 			t.Errorf("zero-value field %q must be omitted from request body, got %v", key, body)
 		}
 	}
 	if body["model"] != "deepseek-chat" {
 		t.Errorf("model = %v, want deepseek-chat", body["model"])
+	}
+}
+
+// toolCallResponseJSON 模拟 DeepSeek/OpenAI 风格的 tool_calls 响应。
+const toolCallResponseJSON = `{
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "用户在问最近聊了什么，先查一下",
+        "tool_calls": [
+          {
+            "id": "call_abc",
+            "type": "function",
+            "function": {"name": "get_recent_messages", "arguments": "{\"limit\":5}"}
+          }
+        ]
+      }
+    }
+  ]
+}`
+
+// TestChatSendsToolsAndParsesToolCalls 请求携带 tools / assistant.tool_calls /
+// tool(tool_call_id) 时按 OpenAI 格式序列化；响应解析 message.tool_calls 与
+// reasoning_content。
+func TestChatSendsToolsAndParsesToolCalls(t *testing.T) {
+	srv, captured := fakeOpenAI(t, http.StatusOK, toolCallResponseJSON)
+	client := NewClient(srv.URL, "sk-test", 5*time.Second)
+
+	req := ChatRequest{
+		Model: "deepseek-chat",
+		Messages: []ChatMessage{
+			{Role: "system", Content: "sys"},
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:   "call_prev",
+					Type: "function",
+					Function: ToolFunction{
+						Name:      "think",
+						Arguments: `{"note":"先查历史"}`,
+					},
+				}},
+			},
+			{Role: "tool", ToolCallID: "call_prev", Content: "{}"},
+		},
+		Tools: []ToolDef{{
+			Type: "function",
+			Function: ToolSchema{
+				Name:        "think",
+				Description: "记录思考笔记",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		}},
+	}
+	resp, err := client.Chat(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+
+	// 请求体：tools 数组
+	body := captured.jsonBody(t)
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v, want 1 个工具定义", body["tools"])
+	}
+	td, _ := tools[0].(map[string]any)
+	if td["type"] != "function" {
+		t.Errorf("tools[0].type = %v, want function", td["type"])
+	}
+	fn, _ := td["function"].(map[string]any)
+	if fn["name"] != "think" || fn["description"] != "记录思考笔记" {
+		t.Errorf("tools[0].function = %v, want think/记录思考笔记", fn)
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	if params["type"] != "object" {
+		t.Errorf("tools[0].function.parameters = %v, want {type:object}", fn["parameters"])
+	}
+
+	// 请求体：assistant.tool_calls 与 tool.tool_call_id
+	msgs, _ := body["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %d 条, want 3", len(msgs))
+	}
+	asst, _ := msgs[1].(map[string]any)
+	calls, ok := asst["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant.tool_calls = %v, want 1 个调用", asst["tool_calls"])
+	}
+	c0, _ := calls[0].(map[string]any)
+	if c0["id"] != "call_prev" || c0["type"] != "function" {
+		t.Errorf("tool_calls[0] = %v, want id=call_prev type=function", c0)
+	}
+	c0fn, _ := c0["function"].(map[string]any)
+	if c0fn["name"] != "think" || c0fn["arguments"] != `{"note":"先查历史"}` {
+		t.Errorf("tool_calls[0].function = %v, want think/{\"note\":\"先查历史\"}", c0fn)
+	}
+	toolMsg, _ := msgs[2].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_prev" || toolMsg["content"] != "{}" {
+		t.Errorf("messages[2] = %v, want tool/call_prev/{}", toolMsg)
+	}
+
+	// 响应：tool_calls 与 reasoning_content
+	calls2 := resp.ToolCalls()
+	if len(calls2) != 1 {
+		t.Fatalf("resp.ToolCalls() = %d 个, want 1", len(calls2))
+	}
+	if calls2[0].ID != "call_abc" || calls2[0].Type != "function" {
+		t.Errorf("ToolCalls[0] = %+v, want id=call_abc type=function", calls2[0])
+	}
+	if calls2[0].Function.Name != "get_recent_messages" || calls2[0].Function.Arguments != `{"limit":5}` {
+		t.Errorf("ToolCalls[0].Function = %+v, want get_recent_messages/{\"limit\":5}", calls2[0].Function)
+	}
+	if got := resp.ReasoningContent(); got != "用户在问最近聊了什么，先查一下" {
+		t.Errorf("ReasoningContent = %q, want 用户在问最近聊了什么，先查一下", got)
+	}
+}
+
+// TestChatResponsePlainContent 纯文本响应：ToolCalls 为空、ReasoningContent 为空。
+func TestChatResponsePlainContent(t *testing.T) {
+	srv, _ := fakeOpenAI(t, http.StatusOK, okResponseJSON)
+	client := NewClient(srv.URL, "sk-test", 5*time.Second)
+
+	resp, err := client.Chat(context.Background(), ChatRequest{
+		Model:    "deepseek-chat",
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if len(resp.ToolCalls()) != 0 {
+		t.Errorf("纯文本响应不应有 tool_calls: %+v", resp.ToolCalls())
+	}
+	if resp.ReasoningContent() != "" {
+		t.Errorf("ReasoningContent = %q, want 空", resp.ReasoningContent())
 	}
 }
 

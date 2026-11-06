@@ -82,10 +82,10 @@ func TestThinkLoopFullSequence(t *testing.T) {
 		t.Fatalf("finish 后循环应终止, LLM 请求数 = %d, want 4", got)
 	}
 
-	// 每个请求都带全部 7 个工具定义
+	// 每个请求都带全部工具定义
 	for i, req := range f.reqs {
-		if len(req.Tools) != 7 {
-			t.Errorf("请求[%d] 携带 %d 个工具定义, want 7", i, len(req.Tools))
+		if len(req.Tools) != len(wantToolNames) {
+			t.Errorf("请求[%d] 携带 %d 个工具定义, want %d", i, len(req.Tools), len(wantToolNames))
 		}
 	}
 
@@ -104,8 +104,8 @@ func TestThinkLoopFullSequence(t *testing.T) {
 	if err := json.Unmarshal([]byte(contentText(tool1)), &helpItems); err != nil {
 		t.Fatalf("help 结果不是 JSON 数组: %v (%s)", err, tool1.Content)
 	}
-	if len(helpItems) != 7 {
-		t.Errorf("help 结果应列 7 个工具, got %d", len(helpItems))
+	if len(helpItems) != len(wantToolNames) {
+		t.Errorf("help 结果应列 %d 个工具, got %d", len(wantToolNames), len(helpItems))
 	}
 
 	// 请求2: think + get_recent_messages 两个 tool 消息按序回填
@@ -433,12 +433,15 @@ func TestDebugDumpPerRoundWithToolCalls(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "LLM 应收到 2 次请求")
 
 	sub := filepath.Join(m.debugDir, "group-888")
+	// f.count() 在请求到达假 LLM 时就满足，而 dumpDebug 在拿到响应、
+	// 处理完工具后才写盘——轮询等待两条记录落齐，避免读早了。
+	waitFor(t, 5*time.Second, func() bool {
+		entries, err := os.ReadDir(sub)
+		return err == nil && len(entries) == 2
+	}, "应每轮落盘 1 条、共 2 条记录")
 	entries, err := os.ReadDir(sub)
 	if err != nil {
 		t.Fatalf("读取 debug 目录失败: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("应每轮落盘 1 条、共 2 条记录, got %d", len(entries))
 	}
 	type rec struct {
 		Round       int  `json:"round"`

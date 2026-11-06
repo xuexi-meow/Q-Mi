@@ -230,7 +230,16 @@ func (m *Manager) handleTurn(turn *Turn) {
 	turn.Mood = m.loadMood()
 
 	msgs := m.builder.Build(turn)
-	tools := newToolSet(m.store, m.notesPath, m.statePath)
+	// P3-2 管理员门槛：本轮任一消息发送者是配置的管理员即视为管理员 turn，
+	// 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
+	isAdmin := false
+	for _, tm := range turn.NewMessages {
+		if bot.IsAdmin(tm.SenderID) {
+			isAdmin = true
+			break
+		}
+	}
+	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin)
 	defs := toolDefs(tools)
 	maxRounds := m.cfg.MaxToolRounds
 	if maxRounds <= 0 {

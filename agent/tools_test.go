@@ -33,12 +33,20 @@ func readState(t *testing.T, path string) (agentStateFile, error) {
 func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 // testToolSet 用临时 notes/state 路径构造工具集，避免测试污染 agent/ 目录。
+// 默认非管理员（isAdmin=false）；需要管理员视角用 testToolSetAdmin。
 func testToolSet(t *testing.T, store *storage.Store) ([]Tool, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	notesPath := filepath.Join(dir, "notes.json")
 	statePath := filepath.Join(dir, "state.json")
-	return newToolSet(store, notesPath, statePath), notesPath, statePath
+	return newToolSet(store, notesPath, statePath, false), notesPath, statePath
+}
+
+// testToolSetAdmin 管理员视角的工具集（危险工具放行）。
+func testToolSetAdmin(t *testing.T) []Tool {
+	t.Helper()
+	dir := t.TempDir()
+	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true)
 }
 
 // findTool 按名字取工具。
@@ -78,13 +86,31 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 	return err
 }
 
-// wantToolNames P2 全部工具名。
+// wantToolNames P2 核心工具 + P3-2 QQ 能力工具（顺序即工具集顺序，help 恒在末尾）。
 var wantToolNames = []string{
 	"get_recent_messages", "search_messages",
-	"send_message", "think", "update_mood", "finish", "help",
+	"send_message", "think", "update_mood", "finish",
+	// P3-2 人性化 QQ 工具
+	"recall_message", "get_friend_list",
+	"lookup_user", "lookup_groups", "lookup_group", "lookup_members", "lookup_member",
+	"set_group_card", "set_group_special_title",
+	"group_ban", "group_whole_ban", "kick_member", "set_group_admin",
+	"set_group_name", "leave_group", "send_group_notice",
+	"set_essence", "remove_essence",
+	"poke", "send_like",
+	"handle_friend_request", "handle_group_request",
+	"get_msg_history", "get_forward_detail",
+	"upload_group_file", "get_group_files",
+	// P3-2 万能逃生舱
+	"napcat_api", "napcat_docs",
+	// 收尾
+	"help",
 }
 
-// TestToolSetContainsAllTools 工具集包含全部 7 个工具，finish 无 Run（纯终止标记）。
+// dangerousToolNames 需要管理员权限的工具。
+var dangerousToolNames = []string{"kick_member", "set_group_admin", "leave_group"}
+
+// TestToolSetContainsAllTools 工具集包含全部工具，finish 无 Run（纯终止标记）。
 func TestToolSetContainsAllTools(t *testing.T) {
 	tools, _, _ := testToolSet(t, nil)
 	got := make([]string, 0, len(tools))
@@ -102,6 +128,29 @@ func TestToolSetContainsAllTools(t *testing.T) {
 	}
 	if findTool(t, tools, "finish").Run != nil {
 		t.Error("finish 不应有 Run（只作循环终止标记）")
+	}
+}
+
+// TestDangerousToolsBlockedForNonAdmin 非管理员调用危险工具直接报权限错误
+// 且不发起 NapCat 请求；管理员视角（testToolSetAdmin）正常放行。
+func TestDangerousToolsBlockedForNonAdmin(t *testing.T) {
+	for _, name := range dangerousToolNames {
+		t.Run(name, func(t *testing.T) {
+			nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
+			tools, _, _ := testToolSet(t, nil)
+			err := runToolErr(t, tools, name, `{"group_id":888,"user_id":5,"enable":true,"reject_add_request":true}`)
+			if !strings.Contains(err.Error(), "管理员权限") {
+				t.Errorf("非管理员 %s 报错应含「管理员权限」, got %v", name, err)
+			}
+			if nap.count() != 0 {
+				t.Errorf("非管理员 %s 不应发起 NapCat 请求, got %d 次", name, nap.count())
+			}
+			adminTools := testToolSetAdmin(t)
+			runToolOK(t, adminTools, name, `{"group_id":888,"user_id":5,"enable":true,"reject_add_request":true}`)
+			if nap.count() != 1 {
+				t.Errorf("管理员调用 %s 应发出 1 次请求, got %d", name, nap.count())
+			}
+		})
 	}
 }
 

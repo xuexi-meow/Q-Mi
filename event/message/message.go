@@ -126,9 +126,9 @@ func (f Face) Stringf() string {
 }
 
 type MFace struct {
-	EmojiID        string  `json:"emoji_id"`
-	EmojiPackageID string  `json:"emoji_package_id"`
-	Key            *string `json:"key,omitempty"`
+	EmojiID        FlexString `json:"emoji_id"`
+	EmojiPackageID FlexString `json:"emoji_package_id"`
+	Key            *string    `json:"key,omitempty"`
 }
 
 func (m *MFace) TypeMake(data json.RawMessage) (any, error) {
@@ -219,8 +219,8 @@ type Image struct {
 	SubType        *FlexString `json:"sub_type,omitempty"`
 	FileSize       *FlexInt    `json:"file_size,omitempty"`
 	Key            *string     `json:"key,omitempty"`
-	EmojiID        *string     `json:"emoji_id,omitempty"`
-	EmojiPackageID *string     `json:"emoji_package_id,omitempty"`
+	EmojiID        *FlexString `json:"emoji_id,omitempty"`
+	EmojiPackageID *FlexString `json:"emoji_package_id,omitempty"`
 }
 
 func (img *Image) TypeMake(data json.RawMessage) (any, error) {

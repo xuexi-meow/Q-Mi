@@ -99,8 +99,8 @@ func TestTypeHandlerUnknownPreservesRawData(t *testing.T) {
 }
 
 func TestTypeHandlerAcceptsRealImagePayload(t *testing.T) {
-	// NapCat 真实上报:sub_type 为数字,file_size 为字符串
-	const raw = `{"type":"image","data":{"summary":"","file":"E0F522ED.jpg","sub_type":0,"url":"https://example.invalid/x","file_size":"233621"}}`
+	// NapCat 真实上报:sub_type/emoji_package_id 为数字,file_size 为字符串
+	const raw = `{"type":"image","data":{"summary":"","file":"E0F522ED.jpg","sub_type":0,"url":"https://example.invalid/x","file_size":"233621","emoji_id":123,"emoji_package_id":456}}`
 	var msg Message
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
@@ -113,8 +113,27 @@ func TestTypeHandlerAcceptsRealImagePayload(t *testing.T) {
 	if !ok {
 		t.Fatalf("类型 = %T, want Image", got)
 	}
-	if img.File != "E0F522ED.jpg" || img.SubType == nil || *img.SubType != "0" || img.FileSize == nil || *img.FileSize != 233621 {
+	if img.File != "E0F522ED.jpg" || img.SubType == nil || *img.SubType != "0" ||
+		img.FileSize == nil || *img.FileSize != 233621 ||
+		img.EmojiID == nil || *img.EmojiID != "123" ||
+		img.EmojiPackageID == nil || *img.EmojiPackageID != "456" {
 		t.Errorf("字段映射错误: %+v", img)
+	}
+}
+
+func TestTypeHandlerMFaceNumericIDs(t *testing.T) {
+	// mface 的 emoji_id/emoji_package_id 真实上报同样可能是数字
+	var msg Message
+	if err := json.Unmarshal([]byte(`{"type":"mface","data":{"emoji_id":1,"emoji_package_id":2}}`), &msg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := msg.TypeHandler()
+	if err != nil {
+		t.Fatalf("mface 数字 id 解析失败: %v", err)
+	}
+	mf, ok := got.(MFace)
+	if !ok || mf.EmojiID != "1" || mf.EmojiPackageID != "2" {
+		t.Fatalf("mface 字段映射错误: %#v", got)
 	}
 }
 

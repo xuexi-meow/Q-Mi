@@ -102,6 +102,42 @@ func (c *Client) post(ctx context.Context, path string, body []byte) ([]byte, er
 
 // ---------------- 常用便捷函数 ----------------
 
+// Call 通用调用:发送任意 api.Request 并把 data 透传为 json.RawMessage。
+// 适合没有专门结构化响应类型的动作,由调用方自行解析 resp.Data。
+func Call(ctx context.Context, req api.Request) (*api.Response[json.RawMessage], error) {
+	return Do[json.RawMessage](ctx, req)
+}
+
+// SendForwardMsg 发送合并转发消息,返回 message_id/forward_id 等结构化数据
+func SendForwardMsg(ctx context.Context, req *api.SendForwardMsg) (*api.Response[api.SendMsgData], error) {
+	return Do[api.SendMsgData](ctx, req)
+}
+
+// SendGroupForwardMsg 发送群合并转发消息
+func SendGroupForwardMsg(ctx context.Context, req *api.SendGroupForwardMsg) (*api.Response[api.SendMsgData], error) {
+	return Do[api.SendMsgData](ctx, req)
+}
+
+// SendPrivateForwardMsg 发送私聊合并转发消息
+func SendPrivateForwardMsg(ctx context.Context, req *api.SendPrivateForwardMsg) (*api.Response[api.SendMsgData], error) {
+	return Do[api.SendMsgData](ctx, req)
+}
+
+// GetGroupMsgHistory 获取群历史消息,解析 messages 数组
+func GetGroupMsgHistory(ctx context.Context, req *api.GetGroupMsgHistory) (*api.Response[api.GetMsgHistoryData], error) {
+	return Do[api.GetMsgHistoryData](ctx, req)
+}
+
+// GetFriendMsgHistory 获取好友历史消息,解析 messages 数组
+func GetFriendMsgHistory(ctx context.Context, req *api.GetFriendMsgHistory) (*api.Response[api.GetMsgHistoryData], error) {
+	return Do[api.GetMsgHistoryData](ctx, req)
+}
+
+// GetFriendList 获取好友列表,解析为 FriendData 数组
+func GetFriendList(ctx context.Context, req *api.GetFriendList) (*api.Response[[]api.FriendData], error) {
+	return Do[[]api.FriendData](ctx, req)
+}
+
 // SendGroupMsg 发送群消息,消息段用 apimsg.Text / apimsg.At 等构造
 func SendGroupMsg(ctx context.Context, groupID int64, msg ...*apimsg.Message) (*api.Response[api.SendMsgData], error) {
 	return Do[api.SendMsgData](ctx, &api.SendGroupMsg{GroupID: groupID, Message: msg})

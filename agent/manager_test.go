@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -375,5 +376,28 @@ func TestEmptyContentNotSent(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := napcat.count(); got != 0 {
 		t.Errorf("空回复不应发送消息,发送次数 = %d", got)
+	}
+}
+
+// TestEnqueueCarriesImagesIntoTurn IncomingMessage.Images 透传到 TurnMessage
+// （P2.7 多模态：wiring 提取的图片 URL 随防抖合并进入 turn）。
+func TestEnqueueCarriesImagesIntoTurn(t *testing.T) {
+	b := &stubBuilder{}
+	m, f := newTestManager(t, testCfg(20*time.Millisecond), b)
+	startFakeNapCat(t)
+
+	im := msg("group", 888, "看图")
+	im.Images = []string{"https://multimedia.nt.qq.com.cn/1"}
+	m.Enqueue(im)
+
+	waitFor(t, 3*time.Second, func() bool { return f.count() == 1 }, "LLM 应收到请求")
+	turn := b.turn(0)
+	if len(turn.NewMessages) != 1 {
+		t.Fatalf("turn 应有 1 条新消息, got %d", len(turn.NewMessages))
+	}
+	got := turn.NewMessages[0].Images
+	want := []string{"https://multimedia.nt.qq.com.cn/1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("TurnMessage.Images = %v, want %v", got, want)
 	}
 }

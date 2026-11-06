@@ -1,11 +1,15 @@
 // agent/context.go 实现上下文组装（spec P2 §2.2/§3.5）：缓存分层
 // system(纯静态) → 全会话混合历史(只追加,块裁剪) → [思考笔记]+本轮新消息(末尾,含当前时间)。
+// P2.7 多模态：multimodal 开启时，带图片的历史行/新消息行 content 变为
+// OpenAI 多模态数组（文本部分 + image_url 部分）。
 // ContextBuilder 是可替换接缝，DefaultBuilder 为默认实现。
 package agent
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +51,7 @@ type TurnMessage struct {
 	SenderID   int64
 	SenderName string
 	Text       string
+	Images     []string // 消息里的图片 URL（P2.7 多模态，wiring 提取）
 	IsSelf     bool
 	Time       time.Time
 }
@@ -59,11 +64,12 @@ type ContextBuilder interface {
 
 // DefaultBuilder 默认实现：persona + agent 格式说明 + 块裁剪历史 + 末尾新消息。
 type DefaultBuilder struct {
-	store   *storage.Store
-	max     int
-	trim    int
-	persona string
-	guide   string
+	store      *storage.Store
+	max        int
+	trim       int
+	persona    string
+	guide      string
+	multimodal bool // P2.7：开启时带图片的消息行以多模态内容直送模型
 }
 
 // 编译期保证 DefaultBuilder 满足接口。
@@ -73,9 +79,10 @@ var _ ContextBuilder = (*DefaultBuilder)(nil)
 // 并使用内置兜底文本，不阻断运行。
 func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBuilder {
 	b := &DefaultBuilder{
-		store: store,
-		max:   cfg.History.Max,
-		trim:  cfg.History.Trim,
+		store:      store,
+		max:        cfg.History.Max,
+		trim:       cfg.History.Trim,
+		multimodal: cfg.Multimodal,
 	}
 	data, err := os.ReadFile(cfg.PersonaFile)
 	if err != nil {
@@ -160,7 +167,7 @@ func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
 	}
 	msgs := []ChatMessage{{Role: "system", Content: system}}
 	b.appendHistory(&msgs, turn)
-	msgs = appendNewMessages(msgs, turn)
+	msgs = b.appendNewMessages(msgs, turn)
 	return msgs
 }
 
@@ -196,11 +203,18 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		if isSelf {
 			role = "assistant"
 		}
-		*msgs = append(*msgs, ChatMessage{
-			Role: role,
-			Content: formatChatLine(time.Unix(int64(r.Time), 0), chatSource(r.ChatType, r.ChatID),
-				senderLabel(r.UserID, r.SenderName, isSelf), truncateContent(r.RawMessage)),
-		})
+		line := formatChatLine(time.Unix(int64(r.Time), 0), chatSource(r.ChatType, r.ChatID),
+			senderLabel(r.UserID, r.SenderName, isSelf), truncateContent(r.RawMessage))
+		var content any = line
+		// P2.7 多模态：仅 user 行（收到的消息）携带图片内容；assistant 行保持
+		// 纯文本（OpenAI 兼容 API 不接受 assistant 消息里的 image_url）。
+		// 无图行保持纯 string，wire 字节不变（缓存前缀稳定）。
+		if b.multimodal && role == "user" {
+			if urls := extractImageURLs(r.Segments); len(urls) > 0 {
+				content = multimodalContent(replaceImageCQ(line), urls)
+			}
+		}
+		*msgs = append(*msgs, ChatMessage{Role: role, Content: content})
 	}
 }
 
@@ -208,7 +222,8 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 // 不做文本拼接），行格式与历史一致（含来源标签）；当前时间只出现在首条新
 // 消息的头部，思考笔记若有则以 "[思考笔记]" 块作为首条新消息的前缀（在当前
 // 时间之前）——不进 system，否则缓存前缀随笔记/时间失效。
-func appendNewMessages(msgs []ChatMessage, turn *Turn) []ChatMessage {
+// multimodal 开启时，带 Images 的新消息行同样多模态化（P2.7）。
+func (b *DefaultBuilder) appendNewMessages(msgs []ChatMessage, turn *Turn) []ChatMessage {
 	for i, m := range turn.NewMessages {
 		content := formatChatLine(m.Time, chatSource(m.ChatType, m.ChatID),
 			senderLabel(m.SenderID, m.SenderName, m.IsSelf), truncateContent(m.Text))
@@ -218,7 +233,68 @@ func appendNewMessages(msgs []ChatMessage, turn *Turn) []ChatMessage {
 				content = FormatNotes(turn.Notes) + "\n\n" + content
 			}
 		}
-		msgs = append(msgs, ChatMessage{Role: "user", Content: content})
+		var c any = content
+		if b.multimodal && len(m.Images) > 0 {
+			c = multimodalContent(content, m.Images)
+		}
+		msgs = append(msgs, ChatMessage{Role: "user", Content: c})
 	}
 	return msgs
+}
+
+// maxImagesPerMessage 单条历史消息最多携带的图片数（防上下文体积爆炸）。
+const maxImagesPerMessage = 4
+
+// extractImageURLs 解析消息段 JSON，取出 type=="image" 且 data.url 非空的
+// 图片 URL（最多 maxImagesPerMessage 条）；输入为空或非法 JSON 返回 nil。
+func extractImageURLs(segmentsJSON []byte) []string {
+	if len(segmentsJSON) == 0 {
+		return nil
+	}
+	var segs []struct {
+		Type string `json:"type"`
+		Data struct {
+			URL string `json:"url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(segmentsJSON, &segs); err != nil {
+		return nil
+	}
+	var urls []string
+	for _, seg := range segs {
+		if seg.Type != "image" || seg.Data.URL == "" {
+			continue
+		}
+		urls = append(urls, seg.Data.URL)
+		if len(urls) >= maxImagesPerMessage {
+			break
+		}
+	}
+	return urls
+}
+
+// cqImageRe 匹配 [CQ:image,...] 码（值内的逗号转义为 &#44;，不含 ]）。
+var cqImageRe = regexp.MustCompile(`\[CQ:image,[^\]]*\]`)
+
+// replaceImageCQ 把文本里的 [CQ:image,...] 码替换为 [图片] 标注（其余 CQ 码原样）。
+func replaceImageCQ(s string) string {
+	return cqImageRe.ReplaceAllString(s, "[图片]")
+}
+
+// imagePart 构造一个 image_url 内容部分（OpenAI 多模态格式）。
+func imagePart(url string) ContentPart {
+	return ContentPart{Type: "image_url", ImageURL: &struct {
+		URL string `json:"url"`
+	}{URL: url}}
+}
+
+// multimodalContent 把行文本与图片 URL 组装成 OpenAI 多模态内容数组：
+// 首项为文本，其后每个 URL 一项 image_url。
+func multimodalContent(text string, urls []string) []ContentPart {
+	parts := make([]ContentPart, 0, len(urls)+1)
+	parts = append(parts, ContentPart{Type: "text", Text: text})
+	for _, u := range urls {
+		parts = append(parts, imagePart(u))
+	}
+	return parts
 }

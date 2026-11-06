@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,4 +191,114 @@ func sentTextAt(t *testing.T, body map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// TestEndToEndGroupImageMessageMultimodal P2.7 端到端：群里发图（@机器人），
+// 多模态开启时假 LLM 应收到多模态 content 数组（文本部分 + image_url 部分），
+// 而非 CQ 码文本；回复照常发出。
+func TestEndToEndGroupImageMessageMultimodal(t *testing.T) {
+	// app.GetApp() 找不到 Config.yaml 会尝试在 cwd(agent/)创建默认文件;先挡住
+	const cfgPath = "Config.yaml"
+	minimal := "netsetting:\n  host: 127.0.0.1\n  port: 1\n  pattern: \"/\"\n  token: \"\"\nbot:\n  qq_number: 999\n"
+	if err := os.WriteFile(cfgPath, []byte(minimal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(cfgPath) })
+
+	openai := &e2eRecorder{}
+	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openai.handle(w, r, `{"choices":[{"index":0,"message":{"role":"assistant","content":"图收到了"}}]}`)
+	}))
+	defer openaiSrv.Close()
+
+	napcat := &e2eRecorder{}
+	napcatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		napcat.handle(w, r, `{"status":"ok","retcode":0,"data":{"message_id":1}}`)
+	}))
+	defer napcatSrv.Close()
+
+	if err := request.Init(&config.Napcat{HTTP: config.NapcatConn{
+		Enable: true,
+		Host:   napcatSrv.Listener.Addr().(*net.TCPAddr).IP.String(),
+		Port:   napcatSrv.Listener.Addr().(*net.TCPAddr).Port,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	a := app.GetApp()
+	savedCfg, savedStore := a.Config, a.Store
+	a.Config = &config.Config{
+		Bot: &config.Bot{QQ_Number: 999},
+		Agent: &config.AgentConfig{
+			Enable: true, BaseURL: openaiSrv.URL, APIKey: "sk-test",
+			Model: "test-model", PersonaFile: "persona.md",
+			Debounce: 20 * time.Millisecond, Temperature: 0.8,
+			History:    config.AgentHistory{Max: 40, Trim: 20},
+			Multimodal: true,
+		},
+	}
+	a.Store = st
+	t.Cleanup(func() {
+		a.Config, a.Store = savedCfg, savedStore
+		resetTestState()
+	})
+	resetTestState()
+
+	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc"
+	imgMsg := `{
+		"post_type":"message","message_type":"group","sub_type":"normal",
+		"message_id":1,"group_id":888,"user_id":12345,"self_id":999,
+		"time":1794000000,"font":0,
+		"message":[
+			{"type":"at","data":{"qq":"999"}},
+			{"type":"text","data":{"text":"看这张图"}},
+			{"type":"image","data":{"file":"abc.image","sub_type":0,"url":"` + imgURL + `"}}
+		],
+		"raw_message":"[CQ:at,qq=999] 看这张图 [CQ:image,file=abc.image,subType=0,url=` + imgURL + `]",
+		"sender":{"user_id":12345,"nickname":"测试用户","sex":"unknown","card":"","role":"member"}
+	}`
+	event.Dispatch([]byte(imgMsg))
+	event.Wait()
+
+	waitFor(t, 5*time.Second, func() bool { return openai.count() == 1 }, "LLM 应收到请求")
+	waitFor(t, 5*time.Second, func() bool { return napcat.count() == 1 }, "应收到回复")
+
+	// LLM 收到的末条消息 content 应为多模态数组
+	msgs, _ := openai.body(0)["messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("LLM 应收到至少 2 条消息, got %v", msgs)
+	}
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	parts, ok := last["content"].([]any)
+	if !ok {
+		t.Fatalf("末条消息 content 应为多模态数组, got %v", last["content"])
+	}
+	p0, _ := parts[0].(map[string]any)
+	if p0["type"] != "text" {
+		t.Fatalf("content[0].type = %v, want text", p0)
+	}
+	if txt, _ := p0["text"].(string); !strings.Contains(txt, "看这张图") || strings.Contains(txt, "CQ:image") {
+		t.Errorf("文本部分应含消息文本且不含 CQ 码: %v", p0)
+	}
+	var gotURL string
+	for _, p := range parts[1:] {
+		m, _ := p.(map[string]any)
+		if m["type"] == "image_url" {
+			iu, _ := m["image_url"].(map[string]any)
+			gotURL, _ = iu["url"].(string)
+		}
+	}
+	if gotURL != imgURL {
+		t.Errorf("image_url = %q, want %q", gotURL, imgURL)
+	}
+	// 回复照常发出
+	if got := sentTextAt(t, napcat.body(0)); got != "图收到了" {
+		t.Errorf("回复内容 = %q, want 图收到了", got)
+	}
 }

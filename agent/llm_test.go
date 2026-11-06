@@ -74,7 +74,7 @@ func TestChatSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat returned error: %v", err)
 	}
-	if resp == nil || resp.Content() != "你好，我是 Q-Mi" {
+	if resp == nil || resp.TextContent() != "你好，我是 Q-Mi" {
 		t.Fatalf("Chat = %+v, want content %q", resp, "你好，我是 Q-Mi")
 	}
 
@@ -344,5 +344,115 @@ func TestChatEmptyChoices(t *testing.T) {
 	}
 	if resp != nil {
 		t.Errorf("resp = %+v, want nil on error", resp)
+	}
+}
+
+// ---------- P2.7 多模态 ----------
+
+// TestChatMessageMultimodalContentSerialization ChatMessage.Content 为
+// []ContentPart 时按 OpenAI 多模态格式序列化；工具消息 content 仍为字符串。
+func TestChatMessageMultimodalContentSerialization(t *testing.T) {
+	srv, captured := fakeOpenAI(t, http.StatusOK, okResponseJSON)
+	client := NewClient(srv.URL, "sk-test", 5*time.Second)
+
+	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc"
+	if _, err := client.Chat(context.Background(), ChatRequest{
+		Model: "test-model",
+		Messages: []ChatMessage{
+			{Role: "user", Content: []ContentPart{
+				{Type: "text", Text: "看这张图"},
+				{Type: "image_url", ImageURL: &struct {
+					URL string `json:"url"`
+				}{URL: imgURL}},
+			}},
+			{Role: "tool", ToolCallID: "c1", Content: "{}"},
+		},
+	}); err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+
+	msgs, ok := captured.jsonBody(t)["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("messages = %v, want 2 entries", captured.jsonBody(t)["messages"])
+	}
+	first, _ := msgs[0].(map[string]any)
+	if first["role"] != "user" {
+		t.Fatalf("messages[0].role = %v, want user", first["role"])
+	}
+	parts, ok := first["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("多模态 content 应为 2 元素数组, got %v", first["content"])
+	}
+	p0, _ := parts[0].(map[string]any)
+	if p0["type"] != "text" || p0["text"] != "看这张图" {
+		t.Errorf("content[0] = %v, want text/看这张图", p0)
+	}
+	p1, _ := parts[1].(map[string]any)
+	if p1["type"] != "image_url" {
+		t.Errorf("content[1].type = %v, want image_url", p1)
+	}
+	iu, ok := p1["image_url"].(map[string]any)
+	if !ok || iu["url"] != imgURL {
+		t.Errorf("content[1].image_url = %v, want url=%q", p1["image_url"], imgURL)
+	}
+	// 工具消息 content 仍为字符串
+	tool, _ := msgs[1].(map[string]any)
+	if tool["content"] != "{}" {
+		t.Errorf("tool content = %v, want 字符串 \"{}\"", tool["content"])
+	}
+}
+
+// TestContentPartExactWireShape ContentPart 数组的精确 wire 字节形态。
+func TestContentPartExactWireShape(t *testing.T) {
+	data, err := json.Marshal([]ContentPart{
+		{Type: "text", Text: "看图"},
+		{Type: "image_url", ImageURL: &struct {
+			URL string `json:"url"`
+		}{URL: "https://example.com/a.jpg"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"https://example.com/a.jpg"}}]`
+	if string(data) != want {
+		t.Errorf("wire = %s, want %s", data, want)
+	}
+}
+
+// arrayContentResponseJSON content 为多模态数组（text + image_url + text）的响应。
+const arrayContentResponseJSON = `{
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {"type": "text", "text": "图里"},
+          {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
+          {"type": "text", "text": "是只猫"}
+        ]
+      }
+    }
+  ]
+}`
+
+// TestChatResponseArrayContentTextContent 响应 content 为数组时 TextContent()
+// 只按序拼接 text 部分；字符串响应时原样返回（见 TestChatSuccess）。
+func TestChatResponseArrayContentTextContent(t *testing.T) {
+	srv, _ := fakeOpenAI(t, http.StatusOK, arrayContentResponseJSON)
+	client := NewClient(srv.URL, "sk-test", 5*time.Second)
+
+	resp, err := client.Chat(context.Background(), ChatRequest{
+		Model:    "test-model",
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	if got := resp.TextContent(); got != "图里是只猫" {
+		t.Errorf("TextContent = %q, want 图里是只猫", got)
+	}
+	if len(resp.ToolCalls()) != 0 {
+		t.Errorf("数组 content 响应不应有 tool_calls: %+v", resp.ToolCalls())
 	}
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -99,7 +100,7 @@ func TestBuildSystemContainsMoodAndAgentGuide(t *testing.T) {
 	now := time.Unix(1762400000, 0)
 
 	withMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now, Mood: "有点开心"})
-	sys := withMood[0].Content
+	sys := contentText(withMood[0])
 	if !strings.Contains(sys, "当前情绪状态: 有点开心") {
 		t.Errorf("system 未携带情绪状态: %q", sys)
 	}
@@ -110,11 +111,11 @@ func TestBuildSystemContainsMoodAndAgentGuide(t *testing.T) {
 	}
 
 	withoutMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now})
-	if strings.Contains(withoutMood[0].Content, "当前情绪状态") {
+	if strings.Contains(contentText(withoutMood[0]), "当前情绪状态") {
 		t.Errorf("无 mood 时不应有情绪行: %q", withoutMood[0].Content)
 	}
 	// mood 只追加在 system 尾部，前缀不变
-	if !strings.HasPrefix(sys, withoutMood[0].Content+"\n当前情绪状态: 有点开心") {
+	if !strings.HasPrefix(sys, contentText(withoutMood[0])+"\n当前情绪状态: 有点开心") {
 		t.Errorf("情绪行应只追加在 system 尾部:\nsys:   %q\nbase:  %q", sys, withoutMood[0].Content)
 	}
 }
@@ -137,10 +138,10 @@ func TestNewDefaultBuilderMissingPersonaWarnsOnceAndFallsBack(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Role != "system" {
 		t.Fatalf("缺 persona 时 Build 应仅返回 system, got %+v", msgs)
 	}
-	if !strings.Contains(msgs[0].Content, "你是一个QQ群聊/私聊里的AI成员") {
+	if !strings.Contains(contentText(msgs[0]), "你是一个QQ群聊/私聊里的AI成员") {
 		t.Errorf("兜底提示词缺失: %q", msgs[0].Content)
 	}
-	if !strings.Contains(msgs[0].Content, "当前账号QQ: 9527") {
+	if !strings.Contains(contentText(msgs[0]), "当前账号QQ: 9527") {
 		t.Errorf("system 未携带自身QQ号: %q", msgs[0].Content)
 	}
 
@@ -177,7 +178,7 @@ func TestNewDefaultBuilderMissingGuideFallsBack(t *testing.T) {
 	b := NewDefaultBuilder(s, cfg)
 	msgs := b.Build(&Turn{ChatType: "private", ChatID: 10001, SelfID: 9527, Now: time.Unix(1762400000, 0)})
 
-	if !strings.Contains(msgs[0].Content, agentGuideText) {
+	if !strings.Contains(contentText(msgs[0]), agentGuideText) {
 		t.Errorf("guide 缺失应回退内置文本: %q", msgs[0].Content)
 	}
 	if !strings.Contains(logs.String(), "absent-guide.md") {
@@ -198,7 +199,7 @@ func TestBuilderUsesGuideFileContent(t *testing.T) {
 	b := NewDefaultBuilder(s, cfg)
 	msgs := b.Build(&Turn{ChatType: "private", ChatID: 10001, SelfID: 9527, Now: time.Unix(1762400000, 0)})
 
-	if !strings.Contains(msgs[0].Content, customGuide) {
+	if !strings.Contains(contentText(msgs[0]), customGuide) {
 		t.Errorf("guide 文件内容未进 system: %q", msgs[0].Content)
 	}
 }
@@ -232,6 +233,13 @@ func assertMessages(t *testing.T, got, want []ChatMessage) {
 			t.Errorf("messages[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
+}
+
+// contentText 取消息内容的字符串形态；content 为多模态数组时返回空串
+// （仅用于断言纯文本行的测试）。
+func contentText(m ChatMessage) string {
+	s, _ := m.Content.(string)
+	return s
 }
 
 // TestBuildHybridHistoryFormatAndRoles 历史跨会话混合、按时间正序，行格式
@@ -478,13 +486,12 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 	if withNotes[1].Content != wantFirst {
 		t.Errorf("首条新消息未带笔记前缀:\ngot:  %q\nwant: %q", withNotes[1].Content, wantFirst)
 	}
-	if strings.Contains(withNotes[2].Content, "[思考笔记]") {
+	if strings.Contains(contentText(withNotes[2]), "[思考笔记]") {
 		t.Errorf("笔记只应出现在首条新消息前: %q", withNotes[2].Content)
 	}
-	if strings.Contains(withNotes[0].Content, "[思考笔记]") {
+	if strings.Contains(contentText(withNotes[0]), "[思考笔记]") {
 		t.Errorf("笔记不应进 system: %q", withNotes[0].Content)
 	}
-
 	withoutNotes := b.Build(&Turn{
 		ChatType: "group",
 		ChatID:   928952016,
@@ -494,10 +501,10 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 			{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: newT},
 		},
 	})
-	if strings.Contains(withoutNotes[len(withoutNotes)-1].Content, "[思考笔记]") {
+	if strings.Contains(contentText(withoutNotes[len(withoutNotes)-1]), "[思考笔记]") {
 		t.Errorf("无笔记时不应注入: %q", withoutNotes[len(withoutNotes)-1].Content)
 	}
-	if !strings.HasPrefix(withoutNotes[len(withoutNotes)-1].Content, "当前时间: ") {
+	if !strings.HasPrefix(contentText(withoutNotes[len(withoutNotes)-1]), "当前时间: ") {
 		t.Errorf("无笔记时首条新消息应以当前时间开头: %q", withoutNotes[len(withoutNotes)-1].Content)
 	}
 }
@@ -534,10 +541,10 @@ func TestBuildSystemStaticAcrossNow(t *testing.T) {
 	if !reflect.DeepEqual(first[0], second[0]) {
 		t.Fatalf("system 应与 Now 无关:\nfirst:  %+v\nsecond: %+v", first[0], second[0])
 	}
-	if strings.Contains(first[0].Content, "2026") || strings.Contains(first[0].Content, "当前时间") {
+	if strings.Contains(contentText(first[0]), "2026") || strings.Contains(contentText(first[0]), "当前时间") {
 		t.Errorf("system 不应携带时间: %q", first[0].Content)
 	}
-	if !strings.Contains(first[len(first)-1].Content, "当前时间: "+base.Format("2006-01-02 15:04")) {
+	if !strings.Contains(contentText(first[len(first)-1]), "当前时间: "+base.Format("2006-01-02 15:04")) {
 		t.Errorf("当前时间应出现在末尾新消息中: %+v", first[len(first)-1])
 	}
 }
@@ -570,12 +577,268 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 
 	wantTail := strings.Repeat("长", 20000) + "...(截断)"
 	wantHistory := "[" + base.Format("01-02 15:04") + "] [群:928952016] <10001> " + wantTail
-	if msgs[1].Content != wantHistory {
-		t.Errorf("超长历史未按 20000 字符截断: rune 数 = %d", len([]rune(msgs[1].Content)))
+	if contentText(msgs[1]) != wantHistory {
+		t.Errorf("超长历史未按 20000 字符截断: rune 数 = %d", len([]rune(contentText(msgs[1]))))
 	}
 	wantNew := "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
 		now.Format("01-02 15:04") + "] [群:928952016] <10001> " + strings.Repeat("新", 20000) + "...(截断)"
-	if msgs[2].Content != wantNew {
-		t.Errorf("超长新消息未按 20000 字符截断: rune 数 = %d", len([]rune(msgs[2].Content)))
+	if contentText(msgs[2]) != wantNew {
+		t.Errorf("超长新消息未按 20000 字符截断: rune 数 = %d", len([]rune(contentText(msgs[2]))))
+	}
+}
+
+// ---------- P2.7 多模态上下文 ----------
+
+// TestExtractImageURLs 从消息段 JSON 提取图片 URL：只取 type=="image" 且
+// data.url 非空的段；空 url / 缺 url / 非 image 段跳过。
+func TestExtractImageURLs(t *testing.T) {
+	segs := `[
+	 {"type":"text","data":{"text":"看图"}},
+	 {"type":"image","data":{"file":"a.image","url":"https://multimedia.nt.qq.com.cn/1","sub_type":0}},
+	 {"type":"image","data":{"file":"b.image","url":""}},
+	 {"type":"image","data":{"file":"c.image"}},
+	 {"type":"face","data":{"id":"1","url":"https://face.example/1"}},
+	 {"type":"image","data":{"file":"d.image","url":"https://multimedia.nt.qq.com.cn/2"}}
+	]`
+	got := extractImageURLs([]byte(segs))
+	want := []string{"https://multimedia.nt.qq.com.cn/1", "https://multimedia.nt.qq.com.cn/2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("extractImageURLs = %v, want %v", got, want)
+	}
+}
+
+// TestExtractImageURLsCapsAtFour 最多提取 4 条图片 URL。
+func TestExtractImageURLsCapsAtFour(t *testing.T) {
+	segs := `[` +
+		`{"type":"image","data":{"url":"https://img.example/1"}},` +
+		`{"type":"image","data":{"url":"https://img.example/2"}},` +
+		`{"type":"image","data":{"url":"https://img.example/3"}},` +
+		`{"type":"image","data":{"url":"https://img.example/4"}},` +
+		`{"type":"image","data":{"url":"https://img.example/5"}}]`
+	got := extractImageURLs([]byte(segs))
+	want := []string{
+		"https://img.example/1", "https://img.example/2",
+		"https://img.example/3", "https://img.example/4",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("extractImageURLs = %v, want %v", got, want)
+	}
+}
+
+// TestExtractImageURLsInvalidInput 空输入与非法 JSON 返回 nil。
+func TestExtractImageURLsInvalidInput(t *testing.T) {
+	for _, in := range [][]byte{nil, {}, []byte("not json"), []byte(`{"type":"image"}`)} {
+		if got := extractImageURLs(in); got != nil {
+			t.Errorf("extractImageURLs(%s) = %v, want nil", in, got)
+		}
+	}
+}
+
+// putRecordFull 写入一条带 segments 的消息记录。
+func putRecordFull(t *testing.T, s *storage.Store, r *storage.MessageRecord) {
+	t.Helper()
+	if err := s.PutMessage(r); err != nil {
+		t.Fatalf("PutMessage(%d): %v", r.MessageID, err)
+	}
+}
+
+// TestBuildHistoryImageRowBecomesMultimodal 含图片 url 的历史行 content 变为
+// 多模态数组：text 部分（CQ:image 码替换为 [图片]）+ 每个 url 一个 image_url
+// 部分；相邻无图行保持 string（wire 字节与旧行为一致，保缓存前缀）。
+func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  true,
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	t1 := time.Unix(1762400000, 0)
+	t2 := t1.Add(60 * time.Second)
+	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc"
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 928952016,
+		UserID: 10001, SenderName: "小明",
+		RawMessage: "[CQ:image,file=a.image,subType=0,url=" + imgURL + "] 看这张图",
+		Segments:   []byte(`[{"type":"image","data":{"file":"a.image","url":"` + imgURL + `","sub_type":0}}]`),
+		Time:       float64(t1.Unix()),
+	})
+	putRecord(t, s, 2, "recv", "group", 928952016, 10002, "小红", "纯文本", t2.Unix())
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t2.Add(time.Minute)})
+	if len(msgs) != 3 {
+		t.Fatalf("应返回 system+2 条历史, got %d: %+v", len(msgs), msgs)
+	}
+
+	// 带图行 → 多模态数组
+	line1 := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> [图片] 看这张图"
+	wantParts := []ContentPart{
+		{Type: "text", Text: line1},
+		imagePart(imgURL),
+	}
+	gotParts, ok := msgs[1].Content.([]ContentPart)
+	if !ok {
+		t.Fatalf("带图历史行 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
+	}
+	if !reflect.DeepEqual(gotParts, wantParts) {
+		t.Errorf("带图行 content =\n%#v\nwant\n%#v", gotParts, wantParts)
+	}
+	// wire 字节级校验
+	gotJSON, err := json.Marshal(msgs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, err := json.Marshal(ChatMessage{Role: "user", Content: wantParts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("带图行 wire 字节不符:\ngot:  %s\nwant: %s", gotJSON, wantJSON)
+	}
+
+	// 无图行 → 仍为 string，字节级与旧行为一致
+	line2 := "[" + t2.Format("01-02 15:04") + "] [群:928952016] <小红(10002)> 纯文本"
+	if got, ok := msgs[2].Content.(string); !ok || got != line2 {
+		t.Fatalf("无图历史行 content 应保持 string %q, got %#v", line2, msgs[2].Content)
+	}
+	oldJSON, err := json.Marshal(ChatMessage{Role: "user", Content: line2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2JSON, err := json.Marshal(msgs[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2JSON) != string(oldJSON) {
+		t.Errorf("无图行 wire 字节被改变:\ngot:  %s\nwant: %s", got2JSON, oldJSON)
+	}
+}
+
+// TestBuildHistorySentImageRowStaysString 自己发出的带图行（assistant 角色）
+// 保持纯文本：OpenAI 兼容 API 不接受 assistant 消息携带 image_url。
+func TestBuildHistorySentImageRowStaysString(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  true,
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	t1 := time.Unix(1762400000, 0)
+	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=xyz"
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: 1, Direction: "sent", ChatType: "group", ChatID: 928952016,
+		UserID: 9527, SenderName: "我",
+		RawMessage: "[CQ:image,file=out.image,url=" + imgURL + "]",
+		Segments:   []byte(`[{"type":"image","data":{"file":"out.image","url":"` + imgURL + `"}}]`),
+		Time:       float64(t1.Unix()),
+	})
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t1.Add(time.Minute)})
+	if len(msgs) != 2 {
+		t.Fatalf("应返回 system+1 条历史, got %d", len(msgs))
+	}
+	want := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <我> [CQ:image,file=out.image,url=" + imgURL + "]"
+	got, ok := msgs[1].Content.(string)
+	if !ok || got != want {
+		t.Fatalf("assistant 行应保持纯文本 %q, got %#v", want, msgs[1].Content)
+	}
+	if msgs[1].Role != "assistant" {
+		t.Errorf("发出行 role = %q, want assistant", msgs[1].Role)
+	}
+}
+
+// TestBuildHistoryMultimodalDisabledKeepsRawCQ multimodal=false 时带图历史行
+// 仍为纯文本、CQ 码原样透传（不支持图片输入的模型维持原行为）。
+func TestBuildHistoryMultimodalDisabledKeepsRawCQ(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  false,
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	t1 := time.Unix(1762400000, 0)
+	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc"
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 928952016,
+		UserID: 10001, SenderName: "小明",
+		RawMessage: "[CQ:image,file=a.image,subType=0,url=" + imgURL + "] 看这张图",
+		Segments:   []byte(`[{"type":"image","data":{"file":"a.image","url":"` + imgURL + `","sub_type":0}}]`),
+		Time:       float64(t1.Unix()),
+	})
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t1.Add(time.Minute)})
+	if len(msgs) != 2 {
+		t.Fatalf("应返回 system+1 条历史, got %d", len(msgs))
+	}
+	want := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> [CQ:image,file=a.image,subType=0,url=" + imgURL + "] 看这张图"
+	if got, ok := msgs[1].Content.(string); !ok || got != want {
+		t.Fatalf("multimodal=false 时应为纯文本 %q, got %#v", want, msgs[1].Content)
+	}
+}
+
+// TestBuildNewMessageImagesMultimodal 本轮新消息带 Images 时行内容变为多模态
+// 数组（text 部分保留时间头/笔记前缀，其后每个 url 一个 image_url）；无图行
+// 与 multimodal=false 时保持 string。
+func TestBuildNewMessageImagesMultimodal(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Unix(1762400000, 0)
+	newT := now.Add(-30 * time.Second)
+	const imgURL = "https://multimedia.nt.qq.com/download?appid=1407&fileid=img1"
+
+	build := func(multimodal bool) []ChatMessage {
+		cfg := config.AgentConfig{
+			PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+			GuideFile:   writeGuideFile(t, agentGuideText),
+			History:     config.AgentHistory{Max: 40, Trim: 20},
+			Multimodal:  multimodal,
+		}
+		b := NewDefaultBuilder(s, cfg)
+		return b.Build(&Turn{
+			ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: now,
+			NewMessages: []TurnMessage{
+				{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明",
+					Text: "看这张图", Images: []string{imgURL}, Time: newT},
+				{ChatType: "group", ChatID: 928952016, SenderID: 10002, SenderName: "小红",
+					Text: "纯文本", Time: now.Add(-10 * time.Second)},
+			},
+		})
+	}
+
+	// multimodal=true：带图新消息 → 数组
+	msgs := build(true)
+	if len(msgs) != 3 {
+		t.Fatalf("应返回 system+2 条新消息, got %d: %+v", len(msgs), msgs)
+	}
+	wantText := "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
+		newT.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 看这张图"
+	wantParts := []ContentPart{
+		{Type: "text", Text: wantText},
+		imagePart(imgURL),
+	}
+	gotParts, ok := msgs[1].Content.([]ContentPart)
+	if !ok {
+		t.Fatalf("带图新消息 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
+	}
+	if !reflect.DeepEqual(gotParts, wantParts) {
+		t.Errorf("带图新消息 content =\n%#v\nwant\n%#v", gotParts, wantParts)
+	}
+	// 无图新消息 → string
+	line2 := "[" + now.Add(-10*time.Second).Format("01-02 15:04") + "] [群:928952016] <小红(10002)> 纯文本"
+	if got, ok := msgs[2].Content.(string); !ok || got != line2 {
+		t.Errorf("无图新消息 content 应保持 string %q, got %#v", line2, msgs[2].Content)
+	}
+
+	// multimodal=false：全部 string
+	msgsOff := build(false)
+	if got, ok := msgsOff[1].Content.(string); !ok || got != wantText {
+		t.Errorf("multimodal=false 时带图新消息应为纯文本, got %#v", msgsOff[1].Content)
 	}
 }

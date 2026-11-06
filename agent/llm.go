@@ -39,11 +39,22 @@ type ToolDef struct {
 	Function ToolSchema `json:"function"`
 }
 
-// ChatMessage 一条对话消息。ToolCalls 用于 assistant 回填工具调用，
+// ContentPart 多模态消息内容数组的一项（OpenAI chat 兼容格式）：
+// type 为 "text" 时携带 Text；为 "image_url" 时携带 ImageURL（P2.7）。
+type ContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url,omitempty"`
+}
+
+// ChatMessage 一条对话消息。Content 为字符串，或多模态内容数组 []ContentPart
+// （P2.7：消息携带图片时）。ToolCalls 用于 assistant 回填工具调用，
 // ToolCallID 用于 role=tool 的结果消息。
 type ChatMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
@@ -59,10 +70,11 @@ type ChatRequest struct {
 }
 
 // responseMessage 响应 choices[].message：比请求消息多 reasoning_content
-// （DeepSeek 系思维链，仅捕获不注入上下文）。
+// （DeepSeek 系思维链，仅捕获不注入上下文）。Content 兼容字符串与多模态
+// 数组两种响应形态，文本经 TextContent 提取。
 type responseMessage struct {
 	Role             string     `json:"role"`
-	Content          string     `json:"content"`
+	Content          any        `json:"content"`
 	ToolCalls        []ToolCall `json:"tool_calls"`
 	ReasoningContent string     `json:"reasoning_content"`
 }
@@ -75,12 +87,33 @@ type ChatResponse struct {
 	} `json:"choices"`
 }
 
-// Content 返回 choices[0].message.content。
-func (r *ChatResponse) Content() string {
+// TextContent 返回 choices[0].message.content 的文本：content 为字符串时
+// 原样返回；为多模态数组时按序拼接所有 text 部分（其余类型跳过）；
+// 其他形态视为空。
+func (r *ChatResponse) TextContent() string {
 	if r == nil || len(r.Choices) == 0 {
 		return ""
 	}
-	return r.Choices[0].Message.Content
+	switch c := r.Choices[0].Message.Content.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, part := range c {
+			m, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if typ, _ := m["type"].(string); typ == "text" {
+				if txt, ok := m["text"].(string); ok {
+					b.WriteString(txt)
+				}
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
 }
 
 // ToolCalls 返回 choices[0].message.tool_calls。

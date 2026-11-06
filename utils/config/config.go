@@ -45,6 +45,7 @@ agent:
   debounce: 3s
   temperature: 0.8
   debug: false
+  multimodal: true
   max_tool_rounds: 10
   history:
     max: 40
@@ -103,6 +104,7 @@ type AgentConfig struct {
 	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
 	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
 	Debug         bool          `yaml:"debug" mapstructure:"debug"`
+	Multimodal    bool          `yaml:"multimodal" mapstructure:"multimodal"`
 	MaxToolRounds int           `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
 	History       AgentHistory  `yaml:"history" mapstructure:"history"`
 }

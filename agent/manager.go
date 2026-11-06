@@ -32,6 +32,7 @@ type IncomingMessage struct {
 	SenderID   int64
 	SenderName string
 	Text       string
+	Images     []string // 消息里的图片 URL（P2.7 多模态，wiring 提取）
 	Time       time.Time
 	Urgent     bool // 紧急（私聊/群@，wiring 判定）：思考中收到则打断当前 turn（spec §5）
 }
@@ -121,6 +122,7 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 		SenderID:   msg.SenderID,
 		SenderName: msg.SenderName,
 		Text:       msg.Text,
+		Images:     msg.Images,
 		Time:       msg.Time,
 	})
 
@@ -265,14 +267,14 @@ func (m *Manager) handleTurn(turn *Turn) {
 		if rc := resp.ReasoningContent(); rc != "" {
 			slog.Info("思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "reasoning", rc)
 		}
-		if content := resp.Content(); content != "" {
+		if content := resp.TextContent(); content != "" {
 			slog.Info("输出", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "content", content)
 		}
 
 		calls := resp.ToolCalls()
 		if len(calls) == 0 {
 			// 兼容路径：纯文本直接回复
-			content := strings.TrimSpace(resp.Content())
+			content := strings.TrimSpace(resp.TextContent())
 			if m.cfg.Debug {
 				m.dumpDebug(turn, req, round, resp, nil, nil, false)
 			}
@@ -280,7 +282,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			return
 		}
 
-		msgs = append(msgs, ChatMessage{Role: "assistant", Content: resp.Content(), ToolCalls: calls})
+		msgs = append(msgs, ChatMessage{Role: "assistant", Content: resp.TextContent(), ToolCalls: calls})
 		finished := false
 		var results []string
 		for _, call := range calls {
@@ -399,7 +401,7 @@ func (m *Manager) dumpDebug(turn *Turn, req ChatRequest, round int, resp *ChatRe
 		ToolResults: toolResults,
 	}
 	if resp != nil {
-		rec.Content = resp.Content()
+		rec.Content = resp.TextContent()
 		rec.Reasoning = resp.ReasoningContent()
 		for _, c := range resp.ToolCalls() {
 			rec.ToolCalls = append(rec.ToolCalls, debugToolCall{Name: c.Function.Name, Arguments: c.Function.Arguments})

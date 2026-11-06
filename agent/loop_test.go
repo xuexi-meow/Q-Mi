@@ -101,7 +101,7 @@ func TestThinkLoopFullSequence(t *testing.T) {
 		t.Errorf("请求1 的 tool 消息 = %+v, want role=tool tool_call_id=c1", tool1)
 	}
 	var helpItems []map[string]any
-	if err := json.Unmarshal([]byte(tool1.Content), &helpItems); err != nil {
+	if err := json.Unmarshal([]byte(contentText(tool1)), &helpItems); err != nil {
 		t.Fatalf("help 结果不是 JSON 数组: %v (%s)", err, tool1.Content)
 	}
 	if len(helpItems) != 7 {
@@ -251,8 +251,7 @@ func TestHandleTurnSegmentTypeErrorBackfilled(t *testing.T) {
 	msgs := f.reqs[1].Messages
 	last := msgs[len(msgs)-1]
 	if last.Role != "tool" || last.ToolCallID != "c1" ||
-		!strings.Contains(last.Content, `"error"`) || !strings.Contains(last.Content, "poke") {
-		t.Errorf("非法段类型应以 error 回填: %+v", last)
+		!strings.Contains(contentText(last), `"error"`) || !strings.Contains(contentText(last), "poke") {		t.Errorf("非法段类型应以 error 回填: %+v", last)
 	}
 	if napcat.count() != 0 {
 		t.Errorf("报错路径不应发消息, got %d", napcat.count())
@@ -405,11 +404,11 @@ func TestHandleTurnToolErrorContinues(t *testing.T) {
 		t.Fatalf("请求2 消息数 = %d, want 5", n)
 	}
 	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" ||
-		!strings.Contains(msgs[2].Content, `"error"`) || !strings.Contains(msgs[2].Content, "未知工具") {
+		!strings.Contains(contentText(msgs[2]), `"error"`) || !strings.Contains(contentText(msgs[2]), "未知工具") {
 		t.Errorf("未知工具的回填 = %+v", msgs[2])
 	}
 	if msgs[n-1].Role != "tool" || msgs[n-1].ToolCallID != "c2" ||
-		!strings.Contains(msgs[n-1].Content, `"error"`) || !strings.Contains(msgs[n-1].Content, "chat_type") {
+		!strings.Contains(contentText(msgs[n-1]), `"error"`) || !strings.Contains(contentText(msgs[n-1]), "chat_type") {
 		t.Errorf("非法参数的回填 = %+v", msgs[n-1])
 	}
 	if napcat.count() != 0 {

@@ -10,6 +10,7 @@ import (
 
 	"Q-Mi/app"
 	"Q-Mi/bot"
+	apimsg "Q-Mi/api/message"
 	"Q-Mi/event"
 	evmsg "Q-Mi/event/message"
 	"Q-Mi/storage"
@@ -40,6 +41,26 @@ func urgentFromEvent(chatType string, msgs []*evmsg.Message, selfID int64) bool 
 	return bot.AtUserID(msgs, selfID)
 }
 
+// eventImageURLs 从事件消息段提取图片 URL（P2.7 多模态）：
+// 只取 type=="image" 且 url 非空的段；段未解析时懒解析，解析失败跳过。
+func eventImageURLs(msgs []*evmsg.Message) []string {
+	var urls []string
+	for _, m := range msgs {
+		if m == nil || m.Type != string(apimsg.TypeImage) {
+			continue
+		}
+		if m.Data == nil {
+			if _, err := m.TypeHandler(); err != nil {
+				continue
+			}
+		}
+		if img, ok := m.Data.(evmsg.Image); ok && img.Url != nil && *img.Url != "" {
+			urls = append(urls, *img.Url)
+		}
+	}
+	return urls
+}
+
 func init() {
 	event.RegisterTyped("message.private", func(e *event.PrivateMessageEvent) {
 		m := getManager()
@@ -54,6 +75,7 @@ func init() {
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
+			Images:     eventImageURLs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("private", e.Message, int64(e.SelfID)),
 		})
@@ -72,6 +94,7 @@ func init() {
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
+			Images:     eventImageURLs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),
 		})

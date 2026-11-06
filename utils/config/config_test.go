@@ -46,6 +46,7 @@ const agentConfigYAML = validConfigYAML + `agent:
   debounce: 3s
   temperature: 0.8
   debug: false
+  multimodal: true
   max_tool_rounds: 5
   history:
     max: 40
@@ -247,6 +248,7 @@ func TestLoadConfigDefaultAgentValues(t *testing.T) {
 		Debounce:      3 * time.Second,
 		Temperature:   0.8,
 		Debug:         false,
+		Multimodal:    true,
 		MaxToolRounds: 10,
 		History:       AgentHistory{Max: 40, Trim: 20},
 	}
@@ -272,6 +274,7 @@ func TestLoadConfigAgentBlock(t *testing.T) {
 		Debounce:      3 * time.Second,
 		Temperature:   0.8,
 		Debug:         false,
+		Multimodal:    true,
 		MaxToolRounds: 5,
 		History:       AgentHistory{Max: 40, Trim: 20},
 	}
@@ -284,6 +287,24 @@ func TestLoadConfigAgentBlock(t *testing.T) {
 	}
 	if string(contents) != agentConfigYAML {
 		t.Error("loading modified the existing configuration")
+	}
+}
+
+// TestLoadConfigAgentMultimodalToggle multimodal 显式设 false 时解析为 false
+//（不支持图片输入的模型关闭多模态，维持纯文本+原始 CQ 码）。
+func TestLoadConfigAgentMultimodalToggle(t *testing.T) {
+	filename := configTestDir(t)
+	content := strings.Replace(agentConfigYAML, "multimodal: true", "multimodal: false", 1)
+	if content == agentConfigYAML {
+		t.Fatal("test replacement did not modify the fixture")
+	}
+	writeTestConfig(t, filename, content)
+	got := new(Config).LoadConfig()
+	if got == nil || got.Agent == nil {
+		t.Fatal("LoadConfig returned nil for valid agent configuration")
+	}
+	if got.Agent.Multimodal {
+		t.Error("multimodal: false 应解析为 false")
 	}
 }
 

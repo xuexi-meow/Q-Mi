@@ -17,14 +17,16 @@ import (
 // fallbackPersona persona 文件缺失时的内置兜底提示词。
 const fallbackPersona = "你是一个QQ群聊/私聊里的AI成员，用中文自然交流。"
 
-// agentGuideText system 中的静态 agent 格式说明段（spec §2.2/§3）：
-// 只写行为准则，保持字节稳定以命中 prompt cache；工具的详细用法由 help 工具提供。
+// agentGuideText guide 文件缺失时的内置兜底格式说明（正式版在 agent/guide.md）。
 const agentGuideText = `[Agent 工作方式]
 你在思考循环中：可先调用工具查资料、记笔记、调整状态，再决定是否回复。
 - 要说话必须调用 send_message（可多次调用，分条发送）；不调用即本轮不回复。
 - think(note) 记录思考笔记，下一轮对话可见；update_mood(mood) 更新你的情绪。
 - 查历史用 get_recent_messages，搜历史用 search_messages；用法不确定先调 help。
 - 想结束本轮思考就调用 finish；finish 前已发出的消息均已生效。`
+
+// defaultGuidePath guide_file 未配置时的默认路径。
+const defaultGuidePath = "agent/guide.md"
 
 // Turn 进 builder 的一轮输入：chat 上下文、思考笔记、本轮新消息、当前时间。
 // 携带全部原料，任何自定义 builder 都能拿到。
@@ -55,19 +57,20 @@ type ContextBuilder interface {
 	Build(turn *Turn) []ChatMessage
 }
 
-// DefaultBuilder 默认实现：persona + 块裁剪历史 + 末尾新消息。
+// DefaultBuilder 默认实现：persona + agent 格式说明 + 块裁剪历史 + 末尾新消息。
 type DefaultBuilder struct {
 	store   *storage.Store
 	max     int
 	trim    int
 	persona string
+	guide   string
 }
 
 // 编译期保证 DefaultBuilder 满足接口。
 var _ ContextBuilder = (*DefaultBuilder)(nil)
 
-// NewDefaultBuilder 构造默认 builder。构造时读取 cfg.PersonaFile，
-// 缺失则告警一次并使用内置兜底提示词，不阻断运行。
+// NewDefaultBuilder 构造默认 builder。persona/guide 文件缺失则告警一次
+// 并使用内置兜底文本，不阻断运行。
 func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBuilder {
 	b := &DefaultBuilder{
 		store: store,
@@ -80,6 +83,16 @@ func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBui
 		b.persona = fallbackPersona
 	} else {
 		b.persona = strings.TrimSpace(string(data))
+	}
+	guidePath := cfg.GuideFile
+	if guidePath == "" {
+		guidePath = defaultGuidePath
+	}
+	if data, err := os.ReadFile(guidePath); err != nil {
+		slog.Warn("读取 agent 格式说明文件失败，使用内置兜底文本", "path", guidePath, "err", err)
+		b.guide = agentGuideText
+	} else {
+		b.guide = strings.TrimSpace(string(data))
 	}
 	return b
 }
@@ -141,7 +154,7 @@ func senderLabel(senderID int64, senderName string, isSelf bool) string {
 //	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加
 //	user:   [思考笔记] + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
 func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
-	system := b.persona + "\n" + agentGuideText + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
+	system := b.persona + "\n" + b.guide + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
 	if turn.Mood != "" {
 		system += "\n当前情绪状态: " + turn.Mood
 	}

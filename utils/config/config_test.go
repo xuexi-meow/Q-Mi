@@ -42,6 +42,7 @@ const agentConfigYAML = validConfigYAML + `agent:
   api_key: "sk-test"
   model: "deepseek-chat"
   persona_file: "agent/persona.md"
+  guide_file: "agent/guide.md"
   debounce: 3s
   temperature: 0.8
   debug: false
@@ -242,6 +243,7 @@ func TestLoadConfigDefaultAgentValues(t *testing.T) {
 		APIKey:        "",
 		Model:         "",
 		PersonaFile:   "agent/persona.md",
+		GuideFile:     "agent/guide.md",
 		Debounce:      3 * time.Second,
 		Temperature:   0.8,
 		Debug:         false,
@@ -266,6 +268,7 @@ func TestLoadConfigAgentBlock(t *testing.T) {
 		APIKey:        "sk-test",
 		Model:         "deepseek-chat",
 		PersonaFile:   "agent/persona.md",
+		GuideFile:     "agent/guide.md",
 		Debounce:      3 * time.Second,
 		Temperature:   0.8,
 		Debug:         false,
@@ -301,6 +304,7 @@ func TestLoadConfigRejectsInvalidAgentConfiguration(t *testing.T) {
 		{"empty api_key", `api_key: "sk-test"`, `api_key: ""`, "agent.api_key"},
 		{"blank api_key", `api_key: "sk-test"`, `api_key: "  "`, "agent.api_key"},
 		{"empty persona_file", `persona_file: "agent/persona.md"`, `persona_file: ""`, "agent.persona_file"},
+		{"empty guide_file", `guide_file: "agent/guide.md"`, `guide_file: ""`, "agent.guide_file"},
 		{"history max below trim", "max: 40", "max: 10", "agent.history.max"},
 		{"zero history trim", "trim: 20", "trim: 0", "agent.history.trim"},
 		{"negative history trim", "trim: 20", "trim: -1", "agent.history.trim"},
@@ -371,6 +375,7 @@ func TestLoadConfigSkipsAgentValidationWhenDisabled(t *testing.T) {
   api_key: ""
   model: ""
   persona_file: ""
+  guide_file: ""
   debounce: 0s
   history:
     max: 0

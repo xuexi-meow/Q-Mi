@@ -41,6 +41,7 @@ agent:
   api_key: ""
   model: ""
   persona_file: "agent/persona.md"
+  guide_file: "agent/guide.md"
   debounce: 3s
   temperature: 0.8
   debug: false
@@ -98,6 +99,7 @@ type AgentConfig struct {
 	APIKey        string        `yaml:"api_key" mapstructure:"api_key"`
 	Model         string        `yaml:"model" mapstructure:"model"`
 	PersonaFile   string        `yaml:"persona_file" mapstructure:"persona_file"`
+	GuideFile     string        `yaml:"guide_file" mapstructure:"guide_file"`
 	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
 	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
 	Debug         bool          `yaml:"debug" mapstructure:"debug"`
@@ -216,6 +218,9 @@ func validateAgentConfig(agent *AgentConfig) error {
 	}
 	if strings.TrimSpace(agent.PersonaFile) == "" {
 		return fmt.Errorf("agent.persona_file must not be empty when agent is enabled")
+	}
+	if strings.TrimSpace(agent.GuideFile) == "" {
+		return fmt.Errorf("agent.guide_file must not be empty when agent is enabled")
 	}
 	if agent.Debounce <= 0 {
 		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)

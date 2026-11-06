@@ -26,6 +26,7 @@ agent:
   api_key: "sk-..."
   model: "deepseek-chat"
   persona_file: "agent/persona.md"
+  guide_file: "agent/guide.md"   # agent 行为/格式约束(工具用法细节走 help 工具)
   debounce: 3s
   temperature: 0.8
   debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/

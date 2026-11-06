@@ -36,6 +36,16 @@ func writePersonaFile(t *testing.T, content string) string {
 	return path
 }
 
+// writeGuideFile 写一份 agent 格式说明测试文件，返回路径。
+func writeGuideFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "guide.md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("写入 guide 文件失败: %v", err)
+	}
+	return path
+}
+
 // captureLogs 把默认 slog 输出重定向到缓冲区，返回该缓冲区。
 func captureLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
@@ -51,6 +61,7 @@ func TestBuildEmptyTurnReturnsOnlySystem(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -81,6 +92,7 @@ func TestBuildSystemContainsMoodAndAgentGuide(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -115,6 +127,7 @@ func TestNewDefaultBuilderMissingPersonaWarnsOnceAndFallsBack(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent-persona.md")
 	cfg := config.AgentConfig{
 		PersonaFile: missing,
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 
@@ -147,6 +160,46 @@ func TestNewDefaultBuilderMissingPersonaWarnsOnceAndFallsBack(t *testing.T) {
 	}
 	if warns != 1 {
 		t.Errorf("persona 缺失应恰好告警一次, got %d 次: %s", warns, logs.String())
+	}
+}
+
+// TestNewDefaultBuilderMissingGuideFallsBack guide 文件缺失时告警并使用内置
+// 兜底格式说明。
+func TestNewDefaultBuilderMissingGuideFallsBack(t *testing.T) {
+	s := openTestStore(t)
+	logs := captureLogs(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   filepath.Join(t.TempDir(), "absent-guide.md"),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+
+	b := NewDefaultBuilder(s, cfg)
+	msgs := b.Build(&Turn{ChatType: "private", ChatID: 10001, SelfID: 9527, Now: time.Unix(1762400000, 0)})
+
+	if !strings.Contains(msgs[0].Content, agentGuideText) {
+		t.Errorf("guide 缺失应回退内置文本: %q", msgs[0].Content)
+	}
+	if !strings.Contains(logs.String(), "absent-guide.md") {
+		t.Errorf("guide 缺失应告警并包含路径: %s", logs.String())
+	}
+}
+
+// TestBuilderUsesGuideFileContent guide 文件内容应原样进 system（可编辑提示词）。
+func TestBuilderUsesGuideFileContent(t *testing.T) {
+	s := openTestStore(t)
+	const customGuide = "[自定义格式说明]\n始终用喵语气说话。"
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, customGuide),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+
+	b := NewDefaultBuilder(s, cfg)
+	msgs := b.Build(&Turn{ChatType: "private", ChatID: 10001, SelfID: 9527, Now: time.Unix(1762400000, 0)})
+
+	if !strings.Contains(msgs[0].Content, customGuide) {
+		t.Errorf("guide 文件内容未进 system: %q", msgs[0].Content)
 	}
 }
 
@@ -188,6 +241,7 @@ func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -220,6 +274,7 @@ func TestBuildHistoryExcludesRecalled(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -249,6 +304,7 @@ func TestBuildWithNilStoreReturnsOnlySystem(t *testing.T) {
 	logs := captureLogs(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(nil, cfg)
@@ -269,6 +325,7 @@ func TestBuildTrimsHistoryAcrossChatsInBlocks(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 4, Trim: 2},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -305,6 +362,7 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -347,6 +405,7 @@ func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -386,6 +445,7 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -448,6 +508,7 @@ func TestBuildSystemStaticAcrossNow(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -487,6 +548,7 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
 	}
 	b := NewDefaultBuilder(s, cfg)

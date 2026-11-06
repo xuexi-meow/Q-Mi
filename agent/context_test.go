@@ -651,7 +651,7 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
-		Multimodal:  true,
+		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -724,7 +724,7 @@ func TestBuildHistorySentImageRowStaysString(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
-		Multimodal:  true,
+		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -760,7 +760,7 @@ func TestBuildHistoryMultimodalDisabledKeepsRawCQ(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
-		Multimodal:  false,
+		Multimodal:  boolPtr(false),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -798,7 +798,7 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 			PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 			GuideFile:   writeGuideFile(t, agentGuideText),
 			History:     config.AgentHistory{Max: 40, Trim: 20},
-			Multimodal:  multimodal,
+			Multimodal:  boolPtr(multimodal),
 		}
 		b := NewDefaultBuilder(s, cfg)
 		return b.Build(&Turn{
@@ -842,3 +842,5 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 		t.Errorf("multimodal=false 时带图新消息应为纯文本, got %#v", msgsOff[1].Content)
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }

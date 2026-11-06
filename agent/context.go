@@ -82,7 +82,7 @@ func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBui
 		store:      store,
 		max:        cfg.History.Max,
 		trim:       cfg.History.Trim,
-		multimodal: cfg.Multimodal,
+		multimodal: cfg.MultimodalEnabled(),
 	}
 	data, err := os.ReadFile(cfg.PersonaFile)
 	if err != nil {

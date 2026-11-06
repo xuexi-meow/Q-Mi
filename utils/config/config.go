@@ -104,7 +104,8 @@ type AgentConfig struct {
 	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
 	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
 	Debug         bool          `yaml:"debug" mapstructure:"debug"`
-	Multimodal    bool          `yaml:"multimodal" mapstructure:"multimodal"`
+	// Multimodal 缺键(nil)视为 true——旧配置文件没有该字段时不应静默关闭。
+	Multimodal    *bool         `yaml:"multimodal" mapstructure:"multimodal"`
 	MaxToolRounds int           `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
 	History       AgentHistory  `yaml:"history" mapstructure:"history"`
 }
@@ -237,6 +238,11 @@ func validateAgentConfig(agent *AgentConfig) error {
 		return fmt.Errorf("agent.history.max %d must be >= agent.history.trim %d", agent.History.Max, agent.History.Trim)
 	}
 	return nil
+}
+
+// MultimodalEnabled 缺键(nil)默认开启。
+func (a *AgentConfig) MultimodalEnabled() bool {
+	return a.Multimodal == nil || *a.Multimodal
 }
 
 func validateHostPort(name, host string, port int) error {

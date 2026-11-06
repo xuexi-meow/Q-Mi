@@ -69,7 +69,8 @@ type DefaultBuilder struct {
 	trim       int
 	persona    string
 	guide      string
-	multimodal bool // P2.7：开启时带图片的消息行以多模态内容直送模型
+	multimodal bool        // P2.7：开启时带图片的消息行以多模态内容直送模型
+	images     *imageCache // P3-3：图片 URL → base64 data URL 本地下载缓存（多会话 worker 共享）
 }
 
 // 编译期保证 DefaultBuilder 满足接口。
@@ -83,6 +84,7 @@ func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBui
 		max:        cfg.History.Max,
 		trim:       cfg.History.Trim,
 		multimodal: cfg.MultimodalEnabled(),
+		images:     newImageCache(),
 	}
 	data, err := os.ReadFile(cfg.PersonaFile)
 	if err != nil {
@@ -211,7 +213,7 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		// 无图行保持纯 string，wire 字节不变（缓存前缀稳定）。
 		if b.multimodal && role == "user" {
 			if urls := extractImageURLs(r.Segments); len(urls) > 0 {
-				content = multimodalContent(replaceImageCQ(line), urls)
+				content = b.multimodalContent(replaceImageCQ(line), urls)
 			}
 		}
 		*msgs = append(*msgs, ChatMessage{Role: role, Content: content})
@@ -235,7 +237,7 @@ func (b *DefaultBuilder) appendNewMessages(msgs []ChatMessage, turn *Turn) []Cha
 		}
 		var c any = content
 		if b.multimodal && len(m.Images) > 0 {
-			c = multimodalContent(content, m.Images)
+			c = b.multimodalContent(content, m.Images)
 		}
 		msgs = append(msgs, ChatMessage{Role: "user", Content: c})
 	}
@@ -289,12 +291,13 @@ func imagePart(url string) ContentPart {
 }
 
 // multimodalContent 把行文本与图片 URL 组装成 OpenAI 多模态内容数组：
-// 首项为文本，其后每个 URL 一项 image_url。
-func multimodalContent(text string, urls []string) []ContentPart {
+// 首项为文本，其后每个 URL 一项 image_url。URL 先经 imageCache 尝试本地
+// 下载转 base64 data URL（P3-3），失败回退原 URL。
+func (b *DefaultBuilder) multimodalContent(text string, urls []string) []ContentPart {
 	parts := make([]ContentPart, 0, len(urls)+1)
 	parts = append(parts, ContentPart{Type: "text", Text: text})
 	for _, u := range urls {
-		parts = append(parts, imagePart(u))
+		parts = append(parts, imagePart(b.images.dataURL(u)))
 	}
 	return parts
 }

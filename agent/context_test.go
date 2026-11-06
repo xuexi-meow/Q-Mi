@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -643,8 +645,9 @@ func putRecordFull(t *testing.T, s *storage.Store, r *storage.MessageRecord) {
 }
 
 // TestBuildHistoryImageRowBecomesMultimodal 含图片 url 的历史行 content 变为
-// 多模态数组：text 部分（CQ:image 码替换为 [图片]）+ 每个 url 一个 image_url
-// 部分；相邻无图行保持 string（wire 字节与旧行为一致，保缓存前缀）。
+// 多模态数组：text 部分（CQ:image 码替换为 [图片]）+ 图片部分经 imageCache
+// 本地下载转为 base64 data URL（P3-3）；相邻无图行保持 string（wire 字节与
+// 旧行为一致，保缓存前缀）。
 func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
@@ -655,9 +658,11 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 	}
 	b := NewDefaultBuilder(s, cfg)
 
+	imgSrv, _ := servePNG(t, "image/png")
+	imgURL := imgSrv.URL + "/a.png"
+
 	t1 := time.Unix(1762400000, 0)
 	t2 := t1.Add(60 * time.Second)
-	const imgURL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc"
 	putRecordFull(t, s, &storage.MessageRecord{
 		MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 928952016,
 		UserID: 10001, SenderName: "小明",
@@ -672,11 +677,11 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 		t.Fatalf("应返回 system+2 条历史, got %d: %+v", len(msgs), msgs)
 	}
 
-	// 带图行 → 多模态数组
+	// 带图行 → 多模态数组，图片部分为本地下载的 data URL
 	line1 := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> [图片] 看这张图"
 	wantParts := []ContentPart{
 		{Type: "text", Text: line1},
-		imagePart(imgURL),
+		imagePart(pngDataURL),
 	}
 	gotParts, ok := msgs[1].Content.([]ContentPart)
 	if !ok {
@@ -684,6 +689,9 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotParts, wantParts) {
 		t.Errorf("带图行 content =\n%#v\nwant\n%#v", gotParts, wantParts)
+	}
+	if got := gotParts[1].ImageURL.URL; !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Errorf("image_url 应为 base64 data URL 前缀, got %q", got)
 	}
 	// wire 字节级校验
 	gotJSON, err := json.Marshal(msgs[1])
@@ -785,13 +793,14 @@ func TestBuildHistoryMultimodalDisabledKeepsRawCQ(t *testing.T) {
 }
 
 // TestBuildNewMessageImagesMultimodal 本轮新消息带 Images 时行内容变为多模态
-// 数组（text 部分保留时间头/笔记前缀，其后每个 url 一个 image_url）；无图行
-// 与 multimodal=false 时保持 string。
+// 数组（text 部分保留时间头/笔记前缀，其后图片 url 经 imageCache 转为 base64
+// data URL，P3-3）；无图行与 multimodal=false 时保持 string。
 func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Unix(1762400000, 0)
 	newT := now.Add(-30 * time.Second)
-	const imgURL = "https://multimedia.nt.qq.com/download?appid=1407&fileid=img1"
+	imgSrv, _ := servePNG(t, "image/png")
+	imgURL := imgSrv.URL + "/img1"
 
 	build := func(multimodal bool) []ChatMessage {
 		cfg := config.AgentConfig{
@@ -821,7 +830,7 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 		newT.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 看这张图"
 	wantParts := []ContentPart{
 		{Type: "text", Text: wantText},
-		imagePart(imgURL),
+		imagePart(pngDataURL),
 	}
 	gotParts, ok := msgs[1].Content.([]ContentPart)
 	if !ok {
@@ -840,6 +849,49 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 	msgsOff := build(false)
 	if got, ok := msgsOff[1].Content.(string); !ok || got != wantText {
 		t.Errorf("multimodal=false 时带图新消息应为纯文本, got %#v", msgsOff[1].Content)
+	}
+}
+
+// TestBuildHistoryImageRowFallsBackWhenDownloadFails 图片下载失败（500）时，
+// 带图历史行仍为多模态数组，image_url 部分回退为原始 URL（不拒绝整个请求）。
+func TestBuildHistoryImageRowFallsBackWhenDownloadFails(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  boolPtr(true),
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(imgSrv.Close)
+	imgURL := imgSrv.URL + "/a.png"
+
+	t1 := time.Unix(1762400000, 0)
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 928952016,
+		UserID: 10001, SenderName: "小明",
+		RawMessage: "[CQ:image,file=a.image,subType=0,url=" + imgURL + "] 看这张图",
+		Segments:   []byte(`[{"type":"image","data":{"file":"a.image","url":"` + imgURL + `","sub_type":0}}]`),
+		Time:       float64(t1.Unix()),
+	})
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t1.Add(time.Minute)})
+	if len(msgs) != 2 {
+		t.Fatalf("应返回 system+1 条历史, got %d: %+v", len(msgs), msgs)
+	}
+	gotParts, ok := msgs[1].Content.([]ContentPart)
+	if !ok {
+		t.Fatalf("带图历史行 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
+	}
+	if len(gotParts) != 2 || gotParts[1].ImageURL == nil {
+		t.Fatalf("content 应含 1 个 image_url 部分: %#v", gotParts)
+	}
+	if got := gotParts[1].ImageURL.URL; got != imgURL {
+		t.Errorf("下载失败应回退原 url, got %q", got)
 	}
 }
 

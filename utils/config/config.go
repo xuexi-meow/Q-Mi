@@ -1,9 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
-
+	"net/url"
 	"os"
+	"strings"
+	"unicode"
 
 	"github.com/spf13/viper"
 )
@@ -11,10 +14,11 @@ import (
 const DefaultConfig = `bot:
   qq_number: 0
   admin_number:
-	- 1234
+    - 1234
 netsetting:
   host: "0.0.0.0"
-  port: 11451
+  port: 9090
+  pattern: "/Q-Mi"
   token: ""
 napcat:
   ws:
@@ -98,6 +102,10 @@ func (c *Config) LoadConfig() *Config {
 	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil {
 		return nil
 	}
+	if err := validateConfig(netSetting, napcat, storageCfg); err != nil {
+		slog.Error("配置校验失败", "err", err)
+		return nil
+	}
 
 	slog.Info("读取配置文件成功")
 	return &Config{
@@ -109,15 +117,53 @@ func (c *Config) LoadConfig() *Config {
 }
 
 func makeNewConfig() bool {
-	if _, err := os.OpenFile("Config.yaml", os.O_CREATE, 0777); err != nil {
+	if _, err := os.Lstat("Config.yaml"); !os.IsNotExist(err) {
+		if err == nil {
+			err = os.ErrExist
+		}
 		slog.Error("创建配置文件失败", "err", err)
 		return false
 	}
-	if err := os.WriteFile("Config.yaml", []byte(DefaultConfig), 0777); err != nil {
+	if err := os.WriteFile("Config.yaml", []byte(DefaultConfig), 0600); err != nil {
 		slog.Error("写入配置文件失败", "err", err)
 		return false
 	}
 	return true
+}
+
+func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage) error {
+	if err := validateHostPort("netsetting", netSetting.Host, netSetting.Port); err != nil {
+		return err
+	}
+	pattern := netSetting.Pattern
+	u, err := url.ParseRequestURI(pattern)
+	if err != nil {
+		return fmt.Errorf("netsetting.pattern: %w", err)
+	}
+	if !strings.HasPrefix(pattern, "/") || u.IsAbs() ||
+		strings.ContainsAny(pattern, "{}*?#\\") || strings.ContainsAny(u.Path, "{}*?#\\") ||
+		strings.IndexFunc(u.Path, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return fmt.Errorf("netsetting.pattern %q must be a plain absolute path without whitespace or wildcards", pattern)
+	}
+	if storage.Enable && strings.TrimSpace(storage.Path) == "" {
+		return fmt.Errorf("storage.path must not be empty when storage is enabled")
+	}
+	if napcat.HTTP.Enable {
+		if err := validateHostPort("napcat.http", napcat.HTTP.Host, napcat.HTTP.Port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateHostPort(name, host string, port int) error {
+	if strings.TrimSpace(host) == "" {
+		return fmt.Errorf("%s.host must not be empty", name)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("%s.port must be between 1 and 65535, got %d", name, port)
+	}
+	return nil
 }
 
 func initConfig(v viper.Viper) (*Bot, *NetSetting, *Napcat, *Storage) {

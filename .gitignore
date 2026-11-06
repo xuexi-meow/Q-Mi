@@ -1,3 +1,8 @@
 Q-Mi.db
 Q-Mi.db-wal
 Q-Mi.db-shm
+node_modules/
+Q-Mi.zip
+npm_install_log.txt
+.continue/
+.vscode/

@@ -128,6 +128,10 @@ func (e *GroupMessageEvent) Messages() []*message.Message {
 	return e.Message
 }
 
+func (e *MessageSentEvent) Messages() []*message.Message {
+	return e.Message
+}
+
 // NoticeEvent 通知事件公共字段
 type NoticeEvent struct {
 	MainEvent

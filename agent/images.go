@@ -86,9 +86,11 @@ func (c *imageCache) dataURL(url string) string {
 }
 
 // download 下载 url 并返回 (字节, MIME 类型, 错误)。独立 client（默认超时
-// 10s），响应体经 http.MaxBytesReader 限 maxImageBytes；Content-Type 缺失或
-// 非 image/*（如 CDN 误标 text/plain、octet-stream）时按魔数猜
-// jpeg/png/gif/webp，仍无法识别视为失败。
+// 10s），响应体经 http.MaxBytesReader 限 maxImageBytes。
+// MIME 只信魔数不信 CDN 的 Content-Type——腾讯 CDN 会把 AVIF 等实际不支持的
+// 格式误标成 image/jpeg，导致提供商以 "unsupported image" 拒绝整个请求。
+// 魔数不在提供商支持的四种格式（jpeg/png/gif/webp）内一律视为失败，该图由
+// 上层从上下文剔除。
 func (c *imageCache) download(url string) ([]byte, string, error) {
 	resp, err := c.client.Get(url)
 	if err != nil {
@@ -102,11 +104,10 @@ func (c *imageCache) download(url string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	mime := strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0])
-	if !strings.HasPrefix(mime, "image/") {
-		if mime = sniffImageMIME(body); mime == "" {
-			return nil, "", fmt.Errorf("agent: 无法识别图片类型 (Content-Type=%q 且魔数不匹配)", mime)
-		}
+	mime := sniffImageMIME(body)
+	if mime == "" {
+		ct := strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0])
+		return nil, "", fmt.Errorf("agent: 图片格式不受支持 (魔数未匹配 jpeg/png/gif/webp, Content-Type=%q)", ct)
 	}
 	return body, mime, nil
 }

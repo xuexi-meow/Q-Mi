@@ -203,3 +203,28 @@ func TestImageCacheDataURLConcurrentSameResult(t *testing.T) {
 		}
 	}
 }
+
+// TestDataURLRejectsHeaderLies CDN 把 AVIF（魔数 ftyp+avif）误标成 image/jpeg
+// 时必须拒绝——只信魔数不信 header；否则该图会以 "unsupported image" 拖垮
+// 整个请求（线上实测）。
+func TestDataURLRejectsHeaderLies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("\x00\x00\x00\x20ftypavif\x00\x00\x00\x00avifmif1fake-payload"))
+	}))
+	defer srv.Close()
+	c := newImageCacheWithClient(srv.Client())
+	if got := c.dataURL(srv.URL + "/a.jpg"); !strings.HasPrefix(got, "http") {
+		t.Fatalf("AVIF 伪装 jpeg 应下载失败回退原 URL, got %q", got[:40])
+	}
+	// 真 jpeg 带 octet-stream 头应凭魔数成功
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write([]byte("\xFF\xD8\xFF\xE0jpeg-bytes"))
+	}))
+	defer ok.Close()
+	c2 := newImageCacheWithClient(ok.Client())
+	if got := c2.dataURL(ok.URL + "/b.jpg"); !strings.HasPrefix(got, "data:image/jpeg;base64,") {
+		t.Fatalf("真 jpeg 应凭魔数识别成功, got %q", got[:40])
+	}
+}

@@ -45,8 +45,9 @@ const defaultMaxToolRounds = 10
 
 // 默认思考状态文件路径（相对工作目录，已进 .gitignore）。
 const (
-	defaultNotesPath = "agent/notes.json"
-	defaultStatePath = "agent/state.json"
+	defaultNotesPath  = "agent/notes.json"
+	defaultStatePath  = "agent/state.json"
+	defaultTimersPath = "agent/timers.json" // P3.5 定时器记录
 )
 
 // turnQueueCap 每个 worker 的 turn 队列缓冲；满了之后投递方阻塞等待。
@@ -64,10 +65,11 @@ type session struct {
 
 // Manager 会话队列：防抖合并、串行处理、思考循环（工具调用）、回复、debug 落盘。
 type Manager struct {
-	builder ContextBuilder
-	client  *Client
-	cfg     config.AgentConfig
-	store   *storage.Store
+	builder    ContextBuilder
+	client     *Client
+	cfg        config.AgentConfig
+	store      *storage.Store
+	timerStore *TimerStore // P3.5 定时提醒（schedule 工具的后端）
 
 	// debugDir/notesPath/statePath 做成私有字段便于测试注入 t.TempDir()。
 	debugDir  string
@@ -79,8 +81,10 @@ type Manager struct {
 }
 
 // NewManager 构造 Manager。store 可为 nil（无历史/查询工具报错）。
+// P3.5：构造后接上 TimerStore（fire 回调引用 m.Enqueue，须先有 manager
+// 再造 store，避免循环依赖），随即恢复上次进程未触发的计时。
 func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, store *storage.Store) *Manager {
-	return &Manager{
+	m := &Manager{
 		builder:   builder,
 		client:    client,
 		cfg:       cfg,
@@ -90,6 +94,9 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 		statePath: defaultStatePath,
 		sessions:  make(map[string]*session),
 	}
+	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
+	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
+	return m
 }
 
 // sessionKey 会话键。
@@ -183,6 +190,22 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 	}
 }
 
+// fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
+// （发送者「定时」、SenderID=SelfID、文本 [定时提醒] 前缀）。走正常防抖
+// 排队，不打断正在进行的思考；非紧急。
+func (m *Manager) fireTimer(st ScheduledTimer) {
+	m.Enqueue(IncomingMessage{
+		ChatType:   st.ChatType,
+		ChatID:     st.ChatID,
+		SelfID:     st.SelfID,
+		SenderID:   st.SelfID,
+		SenderName: "定时",
+		Text:       "[定时提醒] " + st.Note,
+		Time:       time.Now(),
+		Urgent:     false,
+	})
+}
+
 // workerLoop 长驻消费循环：逐个处理 turn，panic 自兜底继续（不依赖外层 recover）。
 func (m *Manager) workerLoop(key string, ch <-chan *Turn) {
 	for turn := range ch {
@@ -239,7 +262,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			break
 		}
 	}
-	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin)
+	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin, turn, m.timerStore)
 	defs := toolDefs(tools)
 	maxRounds := m.cfg.MaxToolRounds
 	if maxRounds <= 0 {

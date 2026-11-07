@@ -9,4 +9,5 @@ npm_install_log.txt
 agent/debug/
 agent/notes.json
 agent/state.json
+agent/timers.json
 Config.yaml

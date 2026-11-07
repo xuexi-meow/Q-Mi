@@ -79,7 +79,15 @@ func intProp(desc string) map[string]any {
 // agent/notes.json、agent/state.json，测试注入临时目录）；store 为 nil 时
 // 查询类工具返回 error。isAdmin 由 manager 按 turn 发送者是否管理员判定，
 // 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
-func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool) []Tool {
+// turn 为本轮 chat 上下文（schedule 从中捕获会话，可为 nil）；timer 为
+// 计时器存储（P3.5，nil 时 schedule/cancel_timer 返回 error）。
+func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore) []Tool {
+	// schedule 的会话上下文在构造期从 turn 捕获（工具 Run 拿不到 turn）。
+	var curChatType string
+	var curChatID, curSelfID int64
+	if turn != nil {
+		curChatType, curChatID, curSelfID = turn.ChatType, turn.ChatID, turn.SelfID
+	}
 	tools := []Tool{
 		{
 			Name:        "get_recent_messages",
@@ -246,6 +254,66 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool)
 					return "", fmt.Errorf("mood 不能为空")
 				}
 				return "{}", writeState(statePath, p.Mood)
+			},
+		},
+		// P3-5 定时器工具：到点经 fire 回调合成为 [定时提醒] 消息排队唤醒。
+		{
+			Name:        "schedule",
+			Description: "定一个一次性闹钟：delay_seconds 秒后你会收到一条 [定时提醒] 开头的消息（note 原样带给你）。提醒走正常消息队列排队，不会打断你正在做的思考。适合控制发言节奏、延时跟进（如「10分钟后看看他回了没」）、定时打卡；循环任务到点后自己再 schedule 一次。",
+			Parameters: objectParams(map[string]any{
+				"delay_seconds": intProp("多少秒后提醒，1 ~ 604800（最长 7 天）"),
+				"note":          strProp("到点提醒内容：写清楚到时要做什么、发给谁（会话与内容）"),
+			}, []string{"delay_seconds", "note"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if timer == nil {
+					return "", errors.New("定时器不可用")
+				}
+				var p struct {
+					DelaySeconds int64  `json:"delay_seconds"`
+					Note         string `json:"note"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.Note == "" {
+					return "", fmt.Errorf("缺少必填参数 note")
+				}
+				if p.DelaySeconds < 1 || p.DelaySeconds > 604800 {
+					return "", fmt.Errorf("delay_seconds 需在 1 ~ 604800 秒之间（最长 7 天），got %d", p.DelaySeconds)
+				}
+				rec, err := timer.Schedule(time.Duration(p.DelaySeconds)*time.Second, p.Note, curChatType, curChatID, curSelfID)
+				if err != nil {
+					return "", err
+				}
+				return marshalCompact(map[string]any{
+					"id":      rec.ID,
+					"fire_at": rec.FireAt.Format("01-02 15:04:05"),
+				})
+			},
+		},
+		{
+			Name:        "cancel_timer",
+			Description: "取消一个还没到点的定时提醒（传 schedule 返回的 id）。已触发或已取消的 id 会报错。",
+			Parameters: objectParams(map[string]any{
+				"timer_id": strProp("schedule 返回的定时器 id"),
+			}, []string{"timer_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if timer == nil {
+					return "", errors.New("定时器不可用")
+				}
+				var p struct {
+					TimerID string `json:"timer_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.TimerID == "" {
+					return "", fmt.Errorf("缺少必填参数 timer_id")
+				}
+				if !timer.Cancel(p.TimerID) {
+					return "", fmt.Errorf("没有找到定时器 %q（可能已触发或已取消）", p.TimerID)
+				}
+				return marshalCompact(map[string]any{"cancelled": true})
 			},
 		},
 		{

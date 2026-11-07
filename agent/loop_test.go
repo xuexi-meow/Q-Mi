@@ -469,3 +469,67 @@ func TestDebugDumpPerRoundWithToolCalls(t *testing.T) {
 		t.Errorf("记录轮数 = %v, want [1 2]", rounds)
 	}
 }
+
+// TestScheduleToolFiresReminderIntoLoop schedule 工具走通全链（P3.5）：
+// LLM 调 schedule → TimerStore 到点 → manager.fireTimer 合成 [定时提醒]
+// IncomingMessage 入队 → 防抖合成新 turn → 思考循环再次醒来，
+// fakeLLM 收到提醒文本；提醒消息发送者为「定时」/SelfID。
+func TestScheduleToolFiresReminderIntoLoop(t *testing.T) {
+	b := &stubBuilder{}
+	cfg := testCfg(20 * time.Millisecond)
+	script := []string{
+		toolCallResp("c1", "schedule", `{"delay_seconds":1,"note":"10分钟后看看他回了没"}`),
+		toolCallResp("c2", "finish", ""),
+		toolCallResp("c3", "finish", ""), // 定时提醒唤醒的 turn
+	}
+	m, f, _ := newLoopManager(t, cfg, b, nil, script)
+	// 计时器与 notes/state 同模式注入临时路径；fire 回调走 manager 真实链路
+	m.timerStore = NewTimerStore(filepath.Join(t.TempDir(), "timers.json"), m.fireTimer)
+	// builder 把本轮首条新消息文本透传给 LLM，使提醒文本可断言
+	b.mu.Lock()
+	b.fn = func(turn *Turn) []ChatMessage {
+		text := ""
+		if len(turn.NewMessages) > 0 {
+			text = turn.NewMessages[0].Text
+		}
+		return []ChatMessage{{Role: "user", Content: text}}
+	}
+	b.mu.Unlock()
+
+	m.Enqueue(msg("group", 888, "帮我记个事"))
+	waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "第 1 个 turn 应完成 schedule + finish")
+	waitFor(t, 10*time.Second, func() bool { return f.count() == 3 }, "定时提醒应唤醒第 2 个 turn")
+
+	// schedule 结果已回填思维链：含 id 与 fire_at
+	last := f.reqs[1].Messages[len(f.reqs[1].Messages)-1]
+	if last.Role != "tool" || last.ToolCallID != "c1" ||
+		!strings.Contains(contentText(last), `"id"`) || !strings.Contains(contentText(last), `"fire_at"`) {
+		t.Errorf("schedule 结果应含 id/fire_at 并回填: %+v (%s)", last, contentText(last))
+	}
+
+	// 提醒 turn：SenderName「定时」、SenderID=SelfID、文本 [定时提醒] + note
+	turn := b.turn(1)
+	if turn.ChatType != "group" || turn.ChatID != 888 {
+		t.Errorf("提醒 turn 会话错误: %+v", turn)
+	}
+	if len(turn.NewMessages) != 1 {
+		t.Fatalf("提醒 turn 应恰有 1 条新消息, got %d", len(turn.NewMessages))
+	}
+	tm := turn.NewMessages[0]
+	if tm.SenderName != "定时" || tm.SenderID != 999 {
+		t.Errorf("提醒消息发送者 = %q/%d, want 定时/999（SelfID）", tm.SenderName, tm.SenderID)
+	}
+	if !strings.Contains(tm.Text, "[定时提醒]") || !strings.Contains(tm.Text, "10分钟后看看他回了没") {
+		t.Errorf("提醒文本 = %q, want [定时提醒] 前缀 + note", tm.Text)
+	}
+
+	// fakeLLM 收到提醒文本（经 builder 进入请求 user 消息）
+	first := f.reqs[2].Messages[0]
+	if first.Role != "user" || !strings.Contains(contentText(first), "[定时提醒]") {
+		t.Errorf("提醒文本应进入 LLM 请求: %+v", first)
+	}
+	// 触发后计时器清空
+	if got := m.timerStore.Active(); got != 0 {
+		t.Errorf("触发后 Active = %d, want 0", got)
+	}
+}

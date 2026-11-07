@@ -34,19 +34,32 @@ func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 // testToolSet 用临时 notes/state 路径构造工具集，避免测试污染 agent/ 目录。
 // 默认非管理员（isAdmin=false）；需要管理员视角用 testToolSetAdmin。
+// 不带计时器与 chat 上下文（schedule/cancel_timer 应报「定时器不可用」）。
 func testToolSet(t *testing.T, store *storage.Store) ([]Tool, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	notesPath := filepath.Join(dir, "notes.json")
 	statePath := filepath.Join(dir, "state.json")
-	return newToolSet(store, notesPath, statePath, false), notesPath, statePath
+	return newToolSet(store, notesPath, statePath, false, nil, nil), notesPath, statePath
 }
 
 // testToolSetAdmin 管理员视角的工具集（危险工具放行）。
 func testToolSetAdmin(t *testing.T) []Tool {
 	t.Helper()
 	dir := t.TempDir()
-	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true)
+	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true, nil, nil)
+}
+
+// testToolSetWithTimers 带真实 TimerStore（临时路径）与 chat 上下文 turn 的
+// 工具集（P3.5 定时工具走通用）；返回工具集与计时器存储。
+func testToolSetWithTimers(t *testing.T) ([]Tool, *TimerStore) {
+	t.Helper()
+	dir := t.TempDir()
+	notesPath := filepath.Join(dir, "notes.json")
+	statePath := filepath.Join(dir, "state.json")
+	timer := NewTimerStore(filepath.Join(dir, "timers.json"), func(ScheduledTimer) {})
+	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
+	return newToolSet(nil, notesPath, statePath, false, turn, timer), timer
 }
 
 // findTool 按名字取工具。
@@ -89,7 +102,10 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 // wantToolNames P2 核心工具 + P3-2 QQ 能力工具（顺序即工具集顺序，help 恒在末尾）。
 var wantToolNames = []string{
 	"get_recent_messages", "search_messages",
-	"send_message", "think", "update_mood", "finish",
+	"send_message", "think", "update_mood",
+	// P3-5 定时器工具
+	"schedule", "cancel_timer",
+	"finish",
 	// P3-2 人性化 QQ 工具
 	"recall_message", "get_friend_list",
 	"lookup_user", "lookup_groups", "lookup_group", "lookup_members", "lookup_member",
@@ -560,5 +576,106 @@ func TestToolDefsSchemaNoNulls(t *testing.T) {
 	}
 	if strings.Contains(string(data), "null") {
 		t.Errorf("工具 schema 序列化含 null，会被提供商拒绝:\n%s", data)
+	}
+}
+
+// ================= P3-5：定时器工具 =================
+
+// TestScheduleToolSchedulesAndReturnsID schedule 工具经 TimerStore 落记录：
+// 返回 {"id","fire_at"}，chat 上下文取自构造期捕获的 turn（group/888/999）；
+// delay_seconds 越界与空 note 报错。
+func TestScheduleToolSchedulesAndReturnsID(t *testing.T) {
+	tools, timer := testToolSetWithTimers(t)
+
+	out := runToolOK(t, tools, "schedule", `{"delay_seconds":60,"note":"10分钟后看看他回了没"}`)
+	if strings.ContainsAny(out, "\n\t") {
+		t.Errorf("输出应为紧凑 JSON: %q", out)
+	}
+	var res struct {
+		ID     string `json:"id"`
+		FireAt string `json:"fire_at"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("schedule 输出不是 JSON 对象: %v (%s)", err, out)
+	}
+	if res.ID == "" || res.FireAt == "" {
+		t.Fatalf("schedule 输出应含 id 与 fire_at: %s", out)
+	}
+	if timer.Active() != 1 {
+		t.Fatalf("调度后 Active = %d, want 1", timer.Active())
+	}
+
+	// chat 上下文来自 turn：group/888/self=999
+	timer.mu.Lock()
+	recs := make([]ScheduledTimer, 0, len(timer.records))
+	for _, r := range timer.records {
+		recs = append(recs, r)
+	}
+	timer.mu.Unlock()
+	if len(recs) != 1 || recs[0].ID != res.ID || recs[0].Note != "10分钟后看看他回了没" ||
+		recs[0].ChatType != "group" || recs[0].ChatID != 888 || recs[0].SelfID != 999 {
+		t.Errorf("落库记录应捕获 turn 会话上下文: %+v", recs)
+	}
+	timer.Cancel(res.ID)
+
+	// 参数校验
+	for _, bad := range []string{
+		`{"delay_seconds":0,"note":"x"}`,
+		`{"delay_seconds":604801,"note":"x"}`,
+		`{"delay_seconds":60,"note":""}`,
+		`{"delay_seconds":60}`,
+		`{"note":"x"}`,
+	} {
+		runToolErr(t, tools, "schedule", bad)
+	}
+	if timer.Active() != 0 {
+		t.Errorf("非法参数不应留下计时, Active = %d", timer.Active())
+	}
+	// 边界 604800（7 天）合法
+	out = runToolOK(t, tools, "schedule", `{"delay_seconds":604800,"note":"边界"}`)
+	if err := json.Unmarshal([]byte(out), &res); err != nil || res.ID == "" {
+		t.Fatalf("7 天边界应成功: %v (%s)", err, out)
+	}
+	timer.Cancel(res.ID)
+}
+
+// TestCancelTimerTool cancel_timer 按 schedule 返回的 ID 取消：
+// 成功 {"cancelled":true}、Active 归零；未知 ID 报 error。
+func TestCancelTimerTool(t *testing.T) {
+	tools, timer := testToolSetWithTimers(t)
+
+	out := runToolOK(t, tools, "schedule", `{"delay_seconds":60,"note":"要取消的"}`)
+	var res struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil || res.ID == "" {
+		t.Fatalf("schedule 输出: %v (%s)", err, out)
+	}
+
+	got := runToolOK(t, tools, "cancel_timer", `{"timer_id":"`+res.ID+`"}`)
+	if got != `{"cancelled":true}` {
+		t.Errorf("cancel 输出 = %q, want {\"cancelled\":true}", got)
+	}
+	if timer.Active() != 0 {
+		t.Errorf("取消后 Active = %d, want 0", timer.Active())
+	}
+
+	err := runToolErr(t, tools, "cancel_timer", `{"timer_id":"`+res.ID+`"}`)
+	if !strings.Contains(err.Error(), res.ID) {
+		t.Errorf("重复取消应报未找到: %v", err)
+	}
+	runToolErr(t, tools, "cancel_timer", `{"timer_id":"nonexistent"}`)
+	runToolErr(t, tools, "cancel_timer", `{"timer_id":""}`)
+}
+
+// TestTimerToolsUnavailableWithoutStore timer 为 nil（未接线）时
+// schedule / cancel_timer 均返回 error。
+func TestTimerToolsUnavailableWithoutStore(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil) // turn=nil, timer=nil
+	for _, name := range []string{"schedule", "cancel_timer"} {
+		err := runToolErr(t, tools, name, `{"delay_seconds":60,"note":"x","timer_id":"x"}`)
+		if !strings.Contains(err.Error(), "定时器不可用") {
+			t.Errorf("%s 无计时器应报「定时器不可用」, got %v", name, err)
+		}
 	}
 }

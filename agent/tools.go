@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,21 +159,21 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 		},
 		{
 			Name:        "send_message",
-			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/dice/rps/json/image），两者二选一。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
+			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/mface/sticker/dice/rps/json/image），两者二选一。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
 			Parameters: objectParams(map[string]any{
 				"chat_type": strProp("会话类型：private / group"),
 				"chat_id":   intProp("会话 ID：群号；私聊 = 对方 QQ"),
 				"text":      strProp("要发送的纯文本内容（与 segments 二选一）"),
 				"segments": map[string]any{
 					"type":        "array",
-					"description": "富消息段数组（与 text 二选一），按顺序发送。段类型白名单：text/at/reply/face/dice/rps/json/image",
+					"description": "富消息段数组（与 text 二选一），按顺序发送。段类型白名单：text/at/reply/face/mface/sticker/dice/rps/json/image",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"type": strProp("段类型：text / at / reply / face / dice / rps / json / image"),
+							"type": strProp("段类型：text / at / reply / face / mface / sticker / dice / rps / json / image"),
 							"data": map[string]any{
 								"type":        "object",
-								"description": "段参数：text{text} / at{qq} / reply{id} / face{id} / dice{result} / rps{result} / json{data} / image{file, summary?}；image 的 file 只支持 http/https/base64:// 图片链接",
+								"description": "段参数：text{text} / at{qq} / reply{id} / face{id} / mface{emoji_id, emoji_package_id, key, summary?} / sticker{id}（发自己收藏的表情，列表见 list_stickers） / dice{result} / rps{result} / json{data} / image{file, summary?}；image 的 file 只支持 http/https/base64:// 图片链接",
 							},
 						},
 						"required": []string{"type", "data"},
@@ -206,7 +207,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					segs = []*apimsg.Message{apimsg.Text(p.Text)}
 				case len(p.Segments) > 0:
 					var err error
-					if segs, err = buildSegments(p.Segments); err != nil {
+					if segs, err = buildSegments(store, p.Segments); err != nil {
 						return "", err
 					}
 				default:
@@ -254,6 +255,173 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					return "", fmt.Errorf("mood 不能为空")
 				}
 				return "{}", writeState(statePath, p.Mood)
+			},
+		},
+		// ================= 表情收藏与发送 =================
+		{
+			Name:        "save_sticker",
+			Description: "把一条消息里的表情/图片收藏起来（自带表情 face、商城表情 mface、图片 image），之后可用 send_message 的 sticker 段随时发出去。seg_index 是该消息里第几个消息段（从 0 开始，默认 0）。",
+			Parameters: objectParams(map[string]any{
+				"message_id": intProp("消息 ID（从聊天记录或上下文里拿）"),
+				"seg_index":  intProp("可选，消息段下标（从 0 开始），默认 0"),
+			}, []string{"message_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法收藏表情")
+				}
+				var p struct {
+					MessageID int64 `json:"message_id"`
+					SegIndex  int   `json:"seg_index"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.MessageID == 0 {
+					return "", fmt.Errorf("message_id 不能为 0")
+				}
+				rec, err := store.GetMessage(p.MessageID)
+				if err != nil {
+					return "", fmt.Errorf("查询消息 %d 失败: %w", p.MessageID, err)
+				}
+				if rec == nil {
+					return "", fmt.Errorf("没有找到消息 %d", p.MessageID)
+				}
+				var segs []struct {
+					Type string          `json:"type"`
+					Data json.RawMessage `json:"data"`
+				}
+				if len(rec.Segments) > 0 {
+					if err := json.Unmarshal(rec.Segments, &segs); err != nil {
+						return "", fmt.Errorf("解析消息 %d 的消息段失败: %w", p.MessageID, err)
+					}
+				}
+				if p.SegIndex < 0 || p.SegIndex >= len(segs) {
+					return "", fmt.Errorf("seg_index %d 超出范围（该消息共 %d 段）", p.SegIndex, len(segs))
+				}
+				seg := segs[p.SegIndex]
+				if seg.Type != "face" && seg.Type != "mface" && seg.Type != "image" {
+					return "", fmt.Errorf("第 %d 段类型 %q 不能收藏，只支持 face/mface/image", p.SegIndex, seg.Type)
+				}
+				var data map[string]any
+				if len(seg.Data) > 0 {
+					if err := json.Unmarshal(seg.Data, &data); err != nil {
+						return "", fmt.Errorf("解析消息段 data 失败: %w", err)
+					}
+				}
+				st := storage.Sticker{Kind: seg.Type}
+				switch seg.Type {
+				case "face":
+					st.FaceID, err = segFlex(data, "id", p.SegIndex)
+					if err != nil {
+						return "", err
+					}
+					if n, convErr := strconv.Atoi(st.FaceID); convErr == nil {
+						st.Summary = QQFaceNames[n] // 内置对照表里的表情名
+					}
+				case "mface":
+					if st.EmojiID, err = segFlex(data, "emoji_id", p.SegIndex); err != nil {
+						return "", err
+					}
+					if st.EmojiPackageID, err = segFlex(data, "emoji_package_id", p.SegIndex); err != nil {
+						return "", err
+					}
+					st.Key = anyString(data["key"])
+					st.Summary = anyString(data["summary"])
+				case "image":
+					st.URL = anyString(data["url"])
+					if st.URL == "" {
+						return "", fmt.Errorf("第 %d 段 image 没有图片 url，无法收藏", p.SegIndex)
+					}
+					st.Summary = anyString(data["summary"])
+				}
+				id, err := store.AddSticker(st)
+				if err != nil {
+					return "", err
+				}
+				return marshalCompact(map[string]any{"sticker_id": id, "kind": st.Kind, "summary": st.Summary})
+			},
+		},
+		{
+			Name:        "list_stickers",
+			Description: "列出你收藏的全部表情（id/kind/summary），用于选择 sticker 段要发的 id。",
+			Parameters:  objectParams(nil, nil),
+			Run: func(json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法查询收藏")
+				}
+				list, err := store.ListStickers()
+				if err != nil {
+					return "", err
+				}
+				rows := make([]map[string]any, 0, len(list))
+				for _, st := range list {
+					rows = append(rows, map[string]any{"id": st.ID, "kind": st.Kind, "summary": st.Summary})
+				}
+				return marshalCompact(rows)
+			},
+		},
+		{
+			Name:        "delete_sticker",
+			Description: "删除一条收藏的表情（传 list_stickers 里的 id）。收藏错了用它清理。",
+			Parameters: objectParams(map[string]any{
+				"sticker_id": intProp("收藏表情的 id"),
+			}, []string{"sticker_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法删除收藏")
+				}
+				var p struct {
+					StickerID int64 `json:"sticker_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.StickerID == 0 {
+					return "", fmt.Errorf("sticker_id 不能为 0")
+				}
+				st, err := store.GetSticker(p.StickerID)
+				if err != nil {
+					return "", err
+				}
+				if st == nil {
+					return "", fmt.Errorf("没有找到表情 %d（可能已删除）", p.StickerID)
+				}
+				if err := store.DeleteSticker(p.StickerID); err != nil {
+					return "", err
+				}
+				return marshalCompact(map[string]any{"deleted": true})
+			},
+		},
+		{
+			Name:        "collect_qq_sticker",
+			Description: "把一个网络图片（http/https 链接）下载并加入 QQ 的收藏表情（QQ 账号自带的收藏夹，不是本列表）：先让 NapCat 下载到本地，再加入收藏。适合把好看的图变成账号级表情。",
+			Parameters: objectParams(map[string]any{
+				"url": strProp("图片链接（http/https）"),
+			}, []string{"url"}),
+			Run: func(args json.RawMessage) (string, error) {
+				var p struct {
+					URL string `json:"url"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.URL == "" {
+					return "", fmt.Errorf("缺少必填参数 url")
+				}
+				// 第一步：download_file 让 NapCat 自己下载（文件须落在 NapCat 机器上）
+				data, err := callNapCat(&api.DownloadFile{URL: p.URL})
+				if err != nil {
+					return "", fmt.Errorf("下载图片失败: %w", err)
+				}
+				path := downloadFilePath(data)
+				if path == "" {
+					return "", fmt.Errorf("下载结果缺少文件路径: %s", data)
+				}
+				// 第二步：add_custom_face（file 是 NapCat 机器上的本地路径）
+				if _, err := callNapCat(&api.AddCustomFace{File: path}); err != nil {
+					return "", fmt.Errorf("加入 QQ 收藏失败: %w", err)
+				}
+				return marshalCompact(map[string]any{"path": path, "added": true})
 			},
 		},
 		// P3-5 定时器工具：到点经 fire 回调合成为 [定时提醒] 消息排队唤醒。
@@ -417,8 +585,9 @@ type segmentParam struct {
 // buildSegments 把 segments 参数转成消息段数组（P2.6）。只接受白名单类型，
 // 白名单外报错；text 段内容累计超过 maxSendMessageTextRunes 报错；
 // image 的 file 原样透传（http/https/base64:// 由 NapCat 处理，
-// 本地路径不该出现，同样透传让 NapCat 报出明确错误）。
-func buildSegments(segs []segmentParam) ([]*apimsg.Message, error) {
+// 本地路径不该出现，同样透传让 NapCat 报出明确错误）；
+// sticker 段查 storage 收藏表转换，需要 store 非 nil。
+func buildSegments(store *storage.Store, segs []segmentParam) ([]*apimsg.Message, error) {
 	out := make([]*apimsg.Message, 0, len(segs))
 	textLen := 0
 	for i, s := range segs {
@@ -487,11 +656,126 @@ func buildSegments(segs []segmentParam) ([]*apimsg.Message, error) {
 				summary = &str
 			}
 			out = append(out, apimsg.Image(file, summary, nil))
+		case "mface":
+			// 商城表情：emoji_id/package_id/key 必填（数字或字符串形态都收），
+			// summary 可选；透传构造 apimsg.Message 让 NapCat 处理。
+			emojiID, err := segFlex(s.Data, "emoji_id", at)
+			if err != nil {
+				return nil, err
+			}
+			pkg, err := segFlex(s.Data, "emoji_package_id", at)
+			if err != nil {
+				return nil, err
+			}
+			key, err := segFlex(s.Data, "key", at)
+			if err != nil {
+				return nil, err
+			}
+			var summary *string
+			if raw, ok := s.Data["summary"]; ok {
+				str, ok := raw.(string)
+				if !ok {
+					return nil, fmt.Errorf("第 %d 段 mface 的 %q 应为字符串", at, "summary")
+				}
+				summary = &str
+			}
+			out = append(out, apimsg.MFace(emojiID, pkg, &key, summary))
+		case "sticker":
+			// 发自己收藏的表情：查 stickers 表后按 kind 转成对应段。
+			if store == nil {
+				return nil, fmt.Errorf("第 %d 段 sticker 需要查询收藏，但记忆库未启用", at)
+			}
+			id, err := segID(s.Data, "id", at)
+			if err != nil {
+				return nil, err
+			}
+			seg, err := stickerSegment(store, id, at)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, seg)
 		default:
-			return nil, fmt.Errorf("第 %d 段不支持的消息段类型 %q，可用：text/at/reply/face/dice/rps/json/image", at, s.Type)
+			return nil, fmt.Errorf("第 %d 段不支持的消息段类型 %q，可用：text/at/reply/face/mface/sticker/dice/rps/json/image", at, s.Type)
 		}
 	}
 	return out, nil
+}
+
+// segFlex 取消息段 data 里的必填字段，兼容字符串与数字两种 JSON 形态
+// （NapCat 上报的 emoji_id/emoji_package_id 等在版本间互换形态）。
+func segFlex(data map[string]any, key string, at int) (string, error) {
+	raw, ok := data[key]
+	if !ok {
+		return "", fmt.Errorf("第 %d 段缺少 %q 字段", at, key)
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	default:
+		return "", fmt.Errorf("第 %d 段的 %q 应为字符串或数字", at, key)
+	}
+}
+
+// segID 取消息段 data 里的必填整数（数字或数字字符串形态都收）。
+func segID(data map[string]any, key string, at int) (int64, error) {
+	raw, ok := data[key]
+	if !ok {
+		return 0, fmt.Errorf("第 %d 段缺少 %q 字段", at, key)
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int64(v), nil
+	case string:
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("第 %d 段的 %q 应为整数, got %q", at, key, v)
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("第 %d 段的 %q 应为整数", at, key)
+	}
+}
+
+// anyString 宽松取字符串：字符串原样，数字转十进制，其余（含缺失）返回空串。
+func anyString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	}
+	return ""
+}
+
+// stickerSegment 把收藏的表情转成可发送的消息段：face→face 段、
+// mface→mface 段（key 必需，缺失报错）、image→image 段（file=url）。
+func stickerSegment(store *storage.Store, id int64, at int) (*apimsg.Message, error) {
+	st, err := store.GetSticker(id)
+	if err != nil {
+		return nil, fmt.Errorf("查询表情 %d 失败: %w", id, err)
+	}
+	if st == nil {
+		return nil, fmt.Errorf("第 %d 段: 没有找到表情 %d（用 list_stickers 查看收藏）", at, id)
+	}
+	var summary *string
+	if st.Summary != "" {
+		summary = &st.Summary
+	}
+	switch st.Kind {
+	case "face":
+		return apimsg.Face(st.FaceID), nil
+	case "mface":
+		if st.Key == "" {
+			return nil, fmt.Errorf("第 %d 段: 表情 %d 缺少 key，无法发送", at, id)
+		}
+		return apimsg.MFace(st.EmojiID, st.EmojiPackageID, &st.Key, summary), nil
+	case "image":
+		return apimsg.Image(st.URL, summary, nil), nil
+	default:
+		return nil, fmt.Errorf("第 %d 段: 表情 %d 类型未知 %q", at, id, st.Kind)
+	}
 }
 
 // segString 取消息段 data 里的必填字符串字段，缺失或类型不符报错。
@@ -599,6 +883,31 @@ func callNapCat(req api.Request) (json.RawMessage, error) {
 		return nil, err
 	}
 	return resp.Data, nil
+}
+
+// downloadFilePath 从 download_file 的 data 里取本地文件路径：
+// 兼容 {"path":...} / {"file":...} / 裸字符串三种返回形态。
+func downloadFilePath(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var obj struct {
+		Path string `json:"path"`
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		if obj.Path != "" {
+			return obj.Path
+		}
+		if obj.File != "" {
+			return obj.File
+		}
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		return s
+	}
+	return ""
 }
 
 // qqTools 构造 P3-2 的 QQ 能力工具（26 个人性化封装 + 逃生舱 2 个）。

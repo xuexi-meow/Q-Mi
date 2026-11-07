@@ -103,6 +103,8 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 var wantToolNames = []string{
 	"get_recent_messages", "search_messages",
 	"send_message", "think", "update_mood",
+	// 表情收藏与发送
+	"save_sticker", "list_stickers", "delete_sticker", "collect_qq_sticker",
 	// P3-5 定时器工具
 	"schedule", "cancel_timer",
 	"finish",

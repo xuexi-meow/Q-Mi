@@ -40,6 +40,19 @@ CREATE TABLE IF NOT EXISTS notices (
     time        REAL NOT NULL
 );
 
+-- 表情收藏:face(自带表情)/mface(商城表情)/image(图片)三类
+CREATE TABLE IF NOT EXISTS stickers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind             TEXT NOT NULL CHECK (kind IN ('face','mface','image')),
+    face_id          TEXT NOT NULL DEFAULT '',
+    emoji_id         TEXT NOT NULL DEFAULT '',
+    emoji_package_id TEXT NOT NULL DEFAULT '',
+    "key"            TEXT NOT NULL DEFAULT '',
+    url              TEXT NOT NULL DEFAULT '',
+    summary          TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL
+);
+
 -- FTS5 独立表:索引内容由 PutMessage 在 Go 侧按字分词后写入
 -- (unicode61 分词器会把连续 CJK 当成单个 token,无法子串匹配,
 --  触发器又做不了按字拆分,故弃用 content 表 + 触发器方案)

@@ -1,6 +1,7 @@
 // wiring.go 事件接线（spec 第 2/5/10 节）：agent 包 init 里注册
-// message.private / message.group handler，事件到来时才查 app.GetApp()
-// （与 handler/store.go 同模式），配置未启用即跳过，零影响。
+// message.private / message.group handler 与 P3-4 的全部通知唤醒 handler，
+// 事件到来时才查 app.GetApp()（与 handler/store.go 同模式），
+// 配置未启用即跳过，零影响。
 package agent
 
 import (
@@ -98,6 +99,83 @@ func init() {
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),
 		})
+	})
+	registerNoticeWake()
+}
+
+// registerNoticeWake P3-4 通知唤醒:全部 QQ 通知/请求事件唤醒 agent,
+// 每类通知格式化成一行 [系统通知] 文本入队,是否反应由模型自决。
+// ChatKey:群类通知 → group:<group_id>;好友类 → private:<user_id/sender_id>;
+// bot_offline 不唤醒(formatBotOffline 返回零值,wakeNotice 跳过,仅归档)。
+func registerNoticeWake() {
+	event.RegisterTyped("notice.group_upload", func(e *event.GroupUploadEvent) {
+		wakeNotice(e.MainEvent, formatGroupUpload(e))
+	})
+	event.RegisterTyped("notice.group_admin", func(e *event.GroupAdminEvent) {
+		wakeNotice(e.MainEvent, formatGroupAdmin(e))
+	})
+	event.RegisterTyped("notice.group_decrease", func(e *event.GroupDecreaseEvent) {
+		wakeNotice(e.MainEvent, formatGroupDecrease(e))
+	})
+	event.RegisterTyped("notice.group_increase", func(e *event.GroupIncreaseEvent) {
+		wakeNotice(e.MainEvent, formatGroupIncrease(e))
+	})
+	event.RegisterTyped("notice.group_ban", func(e *event.GroupBanEvent) {
+		wakeNotice(e.MainEvent, formatGroupBan(e))
+	})
+	event.RegisterTyped("notice.friend_add", func(e *event.FriendAddEvent) {
+		wakeNotice(e.MainEvent, formatFriendAdd(e))
+	})
+	event.RegisterTyped("notice.group_recall", func(e *event.GroupRecallEvent) {
+		wakeNotice(e.MainEvent, formatGroupRecall(e))
+	})
+	event.RegisterTyped("notice.friend_recall", func(e *event.FriendRecallEvent) {
+		wakeNotice(e.MainEvent, formatFriendRecall(e))
+	})
+	event.RegisterTyped("notice.group_card", func(e *event.GroupCardEvent) {
+		wakeNotice(e.MainEvent, formatGroupCard(e))
+	})
+	event.RegisterTyped("notice.group_essence", func(e *event.GroupEssenceEvent) {
+		wakeNotice(e.MainEvent, formatGroupEssence(e))
+	})
+	event.RegisterTyped("notice.group_msg_emoji_like", func(e *event.GroupMsgEmojiLikeEvent) {
+		wakeNotice(e.MainEvent, formatGroupEmojiLike(e))
+	})
+	event.RegisterTyped("notice.notify.group_name", func(e *event.GroupNameEvent) {
+		wakeNotice(e.MainEvent, formatGroupName(e))
+	})
+	event.RegisterTyped("notice.notify.group_title", func(e *event.GroupTitleEvent) {
+		wakeNotice(e.MainEvent, formatGroupTitle(e))
+	})
+	// 戳一戳:群戳带 group_id、好友戳带 sender_id(见 event.PokeEvent 注释),
+	// 同一 key 注册两个变体,各自按标记字段是否为 0 决定是否处理。
+	event.RegisterTyped("notice.notify.poke", func(e *event.GroupPokeEvent) {
+		if e.GroupID == 0 {
+			return
+		}
+		wakeNotice(e.MainEvent, formatGroupPoke(e))
+	})
+	event.RegisterTyped("notice.notify.poke", func(e *event.FriendPokeEvent) {
+		if e.SenderID == 0 {
+			return
+		}
+		wakeNotice(e.MainEvent, formatFriendPoke(e))
+	})
+	event.RegisterTyped("notice.notify.profile_like", func(e *event.ProfileLikeEvent) {
+		wakeNotice(e.MainEvent, formatProfileLike(e))
+	})
+	event.RegisterTyped("notice.notify.input_status", func(e *event.InputStatusEvent) {
+		wakeNotice(e.MainEvent, formatInputStatus(e))
+	})
+	event.RegisterTyped("request.friend", func(e *event.OB11FriendRequestEvent) {
+		wakeNotice(e.MainEvent, formatFriendRequest(e))
+	})
+	event.RegisterTyped("request.group", func(e *event.OB11GroupRequestEvent) {
+		wakeNotice(e.MainEvent, formatGroupRequest(e))
+	})
+	// bot_offline 走零值格式化占位,保证"不唤醒"语义集中在一处(wakeNotice 跳过)。
+	event.RegisterTyped("notice.bot_offline", func(e *event.BotOfflineEvent) {
+		wakeNotice(e.MainEvent, formatBotOffline(e))
 	})
 }
 

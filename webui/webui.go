@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +102,14 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 			handleWake(w, r)
 		case "/api/file":
 			handleFile(w, r)
+		case "/api/friends":
+			handleFriends(w, r)
+		case "/api/groups":
+			handleGroups(w, r)
+		case "/api/members":
+			handleMembers(w, r)
+		case "/api/napcat":
+			handleNapcat(w, r)
 		default:
 			switch {
 			case strings.HasPrefix(r.URL.Path, "/api/notes/"):
@@ -640,6 +650,304 @@ func handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ================= W4 QQ 管理页（spec §4：好友/群/成员/动作直调） =================
+
+// napcatCallTimeout NapCat API 调用超时（服务端 WriteTimeout 15s 之内）。
+const napcatCallTimeout = 10 * time.Second
+
+// napcatFail NapCat 侧失败（未初始化/不可达/retcode 非 0）统一 502 +
+// 简短 JSON 错误（不泄漏堆栈，spec §4：NapCat 不可达不 500）。
+func napcatFail(w http.ResponseWriter, err error) {
+	slog.Warn("WebUI 调用 NapCat 失败", "err", err)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+// groupJSON /api/groups 响应条目（NapCat get_group_list data 的展示子集）。
+type groupJSON struct {
+	GroupID     int64  `json:"group_id"`
+	GroupName   string `json:"group_name"`
+	MemberCount int    `json:"member_count"`
+}
+
+// handleFriends GET /api/friends 好友列表（user_id/nickname/remark/level）。
+func handleFriends(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), napcatCallTimeout)
+	defer cancel()
+	resp, err := request.GetFriendList(ctx, &api.GetFriendList{})
+	if err != nil {
+		napcatFail(w, err)
+		return
+	}
+	writeJSON(w, resp.Data)
+}
+
+// handleGroups GET /api/groups 群列表（group_id/group_name/member_count）。
+func handleGroups(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), napcatCallTimeout)
+	defer cancel()
+	resp, err := request.Do[[]groupJSON](ctx, &api.GetGroupList{})
+	if err != nil {
+		napcatFail(w, err)
+		return
+	}
+	writeJSON(w, resp.Data)
+}
+
+// maxMembersReturned /api/members 单次返回的成员条数上限（与 agent
+// lookup_members 同值，防一次性渲染过大列表）。
+const maxMembersReturned = 100
+
+// handleMembers GET /api/members?group_id= 群成员列表：超过 100 条截断并带
+// total/returned/truncated 标记；group_id 缺失/非法 400（不触达 NapCat）。
+func handleMembers(w http.ResponseWriter, r *http.Request) {
+	gid, err := strconv.ParseInt(r.URL.Query().Get("group_id"), 10, 64)
+	if err != nil || gid == 0 {
+		http.Error(w, "group_id 为必填参数（非 0 整数）", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), napcatCallTimeout)
+	defer cancel()
+	resp, err := request.Do[[]map[string]any](ctx, &api.GetGroupMemberList{GroupID: gid})
+	if err != nil {
+		napcatFail(w, err)
+		return
+	}
+	total := len(resp.Data)
+	truncated := total > maxMembersReturned
+	members := resp.Data
+	if truncated {
+		members = members[:maxMembersReturned]
+	}
+	writeJSON(w, map[string]any{
+		"total": total, "returned": len(members), "truncated": truncated, "members": members,
+	})
+}
+
+// dangerousNapcatActions /api/napcat 直调中需 params.confirm=true 确认的动作
+// 集合（与 agent/tools.go 的 dangerousNapcatActions 同一份清单；该集合未导出，
+// 此处复制维护，见 napcatActionTypes 的重复维护说明）。
+var dangerousNapcatActions = map[string]bool{
+	"set_group_kick":  true,
+	"set_group_leave": true,
+	"delete_friend":   true,
+	"set_qq_avatar":   true,
+	"set_qq_profile":  true,
+	"set_group_name":  true,
+}
+
+// napcatActionRegistry 动作名（无 / 前缀）→ 请求结构体类型，与 agent 包
+// napcat_api 逃生舱的 actionRegistry 同源（api 包结构体清单）。agent 侧
+// 注册表未导出且本次不允许改 agent，故在 webui 复制 actionTypes 清单构建；
+// api 包新增动作时两处需同步（agent 的注册表覆盖率有测试兜底，见报告）。
+var napcatActionRegistry = buildNapcatRegistry(napcatActionTypes())
+
+// buildNapcatRegistry 由动作实例列表构建名称 → 类型映射（与 agent 同规则）。
+func buildNapcatRegistry(list []api.Request) map[string]reflect.Type {
+	m := make(map[string]reflect.Type, len(list))
+	for _, a := range list {
+		name := strings.TrimPrefix(a.Path(), "/")
+		if _, dup := m[name]; dup {
+			panic("webui: 动作注册表路径重复 " + name)
+		}
+		m[name] = reflect.TypeOf(a).Elem()
+	}
+	return m
+}
+
+// napcatActionTypes 全量 NapCat 动作请求类型（api 包 196 个动作，与
+// agent/tools.go 的 actionTypes 保持一致）。
+func napcatActionTypes() []api.Request {
+	return []api.Request{
+		// api.go 已有
+		&api.SendGroupMsg{}, &api.SendPrivateMsg{}, &api.GetMsg{}, &api.DeleteMsg{},
+
+		// ---------------- 核心接口 ----------------
+		&api.SetGroupTodo{}, &api.CompleteGroupTodo{}, &api.CancelGroupTodo{},
+		&api.SendGroupPoke{}, &api.SendFriendPoke{}, &api.SendPoke{},
+
+		// ---------------- 群组接口 ----------------
+		&api.GetGroupDetailInfo{}, &api.GetGroupList{}, &api.GetGroupInfo{},
+		&api.GetGroupMemberList{}, &api.GetGroupMemberInfo{},
+		&api.SetGroupAddRequest{}, &api.SetGroupLeave{}, &api.SetGroupWholeBan{},
+		&api.SetGroupBan{}, &api.SetGroupKick{}, &api.SetGroupAdmin{},
+		&api.SetGroupName{}, &api.SetGroupCard{}, &api.GetEssenceMsgList{},
+		&api.GetGroupIgnoredNotifies{}, &api.DeleteEssenceMsg{}, &api.GetGroupNotice{},
+		&api.SetEssenceMsg{}, &api.DeleteGroupNotice{}, &api.GetGroupShutList{},
+		&api.GetGroupIgnoreAddRequest{}, &api.SetGroupMemberInvitePolicy{},
+		&api.SetGroupMemberPermissions{}, &api.SetGroupNewMemberHistoryVisibility{},
+		&api.GetGroupHonorInfo{}, &api.GetGroupAtAllRemain{}, &api.SetGroupPortrait{},
+
+		// ---------------- 群组扩展 ----------------
+		&api.SetGroupAddOption{}, &api.SetGroupRobotAddOption{}, &api.SetGroupSearch{},
+		&api.SetGroupRemark{}, &api.GetGroupInfoEx{}, &api.SetGroupSign{}, &api.SendGroupSign{},
+		&api.GetGroupSignedList{}, &api.GetGroupShareLink{},
+
+		// ---------------- 好友/用户 ----------------
+		&api.SetFriendRemark{}, &api.SendLike{}, &api.GetFriendList{},
+		&api.SetFriendAddRequest{}, &api.GetCookies{}, &api.GetRecentContact{},
+		&api.GetFriendsWithCategory{}, &api.GetProfileLike{}, &api.SetDiyOnlineStatus{},
+		&api.GetUnidirectionalFriendList{}, &api.DeleteFriend{},
+
+		// ---------------- 消息接口 ----------------
+		&api.SendMsg{}, &api.ForwardFriendSingleMsg{}, &api.ForwardGroupSingleMsg{},
+		&api.MarkGroupMsgAsRead{}, &api.MarkPrivateMsgAsRead{}, &api.MarkMsgAsRead{},
+		&api.MarkAllAsRead{},
+		&api.SendForwardMsg{}, &api.SendGroupForwardMsg{}, &api.SendPrivateForwardMsg{},
+		&api.GetForwardMsg{}, &api.GetGroupMsgHistory{}, &api.GetFriendMsgHistory{},
+
+		// ---------------- 消息扩展 ----------------
+		&api.FetchEmojiLike{}, &api.GetEmojiLikes{}, &api.FetchPttText{},
+		&api.ArkShareGroup{}, &api.ArkSharePeer{}, &api.SendGroupArkShare{}, &api.SendArkShare{},
+		&api.SetMsgEmojiLike{}, &api.ClickInlineKeyboardButton{},
+
+		// ---------------- 文件接口 ----------------
+		&api.GetFile{}, &api.GetImage{}, &api.GetRecord{},
+		&api.GetGroupFileURL{}, &api.GetPrivateFileURL{},
+
+		// ---------------- 文件扩展 ----------------
+		&api.MoveGroupFile{}, &api.RenameGroupFile{}, &api.TransGroupFile{},
+		&api.CreateFlashTask{}, &api.GetFlashFileList{}, &api.GetFlashFileURL{},
+		&api.SendFlashMsg{}, &api.GetShareLink{}, &api.GetFilesetInfo{},
+		&api.GetOnlineFileMsg{}, &api.SendOnlineFile{}, &api.SendOnlineFolder{},
+		&api.ReceiveOnlineFile{}, &api.RefuseOnlineFile{}, &api.CancelOnlineFile{},
+		&api.DownloadFileset{}, &api.GetFilesetID{},
+
+		// ---------------- Go-CQHTTP 文件 ----------------
+		&api.GetGroupRootFiles{}, &api.UploadGroupFile{}, &api.DeleteGroupFile{},
+		&api.CreateGroupFileFolder{}, &api.DeleteGroupFolder{}, &api.GetGroupFileSystemInfo{},
+		&api.GetGroupFilesByFolder{}, &api.DownloadFile{}, &api.UploadPrivateFile{},
+
+		// ---------------- 系统接口 ----------------
+		&api.GetLoginInfo{}, &api.GetVersionInfo{}, &api.CanSendRecord{}, &api.CanSendImage{},
+		&api.GetStatus{}, &api.GetCsrfToken{}, &api.GetCredentials{}, &api.NcGetPacketStatus{},
+		&api.SetRestart{}, &api.GetGroupSystemMsg{}, &api.CleanCache{},
+		&api.SetDoubtFriendsAddRequest{}, &api.GetDoubtFriendsAddRequest{},
+
+		// ---------------- 系统扩展 ----------------
+		&api.GetRkey{}, &api.GetRkeyServer{}, &api.SetOnlineStatus{}, &api.GetRobotUinRange{},
+		&api.FetchCustomFace{}, &api.FetchCustomFaceDetail{}, &api.AddCustomFace{},
+		&api.DeleteCustomFace{}, &api.SetCustomFaceDesc{}, &api.SetInputStatus{},
+		&api.NcGetUserStatus{}, &api.NcGetRkey{}, &api.GetMiniAppArk{}, &api.SendPacket{},
+		&api.BotExit{}, &api.GetCollectionList{},
+
+		// ---------------- Go-CQHTTP 其他 ----------------
+		&api.SetQQProfile{}, &api.CheckURLSafely{}, &api.GetOnlineClients{},
+		&api.GetStrangerInfo{}, &api.GetModelShow{}, &api.SetModelShow{},
+		&api.SendGroupNotice{}, &api.HandleQuickOperation{},
+
+		// ---------------- 扩展接口 ----------------
+		&api.SetGroupKickMembers{}, &api.CreateCollection{}, &api.SetSelfLongNick{},
+		&api.SetQQAvatar{}, &api.TranslateEn2Zh{}, &api.GetClientKey{},
+		&api.SendQzoneMsg{}, &api.OCRImage{}, &api.DeleteQzoneMsg{}, &api.OCRImageInternal{},
+		&api.SetGroupSpecialTitle{}, &api.GetAICharacters{},
+		&api.GetQzoneFeeds{}, &api.GetQzoneMsgList{}, &api.GetQzoneMsgDetail{},
+		&api.GetQzoneCommentList{}, &api.GetQzoneCommentReplies{},
+		&api.LikeQzone{}, &api.UnlikeQzone{}, &api.CommentQzone{},
+		&api.GetQzoneProfile{}, &api.SetQzoneProfile{}, &api.SetQzoneMsgRight{}, &api.SetQzoneBan{},
+
+		// ---------------- AI 扩展 ----------------
+		&api.GetAIRecord{}, &api.SendGroupAIRecord{},
+
+		// ---------------- QQ空间扩展(空友爱看) ----------------
+		&api.GetQzonePublicCapabilities{}, &api.GetQzonePublicFeeds{},
+		&api.GetQzonePublicFeedDetail{}, &api.GetQzonePublicComments{},
+		&api.GetQzonePublicReplies{}, &api.SetQzonePublicUpvote{}, &api.SetQzonePublicLike{},
+		&api.SetQzonePublicFollow{}, &api.SetQzonePublicCommentLike{},
+		&api.CommentQzonePublicFeed{}, &api.ReplyQzonePublicFeed{},
+		&api.DeleteQzonePublicComment{}, &api.DeleteQzonePublicReply{},
+		&api.ForwardQzonePublicFeed{},
+
+		// ---------------- 群相册 ----------------
+		&api.DelGroupAlbumMedia{}, &api.SetGroupAlbumMediaLike{},
+		&api.CancelGroupAlbumMediaLike{}, &api.DoGroupAlbumComment{},
+		&api.GetGroupAlbumMediaList{}, &api.GetQunAlbumList{},
+		&api.UploadImageToQunAlbum{}, &api.UploadImagesToQunAlbum{}, &api.UploadVideoToQunAlbum{},
+	}
+}
+
+// handleNapcat POST /api/napcat {action, params} 动作直调：
+//   - action 必须在白名单（napcatActionRegistry，接受带 / 前缀）内，否则 400；
+//   - 危险动作（dangerousNapcatActions）要求 params.confirm=true 才执行，confirm
+//     剥离后不透传给 NapCat，缺失/非 true 一律 400——WebUI token 持有者即管理员，
+//     采用显式 confirm 开关而非 403 拒绝，人工界面体验更好；
+//   - NapCat 未初始化/不可达/retcode 非 0 → 502 简短 JSON（napcatFail）。
+//
+// GET 返回 {actions, dangerous} 白名单全集（前端动作下拉用）。
+func handleNapcat(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		names := make([]string, 0, len(napcatActionRegistry))
+		for name := range napcatActionRegistry {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		danger := make([]string, 0, len(dangerousNapcatActions))
+		for name := range dangerousNapcatActions {
+			danger = append(danger, name)
+		}
+		sort.Strings(danger)
+		writeJSON(w, map[string]any{"actions": names, "dangerous": danger})
+	case http.MethodPost:
+		var req struct {
+			Action string          `json:"action"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(req.Action), "/"))
+		typ, ok := napcatActionRegistry[name]
+		if !ok {
+			http.Error(w, fmt.Sprintf("未知动作 %q，见 GET /api/napcat 白名单", req.Action), http.StatusBadRequest)
+			return
+		}
+		params := req.Params
+		if dangerousNapcatActions[name] {
+			fields := map[string]json.RawMessage{}
+			if len(params) > 0 {
+				if err := json.Unmarshal(params, &fields); err != nil {
+					http.Error(w, "params 应为 JSON 对象", http.StatusBadRequest)
+					return
+				}
+			}
+			confirmed := false
+			if raw, has := fields["confirm"]; has {
+				_ = json.Unmarshal(raw, &confirmed)
+			}
+			if !confirmed {
+				http.Error(w, "危险操作需在 params 中带 confirm:true 确认后执行", http.StatusBadRequest)
+				return
+			}
+			delete(fields, "confirm") // confirm 是 WebUI 门禁字段，不透传给 NapCat
+			params, _ = json.Marshal(fields)
+		}
+		reqVal := reflect.New(typ) // *T，T 为该动作的请求结构体
+		if len(params) > 0 {
+			if err := json.Unmarshal(params, reqVal.Interface()); err != nil {
+				http.Error(w, "params 解析失败（应为该动作的参数对象）: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), napcatCallTimeout)
+		defer cancel()
+		resp, err := request.Call(ctx, reqVal.Interface().(api.Request))
+		if err != nil {
+			napcatFail(w, err)
+			return
+		}
+		if len(resp.Data) == 0 || string(resp.Data) == "null" {
+			writeJSON(w, map[string]any{"ok": true})
+			return
+		}
+		writeJSON(w, resp.Data)
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}

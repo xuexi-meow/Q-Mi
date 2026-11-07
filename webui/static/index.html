@@ -142,6 +142,7 @@ button.primary { background: var(--accent); color: #fff; }
   font: 13px/1.6 Consolas, monospace; resize: vertical;
 }
 button.danger { color: var(--bad); }
+label.danger, span.danger { color: var(--bad); }
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
@@ -379,7 +380,81 @@ button.danger { color: var(--bad); }
         </div>
       </template>
     </section>
-    <section x-show="tab==='qq'" class="placeholder">QQ 管理 · 建设中（W4）</section>
+    <!-- W4: QQ 管理 -->
+    <section x-show="tab==='qq'">
+      <div class="toolbar">
+        <button class="act" @click="loadQQData()">刷新</button>
+      </div>
+      <div class="muted" x-show="qqErr" x-text="qqErr"></div>
+
+      <!-- 好友（本地搜索过滤） -->
+      <div class="section-title">好友 <span class="muted" x-text="'（' + friends.length + '）'"></span></div>
+      <input type="text" class="agent-input" style="width:300px;margin-bottom:8px"
+             x-model="friendQ" placeholder="搜索昵称 / 备注 / QQ 号…">
+      <template x-for="f in filteredFriends()" :key="f.user_id">
+        <div class="note-row">
+          <span x-text="(f.nickname || '未知') + (f.remark ? '（' + f.remark + '）' : '')"></span>
+          <span class="muted" style="font-size:12px" x-text="'Lv.' + f.level" x-show="f.level"></span>
+          <span class="muted" style="margin-left:auto;font-size:12px" x-text="f.user_id"></span>
+        </div>
+      </template>
+      <div class="muted" x-show="friends.length && !filteredFriends().length">无匹配好友</div>
+      <div class="muted" x-show="!friends.length && !qqErr">暂无好友数据</div>
+
+      <!-- 群列表（点群展开成员） -->
+      <div class="section-title">群列表 <span class="muted" x-text="'（' + groups.length + '）'"></span></div>
+      <template x-for="g in groups" :key="g.group_id">
+        <div class="chat-item" :class="curGroup && curGroup.group_id===g.group_id && 'active'"
+             @click="loadMembers(g)">
+          <div class="t">
+            <span x-text="g.group_name || '未命名群'"></span>
+            <span class="muted" style="font-weight:400;float:right" x-text="g.member_count + ' 人'"></span>
+          </div>
+          <div class="s" x-text="'群号 ' + g.group_id + (curGroup && curGroup.group_id===g.group_id ? ' · 点击刷新成员' : ' · 点击加载成员')"></div>
+        </div>
+      </template>
+      <div class="muted" x-show="!groups.length && !qqErr">暂无群数据</div>
+
+      <!-- 群成员 -->
+      <template x-if="curGroup">
+        <div>
+          <div class="section-title">
+            <span x-text="'群成员：' + (curGroup.group_name || curGroup.group_id)"></span>
+            <span class="muted" x-text="memberTruncated ? '（共 ' + memberTotal + ' 人，显示前 ' + members.length + '）' : '（共 ' + memberTotal + ' 人）'"></span>
+          </div>
+          <template x-for="m in members" :key="m.user_id">
+            <div class="note-row">
+              <span class="ebadge" :class="m.role === 'owner' ? 'reply' : (m.role === 'admin' ? 'turn_start' : 'finish')"
+                    x-text="m.role === 'owner' ? '群主' : (m.role === 'admin' ? '管理' : '成员')"></span>
+              <span x-text="m.card || m.nickname || '未知'"></span>
+              <span class="muted" style="margin-left:auto;font-size:12px" x-text="m.user_id"></span>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <!-- NapCat 动作直调面板 -->
+      <div class="section-title">NapCat 动作直调</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select class="agent-input" style="width:300px" x-model="napAction" @change="onNapActionChange()">
+          <template x-for="a in napActions" :key="a">
+            <option :value="a" x-text="a + (napDangerous[a] ? ' ⚠' : '')"></option>
+          </template>
+        </select>
+        <label style="cursor:pointer" :class="isDangerous() ? 'danger' : ''">
+          <input type="checkbox" x-model="napConfirm"> 确认执行（危险操作必勾）
+        </label>
+        <button class="act primary" :disabled="napBusy" @click="runNapcat()" x-text="napBusy ? '执行中…' : '执行'"></button>
+      </div>
+      <textarea class="file-editor" style="min-height:110px" x-model="napParams"
+                spellcheck="false" placeholder='参数 JSON 对象，如 {"group_id":123}'></textarea>
+      <template x-if="napResult">
+        <pre class="file-editor" style="min-height:80px;margin-top:8px" x-text="napResult"></pre>
+      </template>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        危险动作（踢人/退群/删好友/改资料/改群名）需勾选确认，confirm 由服务端剥离后转发。
+      </div>
+    </section>
   </main>
 
   <!-- 操作提示 toast -->
@@ -421,6 +496,11 @@ function app() {
     wakeText: '',
     agentDisabled: false,
     fileSel: 'persona', fileText: { persona: '', guide: '' },
+    // W4 QQ 管理
+    friends: [], friendQ: '', groups: [], curGroup: null,
+    members: [], memberTotal: 0, memberTruncated: false, qqErr: '',
+    napActions: [], napDangerous: {}, napAction: '', napParams: '{}',
+    napConfirm: false, napResult: '', napBusy: false,
     toastMsg: '', toastTimer: null,
     init() {
       if (!localStorage.qmi_token) {
@@ -433,6 +513,7 @@ function app() {
       this.$watch('tab', (t) => {
         if (t === 'stream' && !this.chatsLoaded) this.loadChats();
         if (t === 'agent') this.loadAgentData();
+        if (t === 'qq') this.loadQQData();
       });
     },
     async api(path, opts = {}) {
@@ -691,6 +772,87 @@ function app() {
         });
         this.agentToast('已保存，重启进程后生效');
       } catch (e) { if (!this.needToken) this.agentToast('保存失败：' + e.message); }
+    },
+    // ---- W4 QQ 管理 ----
+    isDangerous() { return !!this.napDangerous[this.napAction]; },
+    filteredFriends() {
+      const q = this.friendQ.trim().toLowerCase();
+      if (!q) return this.friends;
+      return this.friends.filter(f =>
+        (f.nickname || '').toLowerCase().includes(q) ||
+        (f.remark || '').toLowerCase().includes(q) ||
+        String(f.user_id).includes(q));
+    },
+    async loadQQData() {
+      this.qqErr = '';
+      try {
+        const [f, g, n] = await Promise.all([
+          this.api('/api/friends'), this.api('/api/groups'), this.api('/api/napcat'),
+        ]);
+        this.friends = await f.json();
+        this.groups = await g.json();
+        const nl = await n.json();
+        this.napActions = nl.actions || [];
+        this.napDangerous = {};
+        for (const a of (nl.dangerous || [])) this.napDangerous[a] = true;
+        if (!this.napAction && this.napActions.length) this.napAction = this.napActions[0];
+        this.onNapActionChange();
+      } catch (e) {
+        if (!this.needToken) this.qqErr = 'QQ 数据加载失败：' + e.message;
+      }
+    },
+    onNapActionChange() {
+      // 切到危险动作自动勾上确认（红字提示），切走恢复默认不勾
+      this.napConfirm = this.isDangerous();
+    },
+    async loadMembers(g) {
+      this.curGroup = g;
+      try {
+        const r = await this.api('/api/members?group_id=' + encodeURIComponent(g.group_id));
+        const d = await r.json();
+        if (this.curGroup !== g) return; // 期间切换了群
+        this.members = d.members || [];
+        this.memberTotal = d.total || 0;
+        this.memberTruncated = !!d.truncated;
+      } catch (e) {
+        if (!this.needToken) this.qqErr = '群成员加载失败：' + e.message;
+      }
+    },
+    async runNapcat() {
+      if (!this.napAction) { this.agentToast('请选择动作'); return; }
+      let params = {};
+      const raw = this.napParams.trim();
+      if (raw) {
+        try { params = JSON.parse(raw); } catch (e) { this.agentToast('参数不是合法 JSON：' + e.message); return; }
+        if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+          this.agentToast('参数应为 JSON 对象'); return;
+        }
+      }
+      if (this.isDangerous()) {
+        if (!this.napConfirm) { this.agentToast('危险操作需勾选「确认执行」'); return; }
+        params.confirm = true; // 服务端校验后剥离，不透传给 NapCat
+      }
+      this.napBusy = true;
+      try {
+        const r = await this.api('/api/napcat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: this.napAction, params }),
+        });
+        const text = (await r.text()).trim();
+        if (!r.ok) {
+          let msg = text;
+          try { msg = JSON.parse(text).error || text; } catch (e) { /* 纯文本错误体 */ }
+          this.napResult = '执行失败（HTTP ' + r.status + '）：' + msg;
+          return;
+        }
+        try { this.napResult = JSON.stringify(JSON.parse(text), null, 2); }
+        catch (e) { this.napResult = text; }
+      } catch (e) {
+        if (!this.needToken) this.agentToast('请求失败：' + e.message);
+      } finally {
+        this.napBusy = false;
+      }
     },
   };
 }

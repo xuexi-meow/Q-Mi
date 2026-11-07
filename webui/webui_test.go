@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +23,7 @@ import (
 	"Q-Mi/agent"
 	"Q-Mi/storage"
 	"Q-Mi/utils/config"
+	"Q-Mi/utils/request"
 )
 
 // openOverviewStore 进程内 SQLite 库（概览统计测试用）。
@@ -980,5 +983,298 @@ func TestAPIFileW3(t *testing.T) {
 	resp, _ = sendJSON(t, http.MethodPost, base+"/api/file", "tok", `{"name":"persona","content":"x"}`)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST /api/file = %d, want 405", resp.StatusCode)
+	}
+}
+
+// ================= W4 QQ 管理页（friends/groups/members/napcat 直调） =================
+
+// napcatMock 假 NapCat：记录收到的 path/鉴权头/请求体与调用次数，回复固定
+// retcode=0 信封（data 为构造时给定的 JSON 片段），并把 request 层客户端指向它。
+type napcatMock struct {
+	Path  string
+	Auth  string
+	Body  map[string]any
+	Calls int
+}
+
+// newNapcatMock 起假 NapCat 并初始化 request 客户端（NapCat token 固定 nap-tok）。
+func newNapcatMock(t *testing.T, data string) *napcatMock {
+	t.Helper()
+	m := &napcatMock{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.Path = r.URL.Path
+		m.Auth = r.Header.Get("Authorization")
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		m.Body = body
+		m.Calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","retcode":0,"data":` + data + `,"message":"","wording":"","stream":"normal-action"}`))
+	}))
+	t.Cleanup(ts.Close)
+	pointRequestAt(t, ts.URL)
+	return m
+}
+
+// pointRequestAt 把 request 层默认客户端指向给定 httptest base URL。
+func pointRequestAt(t *testing.T, baseURL string) {
+	t.Helper()
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Napcat{HTTP: config.NapcatConn{Enable: true, Host: u.Hostname(), Port: port, Token: "nap-tok"}}
+	if err := request.Init(cfg); err != nil {
+		t.Fatalf("request.Init: %v", err)
+	}
+}
+
+// TestAPIFriendsW4 GET /api/friends 走假 NapCat：断言转发路径/鉴权与字段提取。
+func TestAPIFriendsW4(t *testing.T) {
+	m := newNapcatMock(t, `[{"user_id":11,"nickname":"小明","remark":"老友","level":3}]`)
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/friends", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/friends = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var friends []map[string]any
+	if err := json.Unmarshal([]byte(body), &friends); err != nil {
+		t.Fatalf("响应不是 JSON 数组: %v (%s)", err, body)
+	}
+	if len(friends) != 1 {
+		t.Fatalf("好友数 = %d, want 1: %s", len(friends), body)
+	}
+	f := friends[0]
+	if f["user_id"] != float64(11) || f["nickname"] != "小明" || f["remark"] != "老友" || f["level"] != float64(3) {
+		t.Errorf("好友字段提取错误: %v", f)
+	}
+	if m.Path != "/get_friend_list" {
+		t.Errorf("NapCat 收到路径 = %s, want /get_friend_list", m.Path)
+	}
+	if m.Auth != "Bearer nap-tok" {
+		t.Errorf("NapCat 鉴权头 = %q, want Bearer nap-tok", m.Auth)
+	}
+}
+
+// TestAPIGroupsW4 GET /api/groups 走假 NapCat：断言路径与字段提取。
+func TestAPIGroupsW4(t *testing.T) {
+	m := newNapcatMock(t, `[{"group_id":100,"group_name":"测试群","member_count":42}]`)
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/groups", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/groups = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var groups []map[string]any
+	if err := json.Unmarshal([]byte(body), &groups); err != nil {
+		t.Fatalf("响应不是 JSON 数组: %v (%s)", err, body)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("群数 = %d, want 1: %s", len(groups), body)
+	}
+	g := groups[0]
+	if g["group_id"] != float64(100) || g["group_name"] != "测试群" || g["member_count"] != float64(42) {
+		t.Errorf("群字段提取错误: %v", g)
+	}
+	if m.Path != "/get_group_list" {
+		t.Errorf("NapCat 收到路径 = %s, want /get_group_list", m.Path)
+	}
+}
+
+// TestAPIMembersW4 GET /api/members?group_id= 走假 NapCat：断言路径/参数、
+// 超过 100 条时截断并带 total/truncated 标记。
+func TestAPIMembersW4(t *testing.T) {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 1; i <= 105; i++ {
+		if i > 1 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"user_id":%d,"nickname":"成员%d","card":"","role":"member"}`, i, i)
+	}
+	b.WriteByte(']')
+	m := newNapcatMock(t, b.String())
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/members?group_id=888", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/members = %d, want 200: %.200s", resp.StatusCode, body)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatalf("响应不是 JSON 对象: %v (%.200s)", err, body)
+	}
+	if raw["total"] != float64(105) || raw["returned"] != float64(100) || raw["truncated"] != true {
+		t.Errorf("total/returned/truncated = %v/%v/%v, want 105/100/true", raw["total"], raw["returned"], raw["truncated"])
+	}
+	members, ok := raw["members"].([]any)
+	if !ok || len(members) != 100 {
+		t.Fatalf("members 应为 100 条, got %v", raw["members"])
+	}
+	first := members[0].(map[string]any)
+	if first["user_id"] != float64(1) || first["nickname"] != "成员1" {
+		t.Errorf("members[0] 字段错误: %v", first)
+	}
+	if m.Path != "/get_group_member_list" {
+		t.Errorf("NapCat 收到路径 = %s, want /get_group_member_list", m.Path)
+	}
+	if m.Body["group_id"] != float64(888) {
+		t.Errorf("NapCat 收到 group_id = %v, want 888", m.Body["group_id"])
+	}
+}
+
+// TestAPIMembersRequiresGroupIDW4 缺 group_id 或非法值 → 400，不触达 NapCat。
+func TestAPIMembersRequiresGroupIDW4(t *testing.T) {
+	m := newNapcatMock(t, `[]`)
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	for _, q := range []string{"", "?group_id=", "?group_id=abc", "?group_id=0"} {
+		resp, _ := get(t, base+"/api/members"+q, "tok")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET /api/members%q = %d, want 400", q, resp.StatusCode)
+		}
+	}
+	if m.Calls != 0 {
+		t.Errorf("参数校验失败不应触达 NapCat, calls = %d", m.Calls)
+	}
+}
+
+// TestAPINapcatW4 POST /api/napcat 直调：白名单内放行透传、白名单外 400、
+// 危险动作无 confirm 400 且不触达 NapCat、带 confirm 放行且 confirm 不透传、
+// GET 返回白名单全集与危险动作清单。
+func TestAPINapcatW4(t *testing.T) {
+	m := newNapcatMock(t, `{"done":true}`)
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	// 白名单内：动作名与参数透传，data 原样返回
+	resp, body := sendJSON(t, http.MethodPost, base+"/api/napcat", "tok",
+		`{"action":"send_like","params":{"user_id":11,"times":1}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/napcat = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `"done":true`) {
+		t.Errorf("data 应原样透传: %s", body)
+	}
+	if m.Path != "/send_like" {
+		t.Errorf("NapCat 收到路径 = %s, want /send_like", m.Path)
+	}
+	if m.Body["user_id"] != float64(11) || m.Body["times"] != float64(1) {
+		t.Errorf("params 透传错误: %v", m.Body)
+	}
+
+	// 白名单外 → 400
+	resp, _ = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok", `{"action":"no_such_action"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("未知动作 = %d, want 400", resp.StatusCode)
+	}
+
+	// 危险动作无 confirm → 400 且不触达 NapCat
+	callsBefore := m.Calls
+	resp, body = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok",
+		`{"action":"set_group_kick","params":{"group_id":1,"user_id":2}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("危险动作无 confirm = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "confirm") {
+		t.Errorf("400 提示应说明需要 confirm: %s", body)
+	}
+	if m.Calls != callsBefore {
+		t.Errorf("危险动作无 confirm 不应触达 NapCat, calls = %d", m.Calls)
+	}
+
+	// 危险动作带 confirm=true → 放行，且 confirm 不透传给 NapCat
+	resp, body = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok",
+		`{"action":"set_group_kick","params":{"group_id":1,"user_id":2,"confirm":true}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("危险动作带 confirm = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if m.Path != "/set_group_kick" {
+		t.Errorf("NapCat 收到路径 = %s, want /set_group_kick", m.Path)
+	}
+	if m.Body["user_id"] != float64(2) {
+		t.Errorf("params 透传错误: %v", m.Body)
+	}
+	if _, has := m.Body["confirm"]; has {
+		t.Errorf("confirm 不应透传给 NapCat: %v", m.Body)
+	}
+
+	// GET 返回白名单全集与危险动作清单（前端下拉用）
+	resp, body = get(t, base+"/api/napcat", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/napcat = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var list struct {
+		Actions   []string `json:"actions"`
+		Dangerous []string `json:"dangerous"`
+	}
+	if err := json.Unmarshal([]byte(body), &list); err != nil {
+		t.Fatalf("响应不是 JSON 对象: %v (%s)", err, body)
+	}
+	if len(list.Actions) < 100 {
+		t.Errorf("actions 全集应覆盖全部动作, got %d 个", len(list.Actions))
+	}
+	for _, want := range []string{"send_like", "get_friend_list", "get_group_list", "get_group_member_list"} {
+		if !containsStr(list.Actions, want) {
+			t.Errorf("actions 缺少 %q", want)
+		}
+	}
+	for _, want := range []string{"set_group_kick", "set_group_leave", "delete_friend", "set_qq_avatar", "set_qq_profile", "set_group_name"} {
+		if !containsStr(list.Dangerous, want) {
+			t.Errorf("dangerous 缺少 %q", want)
+		}
+	}
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAPINapcatUnreachableW4 NapCat 不可达（连接拒绝）时 friends 与 napcat
+// 直调返回 502 + 简短 JSON 错误（非 500 堆栈）。
+func TestAPINapcatUnreachableW4(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close() // 立刻关闭 → 该端口连接拒绝
+	host, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+	if err := request.Init(&config.Napcat{HTTP: config.NapcatConn{
+		Enable: true, Host: host, Port: port, Token: "nap-tok"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	resp, body := get(t, base+"/api/friends", "tok")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("NapCat 不可达 GET /api/friends = %d, want 502: %s", resp.StatusCode, body)
+	}
+	var e1 map[string]any
+	if json.Unmarshal([]byte(body), &e1) != nil || e1["error"] == "" {
+		t.Errorf("502 应为 {\"error\":...} 简短 JSON: %s", body)
+	}
+
+	resp, body = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok", `{"action":"send_like"}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("NapCat 不可达 POST /api/napcat = %d, want 502: %s", resp.StatusCode, body)
+	}
+	var e2 map[string]any
+	if json.Unmarshal([]byte(body), &e2) != nil || e2["error"] == "" {
+		t.Errorf("502 应为 {\"error\":...} 简短 JSON: %s", body)
 	}
 }

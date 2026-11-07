@@ -12,6 +12,7 @@
   --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+[x-cloak] { display: none !important; }
 body {
   background: var(--bg); color: var(--text);
   font: 14px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -120,6 +121,33 @@ button.primary { background: var(--accent); color: #fff; }
   padding: 8px 10px; font-size: 14px; margin-bottom: 12px;
 }
 .mask .err { color: var(--bad); font-size: 13px; margin-bottom: 10px; }
+/* W3 agent 控制页 */
+.agent-input {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; font-size: 13px;
+}
+.note-row {
+  display: flex; gap: 10px; align-items: baseline;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 12px; margin-bottom: 6px;
+}
+.timer-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.timer-table th, .timer-table td {
+  text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.timer-table th { color: var(--dim); font-weight: 500; }
+.file-editor {
+  width: 100%; min-height: 240px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+  font: 13px/1.6 Consolas, monospace; resize: vertical;
+}
+button.danger { color: var(--bad); }
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 18px; border-radius: 8px; z-index: 90;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .4); max-width: 80vw;
+}
 </style>
 </head>
 <body>
@@ -264,10 +292,98 @@ button.primary { background: var(--accent); color: #fff; }
       </template>
     </section>
 
-    <!-- 占位 tab（W3/W4 实现） -->
-    <section x-show="tab==='agent'" class="placeholder">Agent 控制 · 建设中（W3）</section>
+    <!-- W3: Agent 控制 -->
+    <section x-show="tab==='agent'">
+      <template x-if="agentDisabled">
+        <div class="placeholder">
+          Agent 未启用：请在 Config.yaml 设置 agent.enable: true 并重启进程。<br>
+          <span class="muted">笔记/情绪/定时器/唤醒均不可用。</span>
+        </div>
+      </template>
+
+      <template x-if="!agentDisabled">
+        <div>
+          <!-- 情绪 -->
+          <div class="card">
+            <div class="k">当前情绪</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span style="font-size:16px;font-weight:600" x-text="moodNow || '—'"></span>
+              <input type="text" class="agent-input" style="flex:1" x-model="moodInput"
+                     placeholder="设置为…" @keydown.enter="saveMood()">
+              <button class="act primary" @click="saveMood()">保存</button>
+            </div>
+          </div>
+
+          <!-- 思考笔记 -->
+          <div class="section-title">思考笔记</div>
+          <div class="muted" x-show="!notes.length">暂无笔记</div>
+          <template x-for="n in notes" :key="n.index">
+            <div class="note-row">
+              <span class="muted" style="font-size:12px;white-space:nowrap" x-text="fmtTime(n.time * 1000)"></span>
+              <span style="flex:1;word-break:break-word" x-text="n.text"></span>
+              <button class="act danger" @click="delNote(n.index)">删除</button>
+            </div>
+          </template>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input type="text" class="agent-input" style="flex:1" x-model="noteInput"
+                   placeholder="新增笔记内容…" @keydown.enter="addNote()">
+            <button class="act primary" @click="addNote()">添加</button>
+          </div>
+
+          <!-- 定时器 -->
+          <div class="section-title">定时器</div>
+          <table class="timer-table" x-show="timers.length">
+            <thead><tr><th>触发时间</th><th>内容</th><th>所属会话</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="t in timers" :key="t.id">
+                <tr>
+                  <td x-text="fmtTime(Date.parse(t.fire_at))"></td>
+                  <td x-text="t.note"></td>
+                  <td x-text="timerChat(t)"></td>
+                  <td><button class="act danger" @click="cancelTimer(t.id)">取消</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <div class="muted" x-show="!timers.length">暂无定时器</div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input type="number" class="agent-input" style="width:130px" x-model="timerDelay"
+                   placeholder="延迟秒数" min="1" max="604800">
+            <input type="text" class="agent-input" style="flex:1" x-model="timerNote"
+                   placeholder="提醒内容…" @keydown.enter="addTimer()">
+            <button class="act primary" @click="addTimer()">添加</button>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:4px">
+            延迟 1..604800 秒（最长 7 天）；提醒注入 agent 自身会话，发给谁由其自决。
+          </div>
+
+          <!-- 手动唤醒 -->
+          <div class="section-title">手动唤醒</div>
+          <div style="display:flex;gap:8px">
+            <input type="text" class="agent-input" style="flex:1" x-model="wakeText"
+                   placeholder="注入给 agent 的一条消息…" @keydown.enter="doWake()">
+            <button class="act primary" @click="doWake()">唤醒</button>
+          </div>
+
+          <!-- persona / guide 编辑器 -->
+          <div class="section-title">提示词文件（persona / guide）</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+            <select class="agent-input" style="width:190px" x-model="fileSel">
+              <option value="persona">persona.md（人设）</option>
+              <option value="guide">guide.md（工作方式）</option>
+            </select>
+            <button class="act primary" @click="saveFile()">保存</button>
+            <span class="muted" style="font-size:12px">builder 构造时读取：保存后重启进程生效</span>
+          </div>
+          <textarea class="file-editor" x-model="fileText[fileSel]" spellcheck="false"></textarea>
+        </div>
+      </template>
+    </section>
     <section x-show="tab==='qq'" class="placeholder">QQ 管理 · 建设中（W4）</section>
   </main>
+
+  <!-- 操作提示 toast -->
+  <div class="toast" x-cloak x-show="toastMsg" x-text="toastMsg"></div>
 
   <!-- token 输入遮罩 -->
   <template x-if="needToken">
@@ -298,6 +414,14 @@ function app() {
     hasMore: false, loadingMore: false,
     searchQ: '', searchMode: false, searchResults: [],
     traceOn: false, traceEvents: [], traceLastID: 0, traceTimer: null,
+    // W3 agent 控制
+    moodNow: '', moodInput: '',
+    notes: [], noteInput: '',
+    timers: [], timerDelay: '', timerNote: '',
+    wakeText: '',
+    agentDisabled: false,
+    fileSel: 'persona', fileText: { persona: '', guide: '' },
+    toastMsg: '', toastTimer: null,
     init() {
       if (!localStorage.qmi_token) {
         this.needToken = true;
@@ -306,7 +430,10 @@ function app() {
       this.loadOverview();
       // 概览 5s 轮询；消息流 1.5s 轮询 /api/events 由"实时思考链"开关控制
       this.timer = setInterval(() => { if (!this.needToken) this.loadOverview(); }, 5000);
-      this.$watch('tab', (t) => { if (t === 'stream' && !this.chatsLoaded) this.loadChats(); });
+      this.$watch('tab', (t) => {
+        if (t === 'stream' && !this.chatsLoaded) this.loadChats();
+        if (t === 'agent') this.loadAgentData();
+      });
     },
     async api(path, opts = {}) {
       const headers = Object.assign(
@@ -454,6 +581,116 @@ function app() {
     },
     scrollBottom(el) {
       if (el) el.scrollTop = el.scrollHeight;
+    },
+    // ---- W3 agent 控制 ----
+    agentToast(msg) {
+      this.toastMsg = msg;
+      clearTimeout(this.toastTimer);
+      this.toastTimer = setTimeout(() => { this.toastMsg = ''; }, 3000);
+    },
+    // agentAPI 带 JSON 头的写操作封装：503（agent 未启用）置 agentDisabled
+    // 显示友好提示，其余非 2xx 抛出响应体里的错误文本。
+    async agentAPI(path, opts = {}) {
+      const r = await this.api(path, Object.assign({
+        headers: { 'Content-Type': 'application/json' },
+      }, opts));
+      const text = (await r.text()).trim();
+      if (r.status === 503) {
+        this.agentDisabled = true;
+        throw new Error(text || 'agent 未启用');
+      }
+      if (!r.ok) throw new Error(text || ('HTTP ' + r.status));
+      return r;
+    },
+    async loadAgentData() {
+      this.agentDisabled = false;
+      try {
+        const [m, n, t] = await Promise.all([
+          this.api('/api/mood'), this.api('/api/notes'), this.api('/api/timers'),
+        ]);
+        this.moodNow = (await m.json()).mood || '';
+        this.notes = await n.json();
+        this.timers = await t.json();
+      } catch (e) {
+        if (!this.needToken) this.agentToast('加载失败：' + e.message);
+        return;
+      }
+      for (const name of ['persona', 'guide']) {
+        try {
+          const r = await this.api('/api/file?name=' + name);
+          this.fileText[name] = (await r.json()).content || '';
+        } catch (e) { /* 文件读失败静默，编辑器留空 */ }
+      }
+    },
+    async saveMood() {
+      try {
+        await this.agentAPI('/api/mood', { method: 'POST', body: JSON.stringify({ mood: this.moodInput }) });
+        this.moodNow = this.moodInput;
+        this.moodInput = '';
+        this.agentToast('情绪已保存');
+      } catch (e) { if (!this.needToken) this.agentToast('保存失败：' + e.message); }
+    },
+    async addNote() {
+      const text = this.noteInput.trim();
+      if (!text) { this.agentToast('请输入笔记内容'); return; }
+      try {
+        await this.agentAPI('/api/notes', { method: 'POST', body: JSON.stringify({ text }) });
+        this.noteInput = '';
+        await this.loadNotes(); // 重新拉取拿到正确下标
+      } catch (e) { if (!this.needToken) this.agentToast('添加失败：' + e.message); }
+    },
+    async loadNotes() {
+      try { this.notes = await (await this.api('/api/notes')).json(); } catch (e) { /* 静默 */ }
+    },
+    async delNote(index) {
+      try {
+        await this.agentAPI('/api/notes/' + encodeURIComponent(index), { method: 'DELETE' });
+        await this.loadNotes();
+      } catch (e) { if (!this.needToken) this.agentToast('删除失败：' + e.message); }
+    },
+    async loadTimers() {
+      try { this.timers = await (await this.api('/api/timers')).json(); } catch (e) { /* 静默 */ }
+    },
+    timerChat(t) {
+      return (t.chat_type === 'group' ? '群:' : '私聊:') + t.chat_id;
+    },
+    async addTimer() {
+      const d = parseInt(this.timerDelay, 10);
+      if (!d || d < 1 || d > 604800) { this.agentToast('延迟需为 1..604800 秒'); return; }
+      try {
+        await this.agentAPI('/api/timers', {
+          method: 'POST',
+          body: JSON.stringify({ delay_seconds: d, note: this.timerNote }),
+        });
+        this.timerDelay = '';
+        this.timerNote = '';
+        await this.loadTimers();
+        this.agentToast('定时器已添加');
+      } catch (e) { if (!this.needToken) this.agentToast('添加失败：' + e.message); }
+    },
+    async cancelTimer(id) {
+      try {
+        await this.agentAPI('/api/timers/' + encodeURIComponent(id), { method: 'DELETE' });
+        await this.loadTimers();
+      } catch (e) { if (!this.needToken) this.agentToast('取消失败：' + e.message); }
+    },
+    async doWake() {
+      const text = this.wakeText.trim();
+      if (!text) { this.agentToast('请输入唤醒内容'); return; }
+      try {
+        await this.agentAPI('/api/wake', { method: 'POST', body: JSON.stringify({ text }) });
+        this.wakeText = '';
+        this.agentToast('已唤醒，agent 正在思考');
+      } catch (e) { if (!this.needToken) this.agentToast('唤醒失败：' + e.message); }
+    },
+    async saveFile() {
+      try {
+        await this.agentAPI('/api/file', {
+          method: 'PUT',
+          body: JSON.stringify({ name: this.fileSel, content: this.fileText[this.fileSel] }),
+        });
+        this.agentToast('已保存，重启进程后生效');
+      } catch (e) { if (!this.needToken) this.agentToast('保存失败：' + e.message); }
     },
   };
 }

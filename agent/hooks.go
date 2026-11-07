@@ -1,17 +1,38 @@
-// hooks.go W1 WebUI 的 agent 包导出钩子（spec §3.2）：薄封装包级单例，
+// hooks.go W1/W3 WebUI 的 agent 包导出钩子（spec §3.2）：薄封装包级单例，
 // agent 未启用/未初始化时 nil 安全（返回空值或错误），供 webui 包调用。
+// 写类钩子（NoteAdd/NoteDelete/MoodSet/Timer*）沿用 Wake 模式：manager 缺失
+// 返回 ErrAgentNotEnabled；读类钩子（MoodGet/NotesList）沿用 W1 模式：直接
+// 读默认路径文件，不触发 manager 惰性初始化。
 package agent
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 )
 
-// 钩子的错误语义（agent 未启用 / 机器人 QQ 号未配置）。
+// 钩子的错误语义（导出供 webui 区分「agent 未启用」与请求参数问题）。
 var (
-	errAgentNotEnabled = errors.New("agent 未启用")
-	errSelfIDMissing   = errors.New("机器人 QQ 号未配置（bot.qq_number 为 0）")
+	ErrAgentNotEnabled = errors.New("agent 未启用")
+	ErrSelfIDMissing   = errors.New("机器人 QQ 号未配置（bot.qq_number 为 0）")
 )
+
+// SetManagerForTest 跨包测试接缝：注入 manager 单例并返回恢复函数。
+// 仅供 webui 等包的测试使用，生产代码禁止调用。
+func SetManagerForTest(m *Manager) (restore func()) {
+	managerMu.Lock()
+	saved, savedInited := manager, managerInited
+	manager, managerInited = m, true
+	managerMu.Unlock()
+	return func() {
+		managerMu.Lock()
+		manager, managerInited = saved, savedInited
+		managerMu.Unlock()
+	}
+}
 
 // EventsAfter 返回思考链事件环形缓冲中 ID > after 的事件（按序）。
 // agent 未启用时返回 nil。
@@ -28,10 +49,10 @@ func EventsAfter(after uint64) []Event {
 func Wake(text string) error {
 	m := getManager()
 	if m == nil {
-		return errAgentNotEnabled
+		return ErrAgentNotEnabled
 	}
 	if m.selfID <= 0 {
-		return errSelfIDMissing
+		return ErrSelfIDMissing
 	}
 	m.Enqueue(IncomingMessage{
 		ChatType:   "private",
@@ -47,6 +68,7 @@ func Wake(text string) error {
 }
 
 // MoodGet 读取情绪状态（agent/state.json）；文件缺失/损坏返回空串。
+// 不走 manager（不触发惰性初始化），读默认路径。
 func MoodGet() string {
 	state, err := readStateFrom(defaultStatePath)
 	if err != nil {
@@ -56,6 +78,7 @@ func MoodGet() string {
 }
 
 // NotesList 读取思考笔记（agent/notes.json）；文件缺失/损坏返回 nil。
+// 不走 manager（不触发惰性初始化），读默认路径。
 func NotesList() []Note {
 	notes, err := LoadNotes(defaultNotesPath)
 	if err != nil {
@@ -64,7 +87,96 @@ func NotesList() []Note {
 	return notes
 }
 
-// TimerCount 在跑计时器数量。W1 占位返回 -1（TimerStore 缺列表方法，W3 补）。
+// NoteAdd 追加一条思考笔记到 notes.json；agent 未启用返回错误。
+func NoteAdd(text string) error {
+	m := getManager()
+	if m == nil {
+		return ErrAgentNotEnabled
+	}
+	return AppendNote(m.notesPath, text)
+}
+
+// NoteDelete 按下标删除一条思考笔记并重写 notes.json；
+// 下标越界（含负数）返回错误，文件不变。
+func NoteDelete(index int) error {
+	m := getManager()
+	if m == nil {
+		return ErrAgentNotEnabled
+	}
+	notes, err := LoadNotes(m.notesPath)
+	if err != nil {
+		return err
+	}
+	if index < 0 || index >= len(notes) {
+		return fmt.Errorf("笔记下标越界: %d（共 %d 条）", index, len(notes))
+	}
+	notes = append(notes[:index], notes[index+1:]...)
+	return saveNotes(m.notesPath, notes)
+}
+
+// saveNotes 全量重写笔记文件（NoteDelete 用，与 AppendNote 落盘规则一致）。
+func saveNotes(path string, notes []Note) error {
+	data, err := json.Marshal(notes)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// MoodSet 写入情绪状态到 state.json；agent 未启用返回错误。
+func MoodSet(mood string) error {
+	m := getManager()
+	if m == nil {
+		return ErrAgentNotEnabled
+	}
+	return writeState(m.statePath, mood)
+}
+
+// TimerList 待触发计时器快照（按触发时间正序）；agent 未启用返回 nil。
+func TimerList() []ScheduledTimer {
+	m := getManager()
+	if m == nil || m.timerStore == nil {
+		return nil
+	}
+	return m.timerStore.List()
+}
+
+// TimerCount 在跑计时器数量（agent 未启用为 0）。
 func TimerCount() int {
-	return -1
+	return len(TimerList())
+}
+
+// TimerSchedule 定一个 WebUI 触发的定时提醒：挂在 self 会话队列
+// （private+selfID），到点以 [定时提醒] 注入，回复给谁由模型自决。
+// 返回计时器 ID；agent 未启用 / selfID 未配置 / 延迟非法（≤0 或超 7 天）
+// 返回错误。
+func TimerSchedule(delaySec int, note string) (string, error) {
+	m := getManager()
+	if m == nil || m.timerStore == nil {
+		return "", ErrAgentNotEnabled
+	}
+	if m.selfID <= 0 {
+		return "", ErrSelfIDMissing
+	}
+	rec, err := m.timerStore.Schedule(time.Duration(delaySec)*time.Second, note,
+		"private", m.selfID, m.selfID)
+	if err != nil {
+		return "", err
+	}
+	return rec.ID, nil
+}
+
+// TimerCancel 取消一个未触发的计时器；不存在（已触发/已取消/未知 ID）返回错误。
+func TimerCancel(id string) error {
+	m := getManager()
+	if m == nil || m.timerStore == nil {
+		return ErrAgentNotEnabled
+	}
+	if !m.timerStore.Cancel(id) {
+		return fmt.Errorf("计时器不存在或已触发: %s", id)
+	}
+	return nil
 }

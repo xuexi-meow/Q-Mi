@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,8 +90,25 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 			handleSearch(w, r)
 		case "/api/events":
 			handleEvents(w, r)
+		case "/api/notes":
+			handleNotes(w, r)
+		case "/api/mood":
+			handleMood(w, r)
+		case "/api/timers":
+			handleTimers(w, r)
+		case "/api/wake":
+			handleWake(w, r)
+		case "/api/file":
+			handleFile(w, r)
 		default:
-			http.NotFound(w, r)
+			switch {
+			case strings.HasPrefix(r.URL.Path, "/api/notes/"):
+				handleNoteDelete(w, r)
+			case strings.HasPrefix(r.URL.Path, "/api/timers/"):
+				handleTimerCancel(w, r)
+			default:
+				http.NotFound(w, r)
+			}
 		}
 	})
 
@@ -163,7 +182,7 @@ func handleOverview(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(time.Since(startTime).Seconds()),
 		Mood:          agent.MoodGet(),
 		NotesCount:    len(agent.NotesList()),
-		TimersCount:   agent.TimerCount(), // W1 占位 -1，W3 补列表方法
+		TimersCount:   agent.TimerCount(),
 	}
 
 	var wg sync.WaitGroup
@@ -395,4 +414,233 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]agent.Event, 0, len(events))
 	out = append(out, events...)
 	writeJSON(w, out)
+}
+
+// ================= W3 agent 控制页（spec §3.2/§4） =================
+
+// maxTimerDelaySeconds WebUI 新增计时器的延迟上限（7 天），下限 1 秒。
+const maxTimerDelaySeconds = 7 * 24 * 3600
+
+// hookErrStatus 钩子错误的 HTTP 状态映射：agent 未启用/机器人 QQ 未配置是
+// 服务端状态 → 503；其余（下标越界、计时器不存在等）属请求问题 → 400。
+func hookErrStatus(err error) int {
+	if errors.Is(err, agent.ErrAgentNotEnabled) || errors.Is(err, agent.ErrSelfIDMissing) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadRequest
+}
+
+// noteJSON /api/notes 列表行：index 为删除用的数组下标，time 为 unix 秒。
+type noteJSON struct {
+	Index int     `json:"index"`
+	Time  float64 `json:"time"`
+	Text  string  `json:"text"`
+}
+
+// handleNotes GET 列出思考笔记 / POST 新增（{text}，非空校验）。
+func handleNotes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		notes := agent.NotesList()
+		out := make([]noteJSON, 0, len(notes))
+		for i, n := range notes {
+			out = append(out, noteJSON{Index: i, Time: float64(n.Time.Unix()), Text: n.Text})
+		}
+		writeJSON(w, out)
+	case http.MethodPost:
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Text) == "" {
+			http.Error(w, "text 不能为空", http.StatusBadRequest)
+			return
+		}
+		if err := agent.NoteAdd(req.Text); err != nil {
+			http.Error(w, err.Error(), hookErrStatus(err))
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleNoteDelete DELETE /api/notes/{index} 按下标删除思考笔记。
+func handleNoteDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	idx, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/notes/"))
+	if err != nil {
+		http.Error(w, "下标应为整数", http.StatusBadRequest)
+		return
+	}
+	if err := agent.NoteDelete(idx); err != nil {
+		http.Error(w, err.Error(), hookErrStatus(err))
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleMood GET 读情绪 / POST 写情绪（{mood}）。
+func handleMood(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]string{"mood": agent.MoodGet()})
+	case http.MethodPost:
+		var req struct {
+			Mood string `json:"mood"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+			return
+		}
+		if err := agent.MoodSet(req.Mood); err != nil {
+			http.Error(w, err.Error(), hookErrStatus(err))
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleTimers GET 列出待触发计时器 / POST 新增
+// （{delay_seconds, note}，延迟校验 1..604800 秒）。
+func handleTimers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list := agent.TimerList()
+		if list == nil {
+			list = []agent.ScheduledTimer{}
+		}
+		writeJSON(w, list)
+	case http.MethodPost:
+		var req struct {
+			DelaySeconds int    `json:"delay_seconds"`
+			Note         string `json:"note"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+			return
+		}
+		if req.DelaySeconds < 1 || req.DelaySeconds > maxTimerDelaySeconds {
+			http.Error(w, "delay_seconds 应为 1..604800（秒）", http.StatusBadRequest)
+			return
+		}
+		id, err := agent.TimerSchedule(req.DelaySeconds, req.Note)
+		if err != nil {
+			http.Error(w, err.Error(), hookErrStatus(err))
+			return
+		}
+		writeJSON(w, map[string]string{"id": id})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleTimerCancel DELETE /api/timers/{id} 取消一个未触发的计时器。
+func handleTimerCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/timers/")
+	if id == "" {
+		http.Error(w, "缺少计时器 ID", http.StatusBadRequest)
+		return
+	}
+	if err := agent.TimerCancel(id); err != nil {
+		http.Error(w, err.Error(), hookErrStatus(err))
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleWake POST /api/wake {text} 手动唤醒（text 非空校验，注入 self 队列）。
+func handleWake(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Text) == "" {
+		http.Error(w, "text 不能为空", http.StatusBadRequest)
+		return
+	}
+	if err := agent.Wake(req.Text); err != nil {
+		http.Error(w, err.Error(), hookErrStatus(err))
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// fileWhitelist /api/file 可编辑文件白名单（spec §6：杜绝路径穿越），
+// persona/guide 是 builder 构造时读取的提示词文件。
+var fileWhitelist = map[string]string{
+	"persona": "agent/persona.md",
+	"guide":   "agent/guide.md",
+}
+
+// handleFile GET /api/file?name=persona|guide 读内容（未创建过返回空串）；
+// PUT /api/file {name, content} 覆盖写（0600，父目录自动创建）。
+// 白名单外一律 400。
+func handleFile(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		name := r.URL.Query().Get("name")
+		path, ok := fileWhitelist[name]
+		if !ok {
+			http.Error(w, "name 仅支持 persona 或 guide", http.StatusBadRequest)
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("WebUI 读取文件失败", "path", path, "err", err)
+				http.Error(w, "读取文件失败", http.StatusInternalServerError)
+				return
+			}
+			data = nil // 尚未创建过：编辑器从空白开始
+		}
+		writeJSON(w, map[string]string{"content": string(data)})
+	case http.MethodPut:
+		var req struct {
+			Name    string `json:"name"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+			return
+		}
+		path, ok := fileWhitelist[req.Name]
+		if !ok {
+			http.Error(w, "name 仅支持 persona 或 guide", http.StatusBadRequest)
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			slog.Warn("WebUI 创建文件目录失败", "dir", filepath.Dir(path), "err", err)
+			http.Error(w, "创建目录失败", http.StatusInternalServerError)
+			return
+		}
+		if err := os.WriteFile(path, []byte(req.Content), 0o600); err != nil {
+			slog.Warn("WebUI 写文件失败", "path", path, "err", err)
+			http.Error(w, "写入文件失败", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
 }

@@ -221,10 +221,12 @@ func TestMoodGetAndNotesListHooks(t *testing.T) {
 	}
 }
 
-// TestTimerCountPlaceholderW1 W1 阶段 TimerCount 为 -1 占位（列表方法 W3 补）。
-func TestTimerCountPlaceholderW1(t *testing.T) {
-	if got := TimerCount(); got != -1 {
-		t.Errorf("TimerCount = %d, want -1（W1 占位）", got)
+// TestTimerCountNilSafe W3 起 TimerCount 返回真实计数；manager 未启用时为 0
+// （注入 nil 避免触发 getManager 惰性初始化读到真实配置）。
+func TestTimerCountNilSafe(t *testing.T) {
+	withHookManager(t, nil)
+	if got := TimerCount(); got != 0 {
+		t.Errorf("TimerCount = %d, want 0", got)
 	}
 }
 

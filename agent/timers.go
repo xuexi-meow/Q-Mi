@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -142,6 +143,18 @@ func (s *TimerStore) LoadPending() int {
 		s.fireAsync(rec)
 	}
 	return restored
+}
+
+// List 返回待触发记录快照，按 FireAt 正序（WebUI 计时器列表用）。
+func (s *TimerStore) List() []ScheduledTimer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ScheduledTimer, 0, len(s.records))
+	for _, r := range s.records {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FireAt.Before(out[j].FireAt) })
+	return out
 }
 
 // Active 在跑的计时器数量（测试/调试用）。

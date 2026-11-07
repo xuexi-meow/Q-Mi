@@ -29,8 +29,16 @@ var (
 )
 
 // defaultNewManager 用真实配置组装默认实现:DefaultBuilder + OpenAI 客户端(120s 超时)。
+// P3.6：把 bot.qq_number 注入 Manager（定时轮询以自己为会话），并按
+// agent.self_wake 启动定时轮询兜底唤醒（空串=默认 10 分钟，"off"/"0" 跳过）。
 func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
-	return NewManager(NewDefaultBuilder(store, cfg), NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store)
+	cfgQQ := int64(0)
+	if a := app.GetApp(); a != nil && a.Config != nil && a.Config.Bot != nil {
+		cfgQQ = int64(a.Config.Bot.QQ_Number)
+	}
+	m := NewManager(NewDefaultBuilder(store, cfg), NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store, cfgQQ)
+	m.StartSelfWake(selfWakeInterval(cfg))
+	return m
 }
 
 // urgentFromEvent 判定消息紧急度（spec §5 插话打断）：

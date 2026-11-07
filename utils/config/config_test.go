@@ -246,6 +246,7 @@ func TestLoadConfigDefaultAgentValues(t *testing.T) {
 		PersonaFile:   "agent/persona.md",
 		GuideFile:     "agent/guide.md",
 		Debounce:      3 * time.Second,
+		SelfWake:      "10m",
 		Temperature:   0.8,
 		Debug:         false,
 		Multimodal:    boolPtr(true),
@@ -272,6 +273,7 @@ func TestLoadConfigAgentBlock(t *testing.T) {
 		PersonaFile:   "agent/persona.md",
 		GuideFile:     "agent/guide.md",
 		Debounce:      3 * time.Second,
+		SelfWake:      "", // 旧配置缺 self_wake 键 → 空串（运行期按默认 10 分钟处理）
 		Temperature:   0.8,
 		Debug:         false,
 		Multimodal:    boolPtr(true),
@@ -329,6 +331,37 @@ func TestLoadConfigAgentMultimodalMissingDefaultsOn(t *testing.T) {
 	}
 }
 
+// TestLoadConfigAgentSelfWake self_wake 各合法取值按原样解析进 AgentConfig
+// （空串/"off"/"0" 的语义在运行期由 agent 包解释，配置层不重写字段值）。
+func TestLoadConfigAgentSelfWake(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"explicit off", `self_wake: "off"`, "off"},
+		{"explicit zero", `self_wake: "0"`, "0"},
+		{"one hour", `self_wake: "1h"`, "1h"},
+		{"minimum boundary", `self_wake: "30s"`, "30s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filename := configTestDir(t)
+			content := strings.Replace(agentConfigYAML, "debounce: 3s", "debounce: 3s\n  "+tc.yaml, 1)
+			if content == agentConfigYAML {
+				t.Fatal("test replacement did not modify the fixture")
+			}
+			writeTestConfig(t, filename, content)
+			got := new(Config).LoadConfig()
+			if got == nil || got.Agent == nil {
+				t.Fatal("LoadConfig returned nil for valid self_wake configuration")
+			}
+			if got.Agent.SelfWake != tc.want {
+				t.Errorf("SelfWake = %q, want %q", got.Agent.SelfWake, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsInvalidAgentConfiguration(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -355,6 +388,9 @@ func TestLoadConfigRejectsInvalidAgentConfiguration(t *testing.T) {
 		{"non-duration debounce", "debounce: 3s", "debounce: fast", "agent"},
 		{"zero max_tool_rounds", "max_tool_rounds: 5", "max_tool_rounds: 0", "agent.max_tool_rounds"},
 		{"negative max_tool_rounds", "max_tool_rounds: 5", "max_tool_rounds: -1", "agent.max_tool_rounds"},
+		{"self_wake below minimum", "debounce: 3s", "debounce: 3s\n  self_wake: \"500ms\"", "agent.self_wake"},
+		{"self_wake not a duration", "debounce: 3s", "debounce: 3s\n  self_wake: \"fast\"", "agent.self_wake"},
+		{"self_wake below 30s boundary", "debounce: 3s", "debounce: 3s\n  self_wake: \"29s\"", "agent.self_wake"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

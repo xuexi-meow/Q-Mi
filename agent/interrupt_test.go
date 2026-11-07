@@ -83,7 +83,7 @@ func TestUrgentMessageInterruptsSlowTurn(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	m.debugDir = t.TempDir()
@@ -150,7 +150,7 @@ func TestNonUrgentDuringSlowTurnDoesNotInterrupt(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	napcat := startFakeNapCat(t)

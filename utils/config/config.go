@@ -43,6 +43,7 @@ agent:
   persona_file: "agent/persona.md"
   guide_file: "agent/guide.md"
   debounce: 3s
+  self_wake: "10m"
   temperature: 0.8
   debug: false
   multimodal: true
@@ -102,6 +103,9 @@ type AgentConfig struct {
 	PersonaFile   string        `yaml:"persona_file" mapstructure:"persona_file"`
 	GuideFile     string        `yaml:"guide_file" mapstructure:"guide_file"`
 	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
+	// SelfWake 定时轮询间隔（P3.6 代码级唤醒兜底）：空串=默认 10 分钟；
+	// "off"/"0"=关闭；其余必须为 ≥30s 的合法 duration（下限防误配成高频轮询）。
+	SelfWake      string        `yaml:"self_wake" mapstructure:"self_wake"`
 	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
 	Debug         bool          `yaml:"debug" mapstructure:"debug"`
 	// Multimodal 缺键(nil)视为 true——旧配置文件没有该字段时不应静默关闭。
@@ -227,6 +231,16 @@ func validateAgentConfig(agent *AgentConfig) error {
 	}
 	if agent.Debounce <= 0 {
 		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)
+	}
+	// self_wake P3.6：空串=默认 10 分钟，"off"/"0"=关闭；其余须解析成功且 ≥30s。
+	if s := strings.TrimSpace(agent.SelfWake); s != "" && s != "off" && s != "0" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("agent.self_wake %q: %w", agent.SelfWake, err)
+		}
+		if d < 30*time.Second {
+			return fmt.Errorf("agent.self_wake %q must be at least 30s (empty = default 10m, \"off\"/\"0\" = disabled)", agent.SelfWake)
+		}
 	}
 	if agent.MaxToolRounds <= 0 {
 		return fmt.Errorf("agent.max_tool_rounds must be positive, got %d", agent.MaxToolRounds)

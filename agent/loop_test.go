@@ -45,7 +45,7 @@ func newLoopManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder, store 
 	f.mu.Lock()
 	f.script = script
 	f.mu.Unlock()
-	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, store)
+	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, store, 999)
 	dir := t.TempDir()
 	m.notesPath = filepath.Join(dir, "notes.json")
 	m.statePath = filepath.Join(dir, "state.json")

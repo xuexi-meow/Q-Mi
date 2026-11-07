@@ -70,6 +70,7 @@ type Manager struct {
 	cfg        config.AgentConfig
 	store      *storage.Store
 	timerStore *TimerStore // P3.5 定时提醒（schedule 工具的后端）
+	selfID     int64       // 机器人自身 QQ（wiring 从 bot.qq_number 注入）；P3.6 定时轮询以它为会话 ID
 
 	// debugDir/notesPath/statePath 做成私有字段便于测试注入 t.TempDir()。
 	debugDir  string
@@ -81,14 +82,16 @@ type Manager struct {
 }
 
 // NewManager 构造 Manager。store 可为 nil（无历史/查询工具报错）。
+// selfID 为机器人自身 QQ（配置未填传 0：P3.6 定时轮询在 selfID<=0 时停用）。
 // P3.5：构造后接上 TimerStore（fire 回调引用 m.Enqueue，须先有 manager
 // 再造 store，避免循环依赖），随即恢复上次进程未触发的计时。
-func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, store *storage.Store) *Manager {
+func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, store *storage.Store, selfID int64) *Manager {
 	m := &Manager{
 		builder:   builder,
 		client:    client,
 		cfg:       cfg,
 		store:     store,
+		selfID:    selfID,
 		debugDir:  "agent/debug",
 		notesPath: defaultNotesPath,
 		statePath: defaultStatePath,

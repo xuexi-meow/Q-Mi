@@ -183,7 +183,7 @@ func testCfg(debounce time.Duration) config.AgentConfig {
 func newTestManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder) (*Manager, *fakeLLM) {
 	t.Helper()
 	f, srv := newFakeLLM(t, "pong")
-	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	t.Cleanup(func() { srv.Close() })
@@ -366,7 +366,7 @@ func TestEmptyContentNotSent(t *testing.T) {
 	b := &stubBuilder{}
 	cfg := testCfg(20 * time.Millisecond)
 	emptyF, emptySrv := newFakeLLM(t, "   ")
-	m := NewManager(b, NewClient(emptySrv.URL, "sk-test", 5*time.Second), cfg, nil)
+	m := NewManager(b, NewClient(emptySrv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	napcat := startFakeNapCat(t)

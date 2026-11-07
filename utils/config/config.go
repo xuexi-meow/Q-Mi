@@ -51,6 +51,11 @@ agent:
   history:
     max: 40
     trim: 20
+webui:
+  enable: false
+  host: "127.0.0.1"
+  port: 6077
+  token: ""
 `
 
 type Config struct {
@@ -59,6 +64,15 @@ type Config struct {
 	Napcat     *Napcat
 	Storage    *Storage
 	Agent      *AgentConfig
+	WebUI      *WebUIConfig
+}
+
+// WebUIConfig Web 控制台配置，与 Config.yaml 中 webui 块对应。
+type WebUIConfig struct {
+	Enable bool   `yaml:"enable" mapstructure:"enable"`
+	Host   string `yaml:"host" mapstructure:"host"`
+	Port   int    `yaml:"port" mapstructure:"port"`
+	Token  string `yaml:"token" mapstructure:"token"`
 }
 
 // Storage 消息记忆库配置
@@ -143,11 +157,11 @@ func (c *Config) LoadConfig() *Config {
 		}
 	}
 
-	bot, netSetting, napcat, storageCfg, agentCfg := initConfig(*v)
-	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil || agentCfg == nil {
+	bot, netSetting, napcat, storageCfg, agentCfg, webuiCfg := initConfig(*v)
+	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil || agentCfg == nil || webuiCfg == nil {
 		return nil
 	}
-	if err := validateConfig(netSetting, napcat, storageCfg, agentCfg); err != nil {
+	if err := validateConfig(netSetting, napcat, storageCfg, agentCfg, webuiCfg); err != nil {
 		slog.Error("配置校验失败", "err", err)
 		return nil
 	}
@@ -159,6 +173,7 @@ func (c *Config) LoadConfig() *Config {
 		Napcat:     napcat,
 		Storage:    storageCfg,
 		Agent:      agentCfg,
+		WebUI:      webuiCfg,
 	}
 }
 
@@ -177,7 +192,7 @@ func makeNewConfig() bool {
 	return true
 }
 
-func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, agent *AgentConfig) error {
+func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, agent *AgentConfig, webui *WebUIConfig) error {
 	if err := validateHostPort("netsetting", netSetting.Host, netSetting.Port); err != nil {
 		return err
 	}
@@ -201,6 +216,14 @@ func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, ag
 	}
 	if agent.Enable {
 		if err := validateAgentConfig(agent); err != nil {
+			return err
+		}
+	}
+	if webui.Enable {
+		if strings.TrimSpace(webui.Token) == "" {
+			return fmt.Errorf("webui.token must not be empty when webui is enabled")
+		}
+		if err := validateHostPort("webui", webui.Host, webui.Port); err != nil {
 			return err
 		}
 	}
@@ -269,31 +292,36 @@ func validateHostPort(name, host string, port int) error {
 	return nil
 }
 
-func initConfig(v viper.Viper) (*Bot, *NetSetting, *Napcat, *Storage, *AgentConfig) {
+func initConfig(v viper.Viper) (*Bot, *NetSetting, *Napcat, *Storage, *AgentConfig, *WebUIConfig) {
 	var bot Bot
 	if err := v.UnmarshalKey("bot", &bot); err != nil {
 		slog.Error("解析 bot 配置失败", "err", err)
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	var netSetting NetSetting
 	if err := v.UnmarshalKey("netsetting", &netSetting); err != nil {
 		slog.Error("解析 netsetting 配置失败", "err", err)
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	var napcat Napcat
 	if err := v.UnmarshalKey("napcat", &napcat); err != nil {
 		slog.Error("解析 napcat 配置失败", "err", err)
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	var storage Storage
 	if err := v.UnmarshalKey("storage", &storage); err != nil {
 		slog.Error("解析 storage 配置失败", "err", err)
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	var agent AgentConfig
 	if err := v.UnmarshalKey("agent", &agent); err != nil {
 		slog.Error("解析 agent 配置失败", "err", err)
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
-	return &bot, &netSetting, &napcat, &storage, &agent
+	var webui WebUIConfig
+	if err := v.UnmarshalKey("webui", &webui); err != nil {
+		slog.Error("解析 webui 配置失败", "err", err)
+		return nil, nil, nil, nil, nil, nil
+	}
+	return &bot, &netSetting, &napcat, &storage, &agent, &webui
 }

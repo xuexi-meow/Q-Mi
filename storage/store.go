@@ -265,3 +265,14 @@ func (s *Store) MarkRecalled(id int64) error {
 	}
 	return nil
 }
+
+// Stats 返回 messages 与 notices 两表的行数（W1 WebUI 概览统计用）。
+func (s *Store) Stats() (messages, notices int64, err error) {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&messages); err != nil {
+		return 0, 0, fmt.Errorf("统计 messages 失败: %w", err)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM notices").Scan(&notices); err != nil {
+		return 0, 0, fmt.Errorf("统计 notices 失败: %w", err)
+	}
+	return messages, notices, nil
+}

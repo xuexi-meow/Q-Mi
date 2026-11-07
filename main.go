@@ -8,9 +8,11 @@ import (
 	"Q-Mi/storage"
 	"Q-Mi/utils/log"
 	"Q-Mi/utils/request"
+	"Q-Mi/webui"
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -73,8 +75,26 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	// W1 WebUI：agent 启用且 webui.enable 时启动控制台（独立端口）。
+	// Start 非阻塞；退出时与其他服务一并 Shutdown。
+	var webuiServer *http.Server
+	if appInstance.Config.Agent != nil && appInstance.Config.Agent.Enable &&
+		appInstance.Config.WebUI != nil && appInstance.Config.WebUI.Enable {
+		srv, err := webui.Start(*appInstance.Config.WebUI)
+		if err != nil {
+			slog.Warn("WebUI 启动失败，不影响其他功能", "err", err)
+		} else {
+			webuiServer = srv
+		}
+	}
+
 	<-ctx.Done()
 	slog.Info("收到退出信号，正在等待事件处理完成...")
+	if webuiServer != nil {
+		if err := webuiServer.Shutdown(context.Background()); err != nil {
+			slog.Warn("关闭 WebUI 失败", "err", err)
+		}
+	}
 	if err := c.Server.Shutdown(context.Background()); err != nil {
 		return fmt.Errorf("关闭 HTTP 服务失败: %w", err)
 	}

@@ -124,6 +124,7 @@ func TestLoadConfigCurrentConfiguration(t *testing.T) {
 		},
 		Storage: &Storage{Enable: true, Path: "Q-Mi.db"},
 		Agent:   &AgentConfig{},
+		WebUI:   &WebUIConfig{}, // 旧配置缺 webui 块 → 零值（enable=false 不生效）
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("LoadConfig = %+v, want %+v", got, want)
@@ -465,6 +466,110 @@ storage:`, 1)
 	writeTestConfig(t, filename, content)
 	if new(Config).LoadConfig() == nil {
 		t.Fatal("disabled agent with invalid values must not be rejected")
+	}
+}
+
+// webuiConfigYAML 在有效配置上追加启用的 webui 块，供 webui 相关测试复用。
+const webuiConfigYAML = validConfigYAML + `webui:
+  enable: true
+  host: "127.0.0.1"
+  port: 6077
+  token: "test-token"
+`
+
+func TestLoadConfigDefaultWebUIValues(t *testing.T) {
+	configTestDir(t)
+	got := new(Config).LoadConfig()
+	if got == nil {
+		t.Fatal("LoadConfig returned nil")
+	}
+	want := &WebUIConfig{Enable: false, Host: "127.0.0.1", Port: 6077, Token: ""}
+	if !reflect.DeepEqual(got.WebUI, want) {
+		t.Errorf("default webui config = %+v, want %+v", got.WebUI, want)
+	}
+}
+
+func TestLoadConfigWebUIBlock(t *testing.T) {
+	filename := configTestDir(t)
+	writeTestConfig(t, filename, webuiConfigYAML)
+	got := new(Config).LoadConfig()
+	if got == nil {
+		t.Fatal("LoadConfig returned nil for valid webui configuration")
+	}
+	want := &WebUIConfig{Enable: true, Host: "127.0.0.1", Port: 6077, Token: "test-token"}
+	if !reflect.DeepEqual(got.WebUI, want) {
+		t.Errorf("webui config = %+v, want %+v", got.WebUI, want)
+	}
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != webuiConfigYAML {
+		t.Error("loading modified the existing configuration")
+	}
+}
+
+func TestLoadConfigRejectsInvalidWebUIConfiguration(t *testing.T) {
+	cases := []struct {
+		name  string
+		old   string
+		new   string
+		field string
+	}{
+		{"empty token", `token: "test-token"`, `token: ""`, "webui.token"},
+		{"blank token", `token: "test-token"`, `token: "  "`, "webui.token"},
+		{"empty host", "host: \"127.0.0.1\"\n  port: 6077", "host: \"\"\n  port: 6077", "webui.host"},
+		{"blank host", "host: \"127.0.0.1\"\n  port: 6077", "host: \"  \"\n  port: 6077", "webui.host"},
+		{"zero port", "port: 6077", "port: 0", "webui.port"},
+		{"negative port", "port: 6077", "port: -1", "webui.port"},
+		{"large port", "port: 6077", "port: 65536", "webui.port"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			filename := configTestDir(t)
+			content := strings.Replace(webuiConfigYAML, tc.old, tc.new, 1)
+			if content == webuiConfigYAML {
+				t.Fatal("test replacement did not modify the fixture")
+			}
+			writeTestConfig(t, filename, content)
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			if got := new(Config).LoadConfig(); got != nil {
+				t.Error("invalid webui configuration was accepted")
+			}
+			if !strings.Contains(logs.String(), tc.field) {
+				t.Errorf("error log must identify %q, got %q", tc.field, logs.String())
+			}
+			got, err := os.ReadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Error("invalid existing config was overwritten")
+			}
+		})
+	}
+}
+
+func TestLoadConfigAcceptsValidWebUIBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"minimum port", "port: 6077", "port: 1"},
+		{"maximum port", "port: 6077", "port: 65535"},
+		{"disabled with empty token", "enable: true\n  host: \"127.0.0.1\"\n  port: 6077\n  token: \"test-token\"", "enable: false\n  host: \"\"\n  port: 0\n  token: \"\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filename := configTestDir(t)
+			writeTestConfig(t, filename, strings.Replace(webuiConfigYAML, tc.old, tc.new, 1))
+			if new(Config).LoadConfig() == nil {
+				t.Fatal("valid webui configuration was rejected")
+			}
+		})
 	}
 }
 

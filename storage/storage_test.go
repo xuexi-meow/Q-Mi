@@ -879,3 +879,34 @@ func ids(rs []*MessageRecord) []int64 {
 	}
 	return out
 }
+
+// TestStats Stats 返回 messages/notices 两表的行数（W1 WebUI 概览用）。
+func TestStats(t *testing.T) {
+	s := openTestStore(t)
+	msgs, notices, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if msgs != 0 || notices != 0 {
+		t.Fatalf("空库 Stats = (%d, %d), want (0, 0)", msgs, notices)
+	}
+	if err := s.PutMessage(&MessageRecord{MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 888,
+		UserID: 11, RawMessage: "你好", Time: 1729200000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutMessage(&MessageRecord{MessageID: 2, Direction: "recv", ChatType: "group", ChatID: 888,
+		UserID: 12, RawMessage: "在吗", Time: 1729200001}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutNotice(&NoticeRecord{NoticeType: "notify", SubType: "poke",
+		ChatID: 888, UserID: 11, Raw: []byte(`{}`), Time: 1729200002}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, notices, err = s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if msgs != 2 || notices != 1 {
+		t.Errorf("Stats = (%d, %d), want (2, 1)", msgs, notices)
+	}
+}

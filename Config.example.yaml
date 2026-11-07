@@ -36,3 +36,8 @@ agent:
   history:
     max: 40
     trim: 20
+webui:
+  enable: false          # Web 控制台(agent 需同时启用)；要手机/局域网访问把 host 改 0.0.0.0
+  host: "127.0.0.1"
+  port: 6077
+  token: ""              # enable 时必填:Bearer 鉴权令牌,也是管理权限,不要泄露

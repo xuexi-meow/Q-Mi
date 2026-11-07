@@ -77,6 +77,8 @@ type Manager struct {
 	notesPath string
 	statePath string
 
+	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
+
 	mu       sync.Mutex // 保护 sessions 及其中 pending/timer
 	sessions map[string]*session
 }
@@ -96,6 +98,7 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 		notesPath: defaultNotesPath,
 		statePath: defaultStatePath,
 		sessions:  make(map[string]*session),
+		events:    NewEventLog(),
 	}
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
@@ -255,6 +258,9 @@ func (m *Manager) handleTurn(turn *Turn) {
 	turn.Notes = notes
 	turn.Mood = m.loadMood()
 
+	// W1 WebUI 事件埋点：进入 turn（spec §3.1）
+	m.events.Record(turn.ChatType, turn.ChatID, KindTurnStart, turnSummary(turn.NewMessages))
+
 	msgs := m.builder.Build(turn)
 	// P3-2 管理员门槛：本轮任一消息发送者是配置的管理员即视为管理员 turn，
 	// 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
@@ -288,10 +294,12 @@ func (m *Manager) handleTurn(turn *Turn) {
 			if interrupted {
 				// 插话打断（spec §5）：不按普通错误刷屏，不补处理、不回复；
 				// 消息都在 storage，新 turn 上下文自然包含
+				m.events.Record(turn.ChatType, turn.ChatID, KindInterrupted, "本轮思考被紧急消息打断")
 				slog.Info("本轮思考被紧急消息打断，等待新 turn 重开",
 					"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
 				return
 			}
+			m.events.Record(turn.ChatType, turn.ChatID, KindError, chatErr.Error())
 			slog.Warn("LLM 请求失败，本轮思考结束，不重试",
 				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "err", chatErr)
 			return
@@ -301,9 +309,11 @@ func (m *Manager) handleTurn(turn *Turn) {
 		// 不截断（要看全文）、不加配置开关。
 		if rc := resp.ReasoningContent(); rc != "" {
 			slog.Info("思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "reasoning", rc)
+			m.events.Record(turn.ChatType, turn.ChatID, KindReasoning, rc)
 		}
 		if content := resp.TextContent(); content != "" {
 			slog.Info("输出", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "content", content)
+			m.events.Record(turn.ChatType, turn.ChatID, KindOutput, content)
 		}
 
 		calls := resp.ToolCalls()
@@ -327,10 +337,13 @@ func (m *Manager) handleTurn(turn *Turn) {
 			}
 			slog.Info("工具调用", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
 				"tool", call.Function.Name, "args", call.Function.Arguments)
+			m.events.Record(turn.ChatType, turn.ChatID, KindToolCall, call.Function.Name+" "+call.Function.Arguments)
 			result, toolErr := execTool(tools, call)
 			if toolErr != nil {
 				slog.Info("工具执行失败", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
 					"tool", call.Function.Name, "err", toolErr)
+				m.events.Record(turn.ChatType, turn.ChatID, KindToolResult,
+					fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
 				result = toolErrorJSON(toolErr)
 			}
 			results = append(results, result)
@@ -340,11 +353,13 @@ func (m *Manager) handleTurn(turn *Turn) {
 			m.dumpDebug(turn, req, round, resp, results, nil, false)
 		}
 		if finished {
+			m.events.Record(turn.ChatType, turn.ChatID, KindFinish, "结束思考")
 			slog.Info("结束思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
 			return
 		}
 	}
 
+	m.events.Record(turn.ChatType, turn.ChatID, KindError, "轮数上限")
 	slog.Warn("思考轮数达到上限，强制结束本轮",
 		"chat_type", turn.ChatType, "chat_id", turn.ChatID, "max_tool_rounds", maxRounds)
 }
@@ -352,14 +367,18 @@ func (m *Manager) handleTurn(turn *Turn) {
 // replyText 兼容路径发送纯文本回复；空内容不发送。
 func (m *Manager) replyText(turn *Turn, content string) {
 	if content == "" {
+		m.events.Record(turn.ChatType, turn.ChatID, KindError, "LLM 返回空回复，不发送")
 		slog.Warn("LLM 返回空回复，不发送",
 			"chat_type", turn.ChatType, "chat_id", turn.ChatID)
 		return
 	}
 	if err := bot.Reply(context.Background(), turn.ChatType, turn.ChatID, chain.New().Text(content)); err != nil {
+		m.events.Record(turn.ChatType, turn.ChatID, KindError, "回复发送失败: "+err.Error())
 		slog.Warn("回复发送失败",
 			"chat_type", turn.ChatType, "chat_id", turn.ChatID, "err", err)
+		return
 	}
+	m.events.Record(turn.ChatType, turn.ChatID, KindReply, content)
 }
 
 // execTool 按名字执行工具；未知工具 / Run 缺失 / 执行失败返回 error，

@@ -40,6 +40,54 @@ main { max-width: 960px; margin: 24px auto; padding: 0 16px; }
 .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px; }
 .badge.ok { background: rgba(74,222,128,.15); color: var(--ok); }
 .badge.bad { background: rgba(248,113,113,.15); color: var(--bad); }
+/* 思考链 Kind 徽标（W2 消息流） */
+.ebadge { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 11px; margin-right: 6px; }
+.ebadge.turn_start   { background: rgba(91,157,255,.18); color: var(--accent); }
+.ebadge.reasoning    { background: rgba(167,139,250,.18); color: #a78bfa; }
+.ebadge.output       { background: rgba(74,222,128,.18); color: var(--ok); }
+.ebadge.tool_call    { background: rgba(251,191,36,.18); color: var(--warn); }
+.ebadge.tool_result  { background: rgba(251,191,36,.12); color: #d3a417; }
+.ebadge.reply        { background: rgba(74,222,128,.25); color: var(--ok); }
+.ebadge.error        { background: rgba(248,113,113,.2); color: var(--bad); }
+.ebadge.finish       { background: rgba(139,145,160,.2); color: var(--dim); }
+.ebadge.interrupted  { background: rgba(248,113,113,.14); color: #fca5a5; }
+/* 消息流布局 */
+.stream { display: flex; gap: 14px; min-height: 60vh; }
+.chat-list { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
+.chat-item {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; cursor: pointer;
+}
+.chat-item:hover { border-color: var(--accent); }
+.chat-item.active { border-color: var(--accent); background: rgba(91,157,255,.08); }
+.chat-item .t { font-weight: 600; font-size: 13px; }
+.chat-item .s { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.stream-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.msg-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.msg-row { display: flex; }
+.msg-row.sent { justify-content: flex-end; }
+.bubble {
+  max-width: 76%; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 7px 12px; white-space: pre-wrap; word-break: break-word;
+}
+.msg-row.sent .bubble { background: rgba(91,157,255,.14); border-color: rgba(91,157,255,.4); }
+.msg-meta { font-size: 11px; color: var(--dim); margin-bottom: 2px; }
+.msg-row.recalled .bubble { opacity: .55; border-style: dashed; }
+.trace { border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  margin-bottom: 10px; padding: 8px 10px; max-height: 220px; overflow-y: auto;
+  font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+.trace .ev { border-bottom: 1px solid rgba(38,43,56,.5); padding-bottom: 3px; }
+.trace .ev:last-child { border-bottom: none; }
+.trace .m { color: var(--dim); margin-right: 6px; font-size: 11px; }
+.stream-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.stream-toolbar input[type=text] {
+  flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; font-size: 13px;
+}
+.search-hit { cursor: pointer; }
+.search-hit:hover { border-color: var(--accent); }
+.load-more { align-self: center; margin: 4px 0; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
 .muted { color: var(--dim); }
@@ -132,8 +180,91 @@ button.primary { background: var(--accent); color: #fff; }
       </template>
     </section>
 
-    <!-- 占位 tab（W2/W3/W4 实现） -->
-    <section x-show="tab==='stream'" class="placeholder">消息流 · 建设中（W2）</section>
+    <!-- W2: 消息流 -->
+    <section x-show="tab==='stream'">
+      <div class="stream-toolbar">
+        <input type="text" x-model="searchQ" placeholder="搜索消息关键词…"
+               @keydown.enter="doSearch()">
+        <button class="act primary" @click="doSearch()">搜索</button>
+        <button class="act" x-show="searchMode" @click="exitSearch()">返回会话</button>
+        <label style="cursor:pointer" title="轮询 /api/events 展示 agent 思考链">
+          <input type="checkbox" x-model="traceOn" @change="toggleTrace()"> 实时思考链
+        </label>
+      </div>
+
+      <template x-if="traceOn">
+        <div class="trace" x-ref="traceBox">
+          <template x-for="ev in traceEvents" :key="ev.id">
+            <div class="ev">
+              <span class="ebadge" :class="ev.kind" x-text="ev.kind"></span>
+              <span class="m" x-text="fmtTime(ev.time)"></span>
+              <span class="m" x-show="ev.chat_type || ev.chat_id"
+                    x-text="ev.chat_type + ':' + ev.chat_id"></span>
+              <span x-text="ev.text"></span>
+            </div>
+          </template>
+          <div class="muted" x-show="!traceEvents.length">等待事件…（agent 产生思考链时实时滚动）</div>
+        </div>
+      </template>
+
+      <template x-if="!searchMode">
+        <div class="stream">
+          <div class="chat-list">
+            <div class="muted" x-show="chatsErr" x-text="chatsErr"></div>
+            <div class="muted" x-show="!chats.length && !chatsErr">暂无会话</div>
+            <template x-for="c in chats" :key="c.chat_type + ':' + c.chat_id">
+              <div class="chat-item" :class="curChat && curChat.chat_type===c.chat_type && curChat.chat_id===c.chat_id && 'active'"
+                   @click="openChat(c)">
+                <div class="t">
+                  <span x-text="chatTitle(c)"></span>
+                  <span class="muted" style="font-weight:400;float:right" x-text="relTime(c.last_time)"></span>
+                </div>
+                <div class="s" x-text="c.last_text"></div>
+              </div>
+            </template>
+          </div>
+          <div class="stream-main">
+            <div class="muted" x-show="msgsErr" x-text="msgsErr"></div>
+            <div class="placeholder" x-show="!curChat && !msgsErr">← 从左侧选择会话</div>
+            <div class="msg-list" x-show="curChat" x-ref="msgBox">
+              <button class="act load-more" x-show="hasMore && !loadingMore" @click="loadMore()">加载更多</button>
+              <div class="muted load-more" x-show="loadingMore">加载中…</div>
+              <template x-for="m in msgs" :key="m.message_id">
+                <div class="msg-row" :class="[m.direction === 'sent' ? 'sent' : '', m.recalled ? 'recalled' : '']">
+                  <div class="bubble">
+                    <div class="msg-meta">
+                      <span x-text="(m.sender_name || '未知') + (m.user_id ? '(' + m.user_id + ')' : '')"></span>
+                      <span style="float:right" x-text="fmtTime(m.time * 1000)"></span>
+                    </div>
+                    <span x-text="m.text || m.raw_message"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="searchMode">
+        <div class="stream-main">
+          <div class="muted" x-text="searchResults.length ? ('共 ' + searchResults.length + ' 条命中，点击跳转会话') : '无匹配结果'"></div>
+          <div class="msg-list">
+            <template x-for="m in searchResults" :key="m.message_id + ':' + m.chat_type + ':' + m.chat_id">
+              <div class="bubble search-hit" @click="jumpToChat(m)">
+                <div class="msg-meta">
+                  <span x-text="chatTitle(m)"></span> ·
+                  <span x-text="m.sender_name"></span> ·
+                  <span x-text="fmtTime(m.time * 1000)"></span>
+                </div>
+                <span x-text="m.text || m.raw_message"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- 占位 tab（W3/W4 实现） -->
     <section x-show="tab==='agent'" class="placeholder">Agent 控制 · 建设中（W3）</section>
     <section x-show="tab==='qq'" class="placeholder">QQ 管理 · 建设中（W4）</section>
   </main>
@@ -161,14 +292,21 @@ function app() {
     needToken: false, authErr: '',
     tokenInput: '',
     timer: null,
+    // W2 消息流状态
+    chats: [], chatsErr: '', chatsLoaded: false,
+    curChat: null, msgs: [], msgsErr: '',
+    hasMore: false, loadingMore: false,
+    searchQ: '', searchMode: false, searchResults: [],
+    traceOn: false, traceEvents: [], traceLastID: 0, traceTimer: null,
     init() {
       if (!localStorage.qmi_token) {
         this.needToken = true;
         return;
       }
       this.loadOverview();
-      // 概览 5s 轮询（消息流 1s 轮询 /api/events 在 W2 接入）
+      // 概览 5s 轮询；消息流 1.5s 轮询 /api/events 由"实时思考链"开关控制
       this.timer = setInterval(() => { if (!this.needToken) this.loadOverview(); }, 5000);
+      this.$watch('tab', (t) => { if (t === 'stream' && !this.chatsLoaded) this.loadChats(); });
     },
     async api(path, opts = {}) {
       const headers = Object.assign(
@@ -205,6 +343,117 @@ function app() {
       if (d > 0) return d + ' 天 ' + h + ' 小时';
       if (h > 0) return h + ' 小时 ' + m + ' 分';
       return m + ' 分 ' + Math.floor(sec % 60) + ' 秒';
+    },
+    // ---- W2 消息流 ----
+    chatTitle(c) {
+      return (c.chat_type === 'group' ? '群:' : '私聊:') + c.chat_id;
+    },
+    fmtTime(ms) {
+      if (!ms) return '';
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+        ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    },
+    relTime(sec) {
+      if (!sec) return '';
+      const diff = Date.now() / 1000 - sec;
+      if (diff < 60) return '刚刚';
+      if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+      if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+      if (diff < 86400 * 30) return Math.floor(diff / 86400) + ' 天前';
+      return this.fmtTime(sec * 1000).slice(0, 10);
+    },
+    async loadChats() {
+      try {
+        const r = await this.api('/api/chats');
+        this.chats = await r.json();
+        this.chatsErr = '';
+        this.chatsLoaded = true;
+      } catch (e) {
+        if (!this.needToken) this.chatsErr = '会话列表加载失败：' + e.message;
+      }
+    },
+    openChat(c) {
+      this.curChat = c;
+      this.searchMode = false;
+      this.msgs = [];
+      this.hasMore = false;
+      this.loadMessages();
+    },
+    async loadMessages(beforeTime) {
+      if (!this.curChat) return;
+      const c = this.curChat;
+      let url = '/api/messages?chat_type=' + encodeURIComponent(c.chat_type) +
+        '&chat_id=' + encodeURIComponent(c.chat_id);
+      if (beforeTime) url += '&before_time=' + encodeURIComponent(beforeTime);
+      try {
+        const r = await this.api(url);
+        const rows = await r.json();
+        if (this.curChat !== c) return; // 期间切换了会话
+        this.msgsErr = '';
+        const asc = rows.slice().reverse(); // API 新→旧，展示按时间正序
+        if (beforeTime) this.msgs = asc.concat(this.msgs);
+        else this.msgs = asc;
+        this.hasMore = rows.length >= 50;
+        this.$nextTick(() => { this.scrollBottom(this.$refs.msgBox); });
+      } catch (e) {
+        if (!this.needToken) this.msgsErr = '消息加载失败：' + e.message;
+      }
+    },
+    loadMore() {
+      if (!this.msgs.length || this.loadingMore) return;
+      this.loadingMore = true;
+      // 游标 = 已加载最旧一条的 time（不包含该条）
+      this.loadMessages(this.msgs[0].time).finally(() => { this.loadingMore = false; });
+    },
+    async doSearch() {
+      const q = this.searchQ.trim();
+      if (!q) return;
+      try {
+        const r = await this.api('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        this.searchResults = await r.json();
+        this.searchMode = true;
+      } catch (e) {
+        if (!this.needToken) this.msgsErr = '搜索失败：' + e.message;
+      }
+    },
+    exitSearch() {
+      this.searchMode = false;
+      this.searchResults = [];
+    },
+    jumpToChat(m) {
+      this.openChat({ chat_type: m.chat_type, chat_id: m.chat_id });
+    },
+    // ---- 实时思考链（1.5s 轮询 /api/events） ----
+    toggleTrace() {
+      if (this.traceOn) {
+        this.pollEvents();
+        this.traceTimer = setInterval(() => this.pollEvents(), 1500);
+      } else if (this.traceTimer) {
+        clearInterval(this.traceTimer);
+        this.traceTimer = null;
+      }
+    },
+    async pollEvents() {
+      try {
+        const r = await this.api('/api/events?after=' + this.traceLastID);
+        const events = await r.json();
+        if (!events.length) return;
+        this.traceEvents.push(...events);
+        this.traceLastID = events[events.length - 1].id;
+        // 环形缓冲防涨爆：只保留最近 300 条展示
+        if (this.traceEvents.length > 300) this.traceEvents = this.traceEvents.slice(-300);
+        this.$nextTick(() => { this.scrollBottom(this.$refs.traceBox); });
+      } catch (e) { /* 轮询失败静默，下一轮重试 */ }
+    },
+    scrollBottom(el) {
+      if (el) el.scrollTop = el.scrollHeight;
     },
   };
 }

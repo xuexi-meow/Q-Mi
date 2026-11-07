@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestOpenCreatesSchema(t *testing.T) {
@@ -878,6 +879,53 @@ func ids(rs []*MessageRecord) []int64 {
 		out[i] = r.MessageID
 	}
 	return out
+}
+
+// TestChatSummaries W2 WebUI 会话列表：按 chat_type+chat_id 分组，统计条数、
+// 最新时间与最后一条消息文本（raw_message 前 80 字符），按最新时间倒序。
+func TestChatSummaries(t *testing.T) {
+	s := openTestStore(t)
+
+	// 空库：不报错、0 条
+	sums, err := s.ChatSummaries()
+	if err != nil {
+		t.Fatalf("空库 ChatSummaries: %v", err)
+	}
+	if len(sums) != 0 {
+		t.Fatalf("空库应返回 0 条, 得到 %d", len(sums))
+	}
+
+	seedMessages(t, s) // group/100 ×4(含撤回)、group/200 ×1、private/77 ×1
+	sums, err = s.ChatSummaries()
+	if err != nil {
+		t.Fatalf("ChatSummaries: %v", err)
+	}
+	want := []ChatSummary{
+		{ChatType: "group", ChatID: 100, LastText: "晚上开黑", LastTime: 1729200006, Count: 4},
+		{ChatType: "private", ChatID: 77, LastText: "私聊在吗", LastTime: 1729200005, Count: 1},
+		{ChatType: "group", ChatID: 200, LastText: "别群的消息", LastTime: 1729200004, Count: 1},
+	}
+	if !reflect.DeepEqual(sums, want) {
+		t.Errorf("ChatSummaries =\n %+v\nwant\n %+v", sums, want)
+	}
+
+	// 超长最后一条文本截断为前 80 字符（按 rune）
+	long := strings.Repeat("字", 100)
+	if err := s.PutMessage(&MessageRecord{MessageID: 10, Direction: "recv", ChatType: "private",
+		ChatID: 88, UserID: 8, RawMessage: long, Time: 1729200010}); err != nil {
+		t.Fatal(err)
+	}
+	sums, err = s.ChatSummaries()
+	if err != nil {
+		t.Fatalf("ChatSummaries: %v", err)
+	}
+	for _, c := range sums {
+		if c.ChatType == "private" && c.ChatID == 88 {
+			if got := utf8.RuneCountInString(c.LastText); got != 80 {
+				t.Errorf("LastText 长度 = %d, want 80", got)
+			}
+		}
+	}
 }
 
 // TestStats Stats 返回 messages/notices 两表的行数（W1 WebUI 概览用）。

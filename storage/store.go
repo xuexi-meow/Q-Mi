@@ -276,3 +276,46 @@ func (s *Store) Stats() (messages, notices int64, err error) {
 	}
 	return messages, notices, nil
 }
+
+// maxChatSummaryText 会话摘要文本截断长度（W2 WebUI 会话列表用）。
+const maxChatSummaryText = 80
+
+// ChatSummary 一个会话（chat_type + chat_id）的摘要：条数、最新时间、
+// 最后一条消息文本（前 maxChatSummaryText 字符）。
+type ChatSummary struct {
+	ChatType string  `json:"chat_type"`
+	ChatID   int64   `json:"chat_id"`
+	LastText string  `json:"last_text"`
+	LastTime float64 `json:"last_time"`
+	Count    int64   `json:"count"`
+}
+
+// ChatSummaries 会话列表：按 chat_type+chat_id 分组统计，附最后一条消息
+// 文本（相关子查询取同会话最新行的 raw_message），按最新时间倒序。
+func (s *Store) ChatSummaries() ([]ChatSummary, error) {
+	rows, err := s.db.Query(`
+SELECT m.chat_type, m.chat_id, COUNT(*), MAX(m.time),
+       (SELECT m2.raw_message FROM messages m2
+        WHERE m2.chat_type = m.chat_type AND m2.chat_id = m.chat_id
+        ORDER BY m2.time DESC, m2.message_id DESC LIMIT 1)
+FROM messages m
+GROUP BY m.chat_type, m.chat_id
+ORDER BY MAX(m.time) DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("查询会话列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ChatSummary{}
+	for rows.Next() {
+		var c ChatSummary
+		if err := rows.Scan(&c.ChatType, &c.ChatID, &c.Count, &c.LastTime, &c.LastText); err != nil {
+			return nil, fmt.Errorf("扫描会话行失败: %w", err)
+		}
+		if runes := []rune(c.LastText); len(runes) > maxChatSummaryText {
+			c.LastText = string(runes[:maxChatSummaryText])
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}

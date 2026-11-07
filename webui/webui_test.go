@@ -197,3 +197,393 @@ func TestOverviewNapcatUnreachableNoStore(t *testing.T) {
 		t.Errorf("NapCat 不可达时 napcat = %v, want online=false version=\"\"", napcat)
 	}
 }
+
+// withTestStore 注入内存库到 storeProvider，测试结束恢复。
+func withTestStore(t *testing.T, s *storage.Store) {
+	t.Helper()
+	saved := storeProvider
+	storeProvider = func() *storage.Store { return s }
+	t.Cleanup(func() { storeProvider = saved })
+}
+
+// seedStreamMessages 消息流测试数据：group/100 五条(时间递增)、
+// private/77 一条、group/200 一条含关键词"火锅"。
+func seedStreamMessages(t *testing.T, s *storage.Store) {
+	t.Helper()
+	recs := []*storage.MessageRecord{
+		{MessageID: 1, Direction: "recv", ChatType: "group", ChatID: 100, UserID: 11, SenderName: "小明", RawMessage: "早上好", Time: 1729200001},
+		{MessageID: 2, Direction: "sent", ChatType: "group", ChatID: 100, UserID: 999, SenderName: "我", RawMessage: "早", Time: 1729200002},
+		{MessageID: 3, Direction: "recv", ChatType: "group", ChatID: 100, UserID: 11, SenderName: "小明", RawMessage: "中午吃啥", Time: 1729200003},
+		{MessageID: 4, Direction: "recv", ChatType: "group", ChatID: 100, UserID: 12, SenderName: "小红", RawMessage: "吃火锅吧", Time: 1729200004, Recalled: true},
+		{MessageID: 5, Direction: "recv", ChatType: "group", ChatID: 100, UserID: 11, SenderName: "小明", RawMessage: "晚上开黑", Time: 1729200005},
+		{MessageID: 6, Direction: "recv", ChatType: "private", ChatID: 77, UserID: 77, SenderName: "阿七", RawMessage: "私聊在吗", Time: 1729200006},
+		{MessageID: 7, Direction: "recv", ChatType: "group", ChatID: 200, UserID: 33, SenderName: "老王", RawMessage: "火锅走起", Time: 1729200007},
+	}
+	for _, r := range recs {
+		if err := s.PutMessage(r); err != nil {
+			t.Fatalf("seed %d: %v", r.MessageID, err)
+		}
+	}
+}
+
+// TestAPIChats GET /api/chats 返回会话摘要倒序列表。
+func TestAPIChats(t *testing.T) {
+	s := openOverviewStore(t)
+	seedStreamMessages(t, s)
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/chats", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/chats = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var chats []map[string]any
+	if err := json.Unmarshal([]byte(body), &chats); err != nil {
+		t.Fatalf("响应不是合法 JSON 数组: %v (%s)", err, body)
+	}
+	if len(chats) != 3 {
+		t.Fatalf("会话数 = %d, want 3: %s", len(chats), body)
+	}
+	// 按最新时间倒序: group/200 → private/77 → group/100
+	wantOrder := []struct {
+		chatType string
+		chatID   float64
+		count    float64
+		lastText string
+	}{
+		{"group", 200, 1, "火锅走起"},
+		{"private", 77, 1, "私聊在吗"},
+		{"group", 100, 5, "晚上开黑"},
+	}
+	for i, w := range wantOrder {
+		c := chats[i]
+		if c["chat_type"] != w.chatType || c["chat_id"] != w.chatID ||
+			c["count"] != w.count || c["last_text"] != w.lastText {
+			t.Errorf("chats[%d] = %v, want chat=%s/%v count=%v last_text=%q", i, c, w.chatType, w.chatID, w.count, w.lastText)
+		}
+		if _, ok := c["last_time"]; !ok {
+			t.Errorf("chats[%d] 缺少 last_time", i)
+		}
+	}
+}
+
+// TestAPIChatsNoStore store 未启用时 /api/chats 返回空数组而非 null。
+func TestAPIChatsNoStore(t *testing.T) {
+	withTestStore(t, nil)
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/chats", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/chats = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if body != "[]\n" {
+		t.Errorf("无 store 时应返回空数组 [], 得到 %s", body)
+	}
+}
+
+// TestAPIMessages GET /api/messages 分页查询：字段形态、limit 缺省/上限、
+// before_time 游标、缺参 400。
+func TestAPIMessages(t *testing.T) {
+	s := openOverviewStore(t)
+	seedStreamMessages(t, s)
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	// 基本查询：新→旧、JSON 字段形态
+	resp, body := get(t, base+"/api/messages?chat_type=group&chat_id=100", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/messages = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var msgs []map[string]any
+	if err := json.Unmarshal([]byte(body), &msgs); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v (%s)", err, body)
+	}
+	if len(msgs) != 4 { // 已撤回的 msg 4 默认排除
+		t.Fatalf("消息数 = %d, want 4: %s", len(msgs), body)
+	}
+	m := msgs[0]
+	if m["message_id"] != float64(5) || m["chat_type"] != "group" || m["chat_id"] != float64(100) ||
+		m["sender_name"] != "小明" || m["text"] != "晚上开黑" || m["raw_message"] != "晚上开黑" ||
+		m["time"] != float64(1729200005) || m["recalled"] != false {
+		t.Errorf("消息字段形态错误: %v", m)
+	}
+
+	// limit 生效
+	_, body = get(t, base+"/api/messages?chat_type=group&chat_id=100&limit=2", "tok")
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 2 || msgs[0]["message_id"] != float64(5) || msgs[1]["message_id"] != float64(3) {
+		t.Errorf("limit=2 应取最新 2 条: %s", body)
+	}
+
+	// before_time 游标：只取 time < 1729200003
+	_, body = get(t, base+"/api/messages?chat_type=group&chat_id=100&before_time=1729200003", "tok")
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 2 || msgs[0]["message_id"] != float64(2) || msgs[1]["message_id"] != float64(1) {
+		t.Errorf("before_time 游标错误: %s", body)
+	}
+
+	// 缺 chat_id / 非法 chat_id → 400
+	resp, _ = get(t, base+"/api/messages?chat_type=group", "tok")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("缺 chat_id = %d, want 400", resp.StatusCode)
+	}
+	resp, _ = get(t, base+"/api/messages?chat_type=group&chat_id=abc", "tok")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("chat_id 非法 = %d, want 400", resp.StatusCode)
+	}
+
+	// limit 非法值 → 默认 50,不报错;limit 超上限 → 截到 200
+	resp, _ = get(t, base+"/api/messages?chat_type=group&chat_id=100&limit=999999", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("limit 超上限 = %d, want 200", resp.StatusCode)
+	}
+	resp, _ = get(t, base+"/api/messages?chat_type=group&chat_id=100&limit=abc", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("limit 非法 = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestAPIMessagesLimitCap 210 条数据下 limit=1000 截到 200、缺省取 50。
+func TestAPIMessagesLimitCap(t *testing.T) {
+	s := openOverviewStore(t)
+	for id := int64(1); id <= 210; id++ {
+		if err := s.PutMessage(&storage.MessageRecord{MessageID: id, Direction: "recv",
+			ChatType: "group", ChatID: 500, UserID: 1, RawMessage: "刷屏", Time: float64(1729200000 + id)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr + "/api/messages?chat_type=group&chat_id=500"
+
+	_, body := get(t, base+"&limit=1000", "tok")
+	var msgs []map[string]any
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 200 {
+		t.Errorf("limit=1000 应截到 200, 得到 %d", len(msgs))
+	}
+	_, body = get(t, base, "tok")
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 50 {
+		t.Errorf("缺省 limit 应为 50, 得到 %d", len(msgs))
+	}
+}
+
+// TestAPISearch POST /api/search：body 解析、过滤、limit 缺省与上限、
+// 非法 body / 空 query 400、GET 405。
+func TestAPISearch(t *testing.T) {
+	s := openOverviewStore(t)
+	seedStreamMessages(t, s)
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	post := func(t *testing.T, url, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, string(b)
+	}
+
+	// 基本搜索：msg 7 命中（msg 4"吃火锅吧"已撤回,默认排除）
+	resp, body := post(t, base+"/api/search", `{"query":"火锅"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/search = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var msgs []map[string]any
+	if err := json.Unmarshal([]byte(body), &msgs); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v (%s)", err, body)
+	}
+	if len(msgs) != 1 || msgs[0]["message_id"] != float64(7) {
+		t.Errorf("搜索结果错误: %s", body)
+	}
+
+	// 过滤：命中 msg 1；换 chat_id 后无结果
+	_, body = post(t, base+"/api/search", `{"query":"早上","chat_type":"group","chat_id":100,"limit":1}`)
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 1 || msgs[0]["message_id"] != float64(1) {
+		t.Errorf("过滤错误: %s", body)
+	}
+	_, body = post(t, base+"/api/search", `{"query":"早上","chat_id":200}`)
+	_ = json.Unmarshal([]byte(body), &msgs)
+	if len(msgs) != 0 {
+		t.Errorf("chat_id 过滤后应无结果: %s", body)
+	}
+
+	// 非法 JSON → 400
+	resp, _ = post(t, base+"/api/search", `{bad json`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("非法 JSON = %d, want 400", resp.StatusCode)
+	}
+	// 空 query → 400
+	resp, _ = post(t, base+"/api/search", `{"query":""}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("空 query = %d, want 400", resp.StatusCode)
+	}
+	// GET → 405
+	resp, _ = get(t, base+"/api/search", "tok")
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /api/search = %d, want 405", resp.StatusCode)
+	}
+}
+
+// TestAPISearchLimitCap 120 条命中下 limit=500 截到 100。
+func TestAPISearchLimitCap(t *testing.T) {
+	s := openOverviewStore(t)
+	for id := int64(1); id <= 120; id++ {
+		if err := s.PutMessage(&storage.MessageRecord{MessageID: id, Direction: "recv",
+			ChatType: "group", ChatID: 600, UserID: 1, RawMessage: "大海捞针", Time: float64(1729200000 + id)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+srv.Addr+"/api/search",
+		strings.NewReader(`{"query":"捞针","limit":500}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var msgs []map[string]any
+	_ = json.Unmarshal(body, &msgs)
+	if len(msgs) != 100 {
+		t.Errorf("limit=500 应截到 100, 得到 %d: %.100s", len(msgs), body)
+	}
+}
+
+// TestAPIMessageFields 消息行补齐 direction/user_id 字段（recv/sent 区分与
+// 昵称(QQ号) 展示用），且 text 应为 CQ:image 码替换为 [图片] 的展示文本
+// （raw_message 保留原始 CQ 码）。
+func TestAPIMessageFields(t *testing.T) {
+	s := openOverviewStore(t)
+	if err := s.PutMessage(&storage.MessageRecord{MessageID: 1, Direction: "recv",
+		ChatType: "group", ChatID: 100, UserID: 11, SenderName: "小明",
+		RawMessage: "[CQ:image,file=a.image,subType=0,url=https://x/y] 看这张图",
+		Time:       1729200001}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutMessage(&storage.MessageRecord{MessageID: 2, Direction: "sent",
+		ChatType: "group", ChatID: 100, UserID: 999, SenderName: "我",
+		RawMessage: "收到", Time: 1729200002}); err != nil {
+		t.Fatal(err)
+	}
+	withTestStore(t, s)
+	srv := startTestServer(t, "tok")
+
+	_, body := get(t, "http://"+srv.Addr+"/api/messages?chat_type=group&chat_id=100", "tok")
+	var msgs []map[string]any
+	if err := json.Unmarshal([]byte(body), &msgs); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v (%s)", err, body)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("消息数 = %d, want 2: %s", len(msgs), body)
+	}
+	byID := map[int64]map[string]any{}
+	for _, m := range msgs {
+		byID[int64(m["message_id"].(float64))] = m
+	}
+	m1 := byID[1]
+	if m1 == nil {
+		t.Fatalf("缺少 message_id=1: %s", body)
+	}
+	if m1["direction"] != "recv" {
+		t.Errorf("direction = %v, want recv（前端 recv/sent 区分依赖该字段）", m1["direction"])
+	}
+	if m1["user_id"] != float64(11) {
+		t.Errorf("user_id = %v, want 11（前端 昵称(QQ号) 展示依赖该字段）", m1["user_id"])
+	}
+	if m1["text"] != "[图片] 看这张图" {
+		t.Errorf("text = %q, want %q（CQ:image 应替换为 [图片]）", m1["text"], "[图片] 看这张图")
+	}
+	if m1["raw_message"] != "[CQ:image,file=a.image,subType=0,url=https://x/y] 看这张图" {
+		t.Errorf("raw_message 应保留原始 CQ 码: %v", m1["raw_message"])
+	}
+	m2 := byID[2]
+	if m2 == nil {
+		t.Fatalf("缺少 message_id=2: %s", body)
+	}
+	if m2["direction"] != "sent" {
+		t.Errorf("direction = %v, want sent", m2["direction"])
+	}
+	if m2["text"] != "收到" {
+		t.Errorf("无 CQ 码时 text 应与 raw_message 一致: %v", m2["text"])
+	}
+}
+
+// TestAPIMessagesNoStore store 未启用时 /api/messages 返回空数组而非 500/null。
+func TestAPIMessagesNoStore(t *testing.T) {
+	withTestStore(t, nil)
+	srv := startTestServer(t, "tok")
+
+	resp, body := get(t, "http://"+srv.Addr+"/api/messages?chat_type=group&chat_id=100", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("无 store GET /api/messages = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if body != "[]\n" {
+		t.Errorf("无 store 时应返回空数组 [], 得到 %s", body)
+	}
+}
+
+// TestAPISearchNoStore store 未启用时 /api/search 返回空数组而非 500/null。
+func TestAPISearchNoStore(t *testing.T) {
+	withTestStore(t, nil)
+	srv := startTestServer(t, "tok")
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+srv.Addr+"/api/search",
+		strings.NewReader(`{"query":"任意"}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("无 store POST /api/search = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if string(body) != "[]\n" {
+		t.Errorf("无 store 时应返回空数组 [], 得到 %s", body)
+	}
+}
+
+// TestAPIEvents /api/events 透传 agent.EventsAfter：agent 未启用时返回
+// 200 + JSON 数组；after 参数缺失/非法按 0 处理不报错。
+func TestAPIEvents(t *testing.T) {
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	for _, tc := range []string{"", "?after=0", "?after=abc", "?after=-5"} {
+		resp, body := get(t, base+"/api/events"+tc, "tok")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /api/events%s = %d, want 200: %s", tc, resp.StatusCode, body)
+		}
+		var events []map[string]any
+		if err := json.Unmarshal([]byte(body), &events); err != nil {
+			t.Fatalf("after=%q 响应不是 JSON 数组: %v (%s)", tc, err, body)
+		}
+		if len(events) != 0 {
+			t.Errorf("after=%q agent 未启用应为空数组, 得到 %s", tc, body)
+		}
+	}
+}

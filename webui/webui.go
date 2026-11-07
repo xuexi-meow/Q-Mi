@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,6 +80,14 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 		switch r.URL.Path {
 		case "/api/overview":
 			handleOverview(w, r)
+		case "/api/chats":
+			handleChats(w, r)
+		case "/api/messages":
+			handleMessages(w, r)
+		case "/api/search":
+			handleSearch(w, r)
+		case "/api/events":
+			handleEvents(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -216,4 +225,174 @@ func probeNapcat(r *http.Request) napcatStatus {
 	}()
 	wg.Wait()
 	return st
+}
+
+// messageJSON /api/messages 与 /api/search 响应的消息行形态（spec §4）。
+// direction/user_id 供前端 recv/sent 区分与「昵称(QQ号)」展示。
+type messageJSON struct {
+	MessageID  int64   `json:"message_id"`
+	ChatType   string  `json:"chat_type"`
+	ChatID     int64   `json:"chat_id"`
+	Direction  string  `json:"direction"`
+	UserID     int64   `json:"user_id"`
+	SenderName string  `json:"sender_name"`
+	Text       string  `json:"text"`
+	RawMessage string  `json:"raw_message"`
+	Time       float64 `json:"time"`
+	Recalled   bool    `json:"recalled"`
+}
+
+// cqImageRe 匹配 [CQ:image,...] 码（值内逗号转义为 &#44;，不含 ]）。
+// 与 agent/context.go 的 replaceImageCQ 同规则（该函数未导出，包内复制）。
+var cqImageRe = regexp.MustCompile(`\[CQ:image,[^\]]*\]`)
+
+// toMessageJSON MessageRecord 转 JSON 行；text 为展示文本（[CQ:image,...]
+// 码替换为 [图片]，其余 CQ 码原样），raw_message 保留原始内容。
+func toMessageJSON(r *storage.MessageRecord) messageJSON {
+	return messageJSON{
+		MessageID: r.MessageID, ChatType: r.ChatType, ChatID: r.ChatID,
+		Direction: r.Direction, UserID: r.UserID,
+		SenderName: r.SenderName, Text: cqImageRe.ReplaceAllString(r.RawMessage, "[图片]"),
+		RawMessage: r.RawMessage, Time: r.Time, Recalled: r.Recalled,
+	}
+}
+
+// queryInt 解析整型查询参数：缺失/非法/非正数用默认值，超出上限截到 max。
+func queryInt(r *http.Request, key string, def, max int) int {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// writeJSON 序列化响应；编码失败只记日志（响应头已发出）。
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Warn("WebUI 响应序列化失败", "err", err)
+	}
+}
+
+// handleChats GET /api/chats 会话摘要列表；store 未启用返回空数组。
+func handleChats(w http.ResponseWriter, r *http.Request) {
+	sums := []storage.ChatSummary{}
+	if s := storeProvider(); s != nil {
+		out, err := s.ChatSummaries()
+		if err != nil {
+			slog.Warn("WebUI 会话列表查询失败", "err", err)
+			http.Error(w, "查询会话列表失败", http.StatusInternalServerError)
+			return
+		}
+		sums = out
+	}
+	writeJSON(w, sums)
+}
+
+// handleMessages GET /api/messages?chat_type&chat_id&limit&before_time
+// 分页查询某会话消息（新→旧）；before_time 为可选游标（只取 time < 该值）。
+func handleMessages(w http.ResponseWriter, r *http.Request) {
+	chatType := r.URL.Query().Get("chat_type")
+	chatIDStr := r.URL.Query().Get("chat_id")
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if chatType == "" || chatIDStr == "" || err != nil || chatID == 0 {
+		http.Error(w, "chat_type 与 chat_id 为必填参数", http.StatusBadRequest)
+		return
+	}
+	f := storage.MessageFilter{
+		ChatType: chatType,
+		ChatID:   chatID,
+		Limit:    queryInt(r, "limit", 50, 200),
+	}
+	if b := r.URL.Query().Get("before_time"); b != "" {
+		before, err := strconv.ParseFloat(b, 64)
+		if err != nil {
+			http.Error(w, "before_time 应为 unix 秒数字", http.StatusBadRequest)
+			return
+		}
+		if before > 0 {
+			f.Until = time.UnixMilli(int64(before * 1000))
+		}
+	}
+	s := storeProvider()
+	if s == nil {
+		writeJSON(w, []messageJSON{})
+		return
+	}
+	rows, err := s.QueryMessages(f)
+	if err != nil {
+		slog.Warn("WebUI 消息查询失败", "err", err)
+		http.Error(w, "查询消息失败", http.StatusInternalServerError)
+		return
+	}
+	out := make([]messageJSON, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toMessageJSON(row))
+	}
+	writeJSON(w, out)
+}
+
+// searchRequest POST /api/search 请求体。
+type searchRequest struct {
+	Query    string `json:"query"`
+	ChatType string `json:"chat_type"`
+	ChatID   int64  `json:"chat_id"`
+	Limit    int    `json:"limit"`
+}
+
+// handleSearch POST /api/search 全文搜索；body 缺失/非法或 query 为空 → 400。
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req searchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		http.Error(w, "query 不能为空", http.StatusBadRequest)
+		return
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	f := storage.MessageFilter{ChatType: req.ChatType, ChatID: req.ChatID, Limit: limit}
+	s := storeProvider()
+	if s == nil {
+		writeJSON(w, []messageJSON{})
+		return
+	}
+	rows, err := s.SearchMessages(req.Query, f)
+	if err != nil {
+		slog.Warn("WebUI 搜索失败", "err", err)
+		http.Error(w, "搜索失败", http.StatusInternalServerError)
+		return
+	}
+	out := make([]messageJSON, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toMessageJSON(row))
+	}
+	writeJSON(w, out)
+}
+
+// handleEvents GET /api/events?after=N 思考链事件增量（agent 未启用为空数组）。
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	after := queryInt(r, "after", 0, int(^uint(0)>>1))
+	events := agent.EventsAfter(uint64(after))
+	out := make([]agent.Event, 0, len(events))
+	out = append(out, events...)
+	writeJSON(w, out)
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -898,6 +899,98 @@ func TestBuildHistoryImageRowDropsFailedImage(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestBuildHistoryImageWindowLastFive 只有从末尾数最后 5 条历史行（按行计数）
+// 走多模态转换：7 条带图历史 → 仅最后 5 条 content 是数组，前 2 条（窗口外）
+// 保持纯文本——文本已含 [图片] 标注，更早的图不让模型直接看（按需用
+// view_message_images 查看）。
+func TestBuildHistoryImageWindowLastFive(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  boolPtr(true),
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	imgSrv, _ := servePNG(t, "image/png")
+	imgURL := imgSrv.URL + "/a.png"
+
+	base := time.Unix(1762400000, 0)
+	for i := 1; i <= 7; i++ {
+		putRecordFull(t, s, &storage.MessageRecord{
+			MessageID: int64(i), Direction: "recv", ChatType: "group", ChatID: 928952016,
+			UserID: 10001, SenderName: "小明",
+			RawMessage: "[CQ:image,file=a.image,subType=0,url=" + imgURL + "] 图" + strconv.Itoa(i),
+			Segments:   []byte(`[{"type":"image","data":{"file":"a.image","url":"` + imgURL + `"}}]`),
+			Time:       float64(base.Add(time.Duration(i) * time.Second).Unix()),
+		})
+	}
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
+	if len(msgs) != 8 {
+		t.Fatalf("应返回 system+7 条历史, got %d", len(msgs))
+	}
+	// 前 2 条（窗口外）保持 string
+	for i := 1; i <= 2; i++ {
+		if got, ok := msgs[i].Content.(string); !ok {
+			t.Errorf("窗口外带图历史 msgs[%d] 应保持纯文本, got %T", i, msgs[i].Content)
+		} else if !strings.Contains(got, "[图片]") {
+			t.Errorf("窗口外带图历史文本应含 [图片] 标注: %q", got)
+		}
+	}
+	// 最后 5 条（窗口内）是数组
+	for i := 3; i <= 7; i++ {
+		if _, ok := msgs[i].Content.([]ContentPart); !ok {
+			t.Errorf("窗口内带图历史 msgs[%d] 应为多模态数组, got %T", i, msgs[i].Content)
+		}
+	}
+}
+
+// TestBuildHistoryImageWindowCountsAllLines 窗口按行计数、与是否带图无关：
+// 6 条历史只有第 1、6 条带图（其余纯文本）→ 窗口是第 2..6 条行，第 1 条带图行
+// 在窗口外必须保持纯文本（若按"最近 5 张带图行"计数它就会错误地变成数组）。
+func TestBuildHistoryImageWindowCountsAllLines(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		Multimodal:  boolPtr(true),
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	imgSrv, _ := servePNG(t, "image/png")
+	imgURL := imgSrv.URL + "/a.png"
+
+	base := time.Unix(1762400000, 0)
+	for i := 1; i <= 6; i++ {
+		rec := &storage.MessageRecord{
+			MessageID: int64(i), Direction: "recv", ChatType: "group", ChatID: 928952016,
+			UserID: 10001, SenderName: "小明",
+			Time: float64(base.Add(time.Duration(i) * time.Second).Unix()),
+		}
+		if i == 1 || i == 6 {
+			rec.RawMessage = "[CQ:image,file=a.image,subType=0,url=" + imgURL + "] 图" + strconv.Itoa(i)
+			rec.Segments = []byte(`[{"type":"image","data":{"file":"a.image","url":"` + imgURL + `"}}]`)
+		} else {
+			rec.RawMessage = fmt.Sprintf("纯文本 %d", i)
+		}
+		putRecordFull(t, s, rec)
+	}
+
+	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
+	if len(msgs) != 7 {
+		t.Fatalf("应返回 system+6 条历史, got %d", len(msgs))
+	}
+	if _, ok := msgs[1].Content.([]ContentPart); ok {
+		t.Errorf("第 1 条带图行在窗口外（第 6 条/共 6 条）应保持纯文本, got 数组: %#v", msgs[1].Content)
+	}
+	if _, ok := msgs[6].Content.([]ContentPart); !ok {
+		t.Errorf("第 6 条带图行在窗口内应为数组, got %T", msgs[6].Content)
+	}
+}
 
 // TestMultimodalDropsFailedImages 图片下载失败时该 image_url 部分应被剔除
 // （保留文本行），绝不能把注定加载失败的原始 URL 交给提供商——否则整个请求

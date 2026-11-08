@@ -42,6 +42,10 @@ type Turn struct {
 	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入 system 尾部
 	Notes       []Note        // 思考笔记（manager 从 notes.json 读出），注入末尾 user 块头部
 	NewMessages []TurnMessage // 每条自带所属会话（历史已跨会话混合）
+	// pendingImages 本轮工具（view_message_images）申请查看的图片，data URL
+	// 形态。工具 Run 追加，handleTurn 在每轮工具执行完后把它们作为一条 user
+	// 多模态消息附加进思维链并清空。仅会话串行 worker 内读写，无并发。
+	pendingImages []string
 }
 
 // TurnMessage 本轮防抖窗口内的一条新消息。
@@ -72,6 +76,10 @@ type DefaultBuilder struct {
 	multimodal bool        // P2.7：开启时带图片的消息行以多模态内容直送模型
 	images     *imageCache // P3-3：图片 URL → base64 data URL 本地下载缓存（多会话 worker 共享）
 }
+
+// Images 暴露图片下载缓存（manager 的 view_message_images 工具与历史多模态
+// 共用同一份正/负缓存）。
+func (b *DefaultBuilder) Images() *imageCache { return b.images }
 
 // 编译期保证 DefaultBuilder 满足接口。
 var _ ContextBuilder = (*DefaultBuilder)(nil)
@@ -173,6 +181,13 @@ func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
 	return msgs
 }
 
+// historyImageWindow 历史里允许走多模态转换的行窗口：只有从末尾数最后
+// historyImageWindow 条历史行（无论是否带图，按行计数）才把图片转成
+// image_url 部分，更早的带图行保持纯文本（文本已含 [图片] 标注）——旧图
+// 的 rkey 多半已过期，逐条下载既拖慢组装又撑大上下文；要看更早的图由模型
+// 调 view_message_images(message_id) 按需查看。
+const historyImageWindow = 5
+
 // appendHistory 查询并追加跨会话混合的历史消息（不按 chat 过滤，全局按时间
 // 取最近 N 条），按时间正序（旧→新）。默认排除已撤回；查询失败时告警，
 // 本轮不带历史继续对话。
@@ -199,7 +214,7 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		}
 		records = records[drop:]
 	}
-	for _, r := range records {
+	for i, r := range records {
 		isSelf := r.Direction == "sent"
 		role := "user"
 		if isSelf {
@@ -211,9 +226,17 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		// P2.7 多模态：仅 user 行（收到的消息）携带图片内容；assistant 行保持
 		// 纯文本（OpenAI 兼容 API 不接受 assistant 消息里的 image_url）。
 		// 无图行保持纯 string，wire 字节不变（缓存前缀稳定）。
+		// 图片按需上传策略：只有从末尾数最后 historyImageWindow 条行（无论
+		// 是否带图，按行计数）才多模态化；更早的带图行保持纯文本，但同样把
+		// [CQ:image,...] 换成 [图片] 标注（模型据此知道该行带过图）。
 		if b.multimodal && role == "user" {
 			if urls := extractImageURLs(r.Segments); len(urls) > 0 {
-				content = b.multimodalContent(replaceImageCQ(line), urls)
+				text := replaceImageCQ(line)
+				if len(records)-i <= historyImageWindow {
+					content = b.multimodalContent(text, urls)
+				} else {
+					content = text
+				}
 			}
 		}
 		*msgs = append(*msgs, ChatMessage{Role: role, Content: content})

@@ -91,30 +91,27 @@ func TestImageCacheDataURLCachesSingleRequest(t *testing.T) {
 	}
 }
 
-// TestImageCacheDataURLServerErrorFallsBackAndNotCached 非 2xx（500）→ 返回
-// 原 url；失败结果不缓存——服务恢复后再次调用能成功下载。
-func TestImageCacheDataURLServerErrorFallsBackAndNotCached(t *testing.T) {
-	var failing atomic.Bool
-	failing.Store(true)
+// TestImageCacheDataURLNegativeCache 失败结果进负缓存（哨兵 ""）：同一 url
+// 第二次调用命中负缓存、不再发 HTTP 请求（计数器恒 1），仍回退原 url。
+// 正/负缓存均不淘汰——rkey 过期的死链在这个进程内注定永远失败。
+func TestImageCacheDataURLNegativeCache(t *testing.T) {
+	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failing.Load() {
-			http.Error(w, "boom", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write(pngBytes)
+		hits.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)
 	c := newImageCache()
 	u := srv.URL + "/a.png"
 
 	if got := c.dataURL(u); got != u {
-		t.Errorf("500 时应回退原 url, got %q", got)
+		t.Errorf("失败应回退原 url, got %q", got)
 	}
-
-	failing.Store(false)
-	if got := c.dataURL(u); got != pngDataURL {
-		t.Errorf("失败结果不应被缓存, 服务恢复后应成功: got %q", got)
+	if got := c.dataURL(u); got != u {
+		t.Errorf("负缓存命中仍应回退原 url, got %q", got)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("HTTP 请求数 = %d, want 1（失败已进负缓存,第二次不应再发请求）", hits.Load())
 	}
 }
 

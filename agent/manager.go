@@ -77,6 +77,11 @@ type Manager struct {
 	notesPath string
 	statePath string
 
+	// images 图片下载缓存：与 builder 的历史多模态共用同一份（正/负缓存
+	// 跨 builder 与 view_message_images 工具共享）；自定义 builder（测试桩）
+	// 无缓存时 manager 自建。
+	images *imageCache
+
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
 	mu       sync.Mutex // 保护 sessions 及其中 pending/timer
@@ -99,6 +104,13 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 		statePath: defaultStatePath,
 		sessions:  make(map[string]*session),
 		events:    NewEventLog(),
+	}
+	// 图片缓存：优先复用 DefaultBuilder 自带的（历史多模态与工具共享
+	// 正/负缓存）；其他 builder（测试桩）没有缓存，manager 自建一份。
+	if db, ok := builder.(*DefaultBuilder); ok {
+		m.images = db.Images()
+	} else {
+		m.images = newImageCache()
 	}
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
@@ -271,7 +283,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			break
 		}
 	}
-	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin, turn, m.timerStore)
+	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin, turn, m.timerStore, m.images)
 	defs := toolDefs(tools)
 	maxRounds := m.cfg.MaxToolRounds
 	if maxRounds <= 0 {
@@ -348,6 +360,20 @@ func (m *Manager) handleTurn(turn *Turn) {
 			}
 			results = append(results, result)
 			msgs = append(msgs, ChatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
+		}
+		// P3-4 图片按需上传：本轮工具（view_message_images）申请查看的图片，
+		// 在工具执行完当轮追加为一条 user 多模态消息（下一轮 LLM 请求即可见），
+		// 随后清空。pendingImages 只在本会话的串行 worker（handleTurn）内
+		// 读写——Enqueue 只写 TurnMessage、其他会话各有 worker，顺序执行
+		// 无并发问题。
+		if len(turn.pendingImages) > 0 {
+			parts := make([]ContentPart, 0, len(turn.pendingImages)+1)
+			parts = append(parts, ContentPart{Type: "text", Text: "这是你刚才要求查看的图片"})
+			for _, du := range turn.pendingImages {
+				parts = append(parts, imagePart(du))
+			}
+			msgs = append(msgs, ChatMessage{Role: "user", Content: parts})
+			turn.pendingImages = nil
 		}
 		if m.cfg.Debug {
 			m.dumpDebug(turn, req, round, resp, results, nil, false)

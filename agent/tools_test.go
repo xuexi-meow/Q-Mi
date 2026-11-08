@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -35,19 +37,20 @@ func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
 // testToolSet 用临时 notes/state 路径构造工具集，避免测试污染 agent/ 目录。
 // 默认非管理员（isAdmin=false）；需要管理员视角用 testToolSetAdmin。
 // 不带计时器与 chat 上下文（schedule/cancel_timer 应报「定时器不可用」）。
+// images 为图片下载缓存（view_message_images 用），按需注入。
 func testToolSet(t *testing.T, store *storage.Store) ([]Tool, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	notesPath := filepath.Join(dir, "notes.json")
 	statePath := filepath.Join(dir, "state.json")
-	return newToolSet(store, notesPath, statePath, false, nil, nil), notesPath, statePath
+	return newToolSet(store, notesPath, statePath, false, nil, nil, nil), notesPath, statePath
 }
 
 // testToolSetAdmin 管理员视角的工具集（危险工具放行）。
 func testToolSetAdmin(t *testing.T) []Tool {
 	t.Helper()
 	dir := t.TempDir()
-	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true, nil, nil)
+	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true, nil, nil, nil)
 }
 
 // testToolSetWithTimers 带真实 TimerStore（临时路径）与 chat 上下文 turn 的
@@ -59,7 +62,17 @@ func testToolSetWithTimers(t *testing.T) ([]Tool, *TimerStore) {
 	statePath := filepath.Join(dir, "state.json")
 	timer := NewTimerStore(filepath.Join(dir, "timers.json"), func(ScheduledTimer) {})
 	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
-	return newToolSet(nil, notesPath, statePath, false, turn, timer), timer
+	return newToolSet(nil, notesPath, statePath, false, turn, timer, nil), timer
+}
+
+// testToolSetForViewImages 带 store、chat 上下文 turn 与图片缓存的工具集
+// （view_message_images 测试用），返回工具集与工具会写入的 turn。
+func testToolSetForViewImages(t *testing.T, store *storage.Store, images *imageCache) ([]Tool, *Turn) {
+	t.Helper()
+	dir := t.TempDir()
+	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
+	return newToolSet(store, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"),
+		false, turn, nil, images), turn
 }
 
 // findTool 按名字取工具。
@@ -101,7 +114,7 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 
 // wantToolNames P2 核心工具 + P3-2 QQ 能力工具（顺序即工具集顺序，help 恒在末尾）。
 var wantToolNames = []string{
-	"get_recent_messages", "search_messages",
+	"get_recent_messages", "search_messages", "view_message_images",
 	"send_message", "think", "update_mood",
 	// 表情收藏与发送
 	"save_sticker", "list_stickers", "delete_sticker", "collect_qq_sticker",
@@ -1000,4 +1013,151 @@ func TestDeleteQzoneTool(t *testing.T) {
 	if nap.count() != 1 {
 		t.Errorf("tid 空不应发请求, got %d", nap.count())
 	}
+}
+
+// ================= view_message_images：按需查看历史消息图片 =================
+
+// putImageRecord 写入一条带 image 段（url+file）的消息记录。
+func putImageRecord(t *testing.T, s *storage.Store, id int64, url, file string) {
+	t.Helper()
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: id, Direction: "recv", ChatType: "group", ChatID: 888, UserID: 10001,
+		SenderName: "小明",
+		RawMessage: "[CQ:image,file=" + file + ",subType=0,url=" + url + "]",
+		Segments:   []byte(`[{"type":"image","data":{"file":"` + file + `","url":"` + url + `"}}]`),
+		Time:       1762400000,
+	})
+}
+
+// deadImageHost 起一个全部请求 404 的假图床。
+func deadImageHost(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestViewMessageImagesDirectSuccess 直连成功：消息段 url 在假图床上可下载 →
+// 工具返回 JSON（total/attached/note），turn.pendingImages 得到 data URL；
+// 全程不调 NapCat（无 get_image 换链）。
+func TestViewMessageImagesDirectSuccess(t *testing.T) {
+	s := openTestStore(t)
+	imgSrv, _ := servePNG(t, "image/png")
+	putImageRecord(t, s, 7, imgSrv.URL+"/a.png", "ABC.image")
+	napcat := startP3NapCat(t, func(path string, body map[string]any) any {
+		t.Errorf("直连成功不应调用 NapCat, got %s", path)
+		return nil
+	})
+	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+
+	out := runToolOK(t, tools, "view_message_images", `{"message_id":7}`)
+	obj := objOf(t, out)
+	if obj["total"] != float64(1) || obj["attached"] != float64(1) {
+		t.Errorf("输出 total/attached = %v/%v, want 1/1: %s", obj["total"], obj["attached"], out)
+	}
+	note, _ := obj["note"].(string)
+	if !strings.Contains(note, "已附在下一条消息") {
+		t.Errorf("note 应注明图片附在下一条消息: %q", note)
+	}
+	if napcat.count() != 0 {
+		t.Errorf("直连成功不应调 NapCat, got %d 次", napcat.count())
+	}
+	if len(turn.pendingImages) != 1 {
+		t.Fatalf("pendingImages 应有 1 张, got %d", len(turn.pendingImages))
+	}
+	if !strings.HasPrefix(turn.pendingImages[0], "data:image/png;base64,") {
+		t.Errorf("pendingImages[0] 应为 png data URL: %q", turn.pendingImages[0][:40])
+	}
+}
+
+// TestViewMessageImagesGetImageChainSwitch 直连失败（原 url 死链）→ get_image
+// 换链成功：NapCat /get_image 收到 file 参数，返回新 url，新 url 下载成功。
+func TestViewMessageImagesGetImageChainSwitch(t *testing.T) {
+	s := openTestStore(t)
+	// 假图床：/old/* 死链，/new/* 提供新链（rkey 换新场景）
+	mux := http.NewServeMux()
+	mux.HandleFunc("/old/", http.NotFoundHandler().ServeHTTP)
+	mux.HandleFunc("/new/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(pngBytes)
+	})
+	imgSrv := httptest.NewServer(mux)
+	t.Cleanup(imgSrv.Close)
+	putImageRecord(t, s, 8, imgSrv.URL+"/old/a.png", "ABC.image")
+
+	napcat := startP3NapCat(t, func(path string, body map[string]any) any {
+		if path == "/get_image" {
+			if str(t, body, "file") != "ABC.image" {
+				t.Errorf("get_image 请求 file = %v, want ABC.image", body["file"])
+			}
+			// NapCat 在 WSL：file 是本地路径读不了，url 是换新后的下载链接
+			return map[string]any{"file": "/mnt/napcat/ABC.png", "url": imgSrv.URL + "/new/a.png"}
+		}
+		return nil
+	})
+	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+
+	out := runToolOK(t, tools, "view_message_images", `{"message_id":8}`)
+	obj := objOf(t, out)
+	if obj["total"] != float64(1) || obj["attached"] != float64(1) {
+		t.Errorf("输出 total/attached = %v/%v, want 1/1: %s", obj["total"], obj["attached"], out)
+	}
+	if napcat.count() != 1 || napcat.path(0) != "/get_image" {
+		t.Fatalf("应恰好调 1 次 /get_image, got %v", napcat.paths)
+	}
+	if len(turn.pendingImages) != 1 || !strings.HasPrefix(turn.pendingImages[0], "data:image/png;base64,") {
+		t.Fatalf("pendingImages 应有 1 张换链成功的 data URL, got %v", turn.pendingImages)
+	}
+}
+
+// TestViewMessageImagesDoubleFailureSkips 双失败跳过：原 url 死链且 get_image
+// 只返回本地路径（url=file 同为 WSL 路径，Q-Mi 读不了）→ 该图跳过并在输出里
+// 注明，pendingImages 不含该图；跳过不是报错（其他图可能成功）。
+func TestViewMessageImagesDoubleFailureSkips(t *testing.T) {
+	s := openTestStore(t)
+	host := deadImageHost(t)
+	putImageRecord(t, s, 9, host.URL+"/dead.png", "ABC.image")
+	napcat := startP3NapCat(t, func(path string, body map[string]any) any {
+		if path == "/get_image" {
+			// 文档：url 缺省回退为本地 downloadPath，读不了
+			return map[string]any{"file": "/mnt/napcat/ABC.png", "url": "/mnt/napcat/ABC.png"}
+		}
+		return nil
+	})
+	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+
+	out := runToolOK(t, tools, "view_message_images", `{"message_id":9}`)
+	obj := objOf(t, out)
+	if obj["total"] != float64(1) || obj["attached"] != float64(0) {
+		t.Errorf("输出 total/attached = %v/%v, want 1/0: %s", obj["total"], obj["attached"], out)
+	}
+	skipped, ok := obj["skipped"].([]any)
+	if !ok || len(skipped) != 1 {
+		t.Fatalf("双失败应输出 1 条 skipped 注明: %s", out)
+	}
+	if napcat.count() != 1 {
+		t.Errorf("应调 1 次 get_image 换链, got %d", napcat.count())
+	}
+	if len(turn.pendingImages) != 0 {
+		t.Errorf("双失败不应有 pendingImages, got %v", turn.pendingImages)
+	}
+}
+
+// TestViewMessageImagesNoImageErrors 消息里没有 image 段 → 报错（不是空结果）。
+func TestViewMessageImagesNoImageErrors(t *testing.T) {
+	s := openTestStore(t)
+	putRecordFull(t, s, &storage.MessageRecord{
+		MessageID: 10, Direction: "recv", ChatType: "group", ChatID: 888, UserID: 10001,
+		SenderName: "小明", RawMessage: "纯文本消息", Time: 1762400000,
+	})
+	startP3NapCat(t, func(string, map[string]any) any { return nil })
+	tools, _ := testToolSetForViewImages(t, s, newImageCache())
+
+	err := runToolErr(t, tools, "view_message_images", `{"message_id":10}`)
+	if !strings.Contains(err.Error(), "没有图片") {
+		t.Errorf("无图应报「没有图片」: %v", err)
+	}
+	// message_id 缺失 / 未知消息同样报错
+	runToolErr(t, tools, "view_message_images", `{}`)
+	runToolErr(t, tools, "view_message_images", `{"message_id":404}`)
 }

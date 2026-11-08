@@ -8,6 +8,10 @@
 // 同 URL 的二次访问很少，淘汰收益有限；进程常驻场景下单实例、图片低频，进程
 // 重启即清零。下载在 builder 所在 worker goroutine 内同步进行——阻塞思考循环
 // 等待图片是有意行为（模型需要图片内容才能回复）。
+//
+// 负缓存：下载失败的 url 以空串哨兵缓存，get 命中哨兵直接视为已知失败立即
+// 返回错误（不再发 HTTP）——rkey 过期的死链在本进程内注定永远失败，重试只
+// 会白等 10s 超时。正/负缓存均不淘汰，与上述"不做淘汰"一致。
 package agent
 
 import (
@@ -50,7 +54,8 @@ func newImageCacheWithClient(client *http.Client) *imageCache {
 	}
 }
 
-// get 查缓存，键为完整 URL。
+// get 查缓存，键为完整 URL。命中空串哨兵 = 已缓存的失败（负缓存），
+// 返回 ("", true)。
 func (c *imageCache) get(url string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,26 +63,31 @@ func (c *imageCache) get(url string) (string, bool) {
 	return v, ok
 }
 
-// put 写缓存，键为完整 URL。
+// put 写缓存，键为完整 URL。写入空串哨兵即登记负缓存（已知失败）。
 func (c *imageCache) put(url, dataURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.m[url] = dataURL
 }
 
-// dataURL 返回 url 对应的 base64 data URL：命中缓存直接返回；未命中则下载，
-// 成功转 data:<mime>;base64,<...> 并缓存；任何失败（超时/超限/非 2xx/内容
-// 无法识别）返回原 url 且不缓存失败结果。nil 接收器与空 url 原样透传。
+// dataURL 返回 url 对应的 base64 data URL：命中缓存直接返回（空串哨兵 =
+// 已缓存的失败，立即回退原 url、不再发 HTTP）；未命中则下载，成功转
+// data:<mime>;base64,<...> 并缓存，任何失败（超时/超限/非 2xx/内容无法
+// 识别）登记负缓存后返回原 url。nil 接收器与空 url 原样透传。
 func (c *imageCache) dataURL(url string) string {
 	if c == nil || url == "" {
 		return url
 	}
 	if v, ok := c.get(url); ok {
+		if v == "" { // 负缓存哨兵：已知失败，不再重试 HTTP
+			return url
+		}
 		return v
 	}
 	data, mime, err := c.download(url)
 	if err != nil {
-		slog.Warn("图片下载失败，回退原始 URL", "url", url, "err", err)
+		slog.Warn("图片下载失败，回退原始 URL（已记入负缓存）", "url", url, "err", err)
+		c.put(url, "") // 负缓存：失败结果也缓存，避免每次都白等超时
 		return url
 	}
 	du := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)

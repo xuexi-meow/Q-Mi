@@ -81,8 +81,9 @@ func intProp(desc string) map[string]any {
 // 查询类工具返回 error。isAdmin 由 manager 按 turn 发送者是否管理员判定，
 // 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
 // turn 为本轮 chat 上下文（schedule 从中捕获会话，可为 nil）；timer 为
-// 计时器存储（P3.5，nil 时 schedule/cancel_timer 返回 error）。
-func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore) []Tool {
+// 计时器存储（P3.5，nil 时 schedule/cancel_timer 返回 error）；images 为
+// 图片下载缓存（view_message_images 用，nil 时该工具报错）。
+func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore, images *imageCache) []Tool {
 	// schedule 的会话上下文在构造期从 turn 捕获（工具 Run 拿不到 turn）。
 	var curChatType string
 	var curChatID, curSelfID int64
@@ -155,6 +156,115 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					ChatID:   p.ChatID,
 					Limit:    limit,
 				}, p.Query)
+			},
+		},
+		{
+			Name:        "view_message_images",
+			Description: "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。历史上下文只携带最近几条消息的图片，更早的图用它按需查看。",
+			Parameters: objectParams(map[string]any{
+				"message_id": intProp("消息 ID（从聊天记录或上下文里拿）"),
+			}, []string{"message_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法查看消息图片")
+				}
+				if images == nil {
+					return "", errors.New("图片下载缓存不可用，无法查看消息图片")
+				}
+				var p struct {
+					MessageID int64 `json:"message_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.MessageID == 0 {
+					return "", fmt.Errorf("message_id 不能为 0")
+				}
+				rec, err := store.GetMessage(p.MessageID)
+				if err != nil {
+					return "", fmt.Errorf("查询消息 %d 失败: %w", p.MessageID, err)
+				}
+				if rec == nil {
+					return "", fmt.Errorf("没有找到消息 %d", p.MessageID)
+				}
+				// 解析 image 段：url 供直连下载，file 留作 get_image 换链
+				var segs []struct {
+					Type string `json:"type"`
+					Data struct {
+						URL  string `json:"url"`
+						File string `json:"file"`
+					} `json:"data"`
+				}
+				if len(rec.Segments) > 0 {
+					if err := json.Unmarshal(rec.Segments, &segs); err != nil {
+						return "", fmt.Errorf("解析消息 %d 的消息段失败: %w", p.MessageID, err)
+					}
+				}
+				type imgSeg struct{ url, file string }
+				var imgs []imgSeg
+				for _, seg := range segs {
+					if seg.Type != "image" || (seg.Data.URL == "" && seg.Data.File == "") {
+						continue
+					}
+					imgs = append(imgs, imgSeg{url: seg.Data.URL, file: seg.Data.File})
+				}
+				if len(imgs) == 0 {
+					return "", fmt.Errorf("消息 %d 里没有图片", p.MessageID)
+				}
+				// 逐张取 data URL：原 url 直连下载 → 失败走 NapCat get_image
+				// 换新链 → 仍不可用（如换链只给 NapCat 侧本地路径，跨 WSL
+				// 读不了）则该图跳过并在结果里注明。
+				var (
+					dus   []string
+					skips []string
+				)
+				for i, img := range imgs {
+					du := ""
+					if img.url != "" {
+						du = images.dataURL(img.url) // 成功必为 data: 前缀；失败回退原 url
+					}
+					if !strings.HasPrefix(du, "data:") && img.file != "" {
+						if data, err := callNapCat(&api.GetImage{File: img.file}); err == nil {
+							var gi struct {
+								File string `json:"file"`
+								URL  string `json:"url"`
+							}
+							if jerr := json.Unmarshal(data, &gi); jerr == nil && isDownloadableURL(gi.URL) {
+								if d2 := images.dataURL(gi.URL); strings.HasPrefix(d2, "data:") {
+									du = d2
+								}
+							}
+						}
+					}
+					if !strings.HasPrefix(du, "data:") {
+						switch {
+						case img.url == "":
+							skips = append(skips, fmt.Sprintf("第 %d 张：消息段缺 url，换链也未取得可用链接", i+1))
+						case img.file == "":
+							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 下载失败且消息段没有 file 可换链", i+1))
+						default:
+							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 与 get_image 换链均不可用（可能只有 NapCat 侧本地路径），已跳过", i+1))
+						}
+						continue
+					}
+					dus = append(dus, du)
+					if turn != nil {
+						turn.pendingImages = append(turn.pendingImages, du)
+					}
+				}
+				note := fmt.Sprintf("共 %d 张图片，已附在下一条消息", len(imgs))
+				if len(dus) < len(imgs) {
+					note = fmt.Sprintf("共 %d 张图片，其中 %d 张已附在下一条消息（其余已跳过，见 skipped）", len(imgs), len(dus))
+				}
+				out := map[string]any{
+					"total":    len(imgs),
+					"attached": len(dus),
+					"note":     note,
+				}
+				if len(skips) > 0 {
+					out["skipped"] = skips
+				}
+				return marshalCompact(out)
 			},
 		},
 		{
@@ -908,6 +1018,14 @@ func callNapCat(req api.Request) (json.RawMessage, error) {
 		return nil, err
 	}
 	return resp.Data, nil
+}
+
+// isDownloadableURL 判断是否为 Q-Mi 可直接下载的 http(s) 链接。NapCat 的
+// get_image 在拿不到图片外链时 url 字段会回退为 NapCat 侧本地路径（NapCat
+// 常驻 WSL、Q-Mi 在 Windows，跨系统读不了），不能当下载链接用。
+func isDownloadableURL(s string) bool {
+	low := strings.ToLower(s)
+	return strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://")
 }
 
 // downloadFilePath 从 download_file 的 data 里取本地文件路径：

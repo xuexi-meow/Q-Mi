@@ -401,3 +401,73 @@ func TestEnqueueCarriesImagesIntoTurn(t *testing.T) {
 		t.Errorf("TurnMessage.Images = %v, want %v", got, want)
 	}
 }
+
+// TestHandleTurnAttachesPendingImagesAfterTools 工具（view_message_images）成功
+// 后 pendingImages 非空 → 当轮工具执行完即追加一条 user 多模态消息（text
+// 「这是你刚才要求查看的图片」+ image_url data URL）进 msgs 并清空
+// pendingImages，下一轮 LLM 请求可见图片。pendingImages 只在本会话串行
+// worker（handleTurn）内读写，顺序执行无并发问题。
+func TestHandleTurnAttachesPendingImagesAfterTools(t *testing.T) {
+	b := &stubBuilder{}
+	cfg := testCfg(20 * time.Millisecond)
+	script := []string{
+		toolCallResp("c1", "view_message_images", `{"message_id":7}`),
+		toolCallResp("c2", "finish", ""),
+	}
+	s := openTestStore(t)
+	imgSrv, _ := servePNG(t, "image/png")
+	putImageRecord(t, s, 7, imgSrv.URL+"/a.png", "ABC.image")
+	m, f, _ := newLoopManager(t, cfg, b, s, script)
+
+	m.Enqueue(msg("group", 888, "看看那张图"))
+	waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "图片应随下一轮请求送出")
+	time.Sleep(150 * time.Millisecond)
+	if got := f.count(); got != 2 {
+		t.Fatalf("finish 后循环应终止, LLM 请求数 = %d, want 2", got)
+	}
+
+	// 请求2：user, assistant(c1), tool(c1), user(图片)
+	msgs := f.reqs[1].Messages
+	if len(msgs) != 4 {
+		t.Fatalf("请求2 应有 4 条消息, got %d: %+v", len(msgs), msgs)
+	}
+	tool := msgs[2]
+	if tool.Role != "tool" || tool.ToolCallID != "c1" || !strings.Contains(contentText(tool), "已附在下一条消息") {
+		t.Errorf("view_message_images 的 tool 消息 = %+v (%s)", tool, contentText(tool))
+	}
+	imgMsg := msgs[3]
+	if imgMsg.Role != "user" {
+		t.Fatalf("图片消息 role = %q, want user", imgMsg.Role)
+	}
+	// fakeLLM 收到的是 JSON 反序列化后的 wire 形态（[]any + map）
+	arr, ok := imgMsg.Content.([]any)
+	if !ok {
+		t.Fatalf("图片消息 content 应为多模态数组, got %T: %#v", imgMsg.Content, imgMsg.Content)
+	}
+	if len(arr) != 2 {
+		t.Fatalf("图片消息应有 text+image_url 两部分, got %d: %#v", len(arr), arr)
+	}
+	p0, ok := arr[0].(map[string]any)
+	if !ok || p0["type"] != "text" {
+		t.Fatalf("parts[0] 应为 text, got %#v", arr[0])
+	}
+	if text, _ := p0["text"].(string); !strings.Contains(text, "这是你刚才要求查看的图片") {
+		t.Errorf("text 部分不符: %q", text)
+	}
+	p1, ok := arr[1].(map[string]any)
+	if !ok || p1["type"] != "image_url" {
+		t.Fatalf("parts[1] 应为 image_url, got %#v", arr[1])
+	}
+	iu, ok := p1["image_url"].(map[string]any)
+	if !ok {
+		t.Fatalf("image_url 字段缺失: %#v", p1)
+	}
+	if url, _ := iu["url"].(string); !strings.HasPrefix(url, "data:image/png;base64,") {
+		t.Errorf("image_url 应为 data URL: %.40q", url)
+	}
+
+	// pendingImages 已清空
+	if got := len(b.turn(0).pendingImages); got != 0 {
+		t.Errorf("pendingImages 应已清空, got %d", got)
+	}
+}

@@ -120,6 +120,8 @@ type AgentConfig struct {
 	ImageDir string `yaml:"image_dir" mapstructure:"image_dir"`
 	// WorkspaceDir 文件操作工作区根目录（computer 板块围栏）；空串 = 默认 agent/workspace。
 	WorkspaceDir string `yaml:"workspace_dir" mapstructure:"workspace_dir"`
+	// BrowserExec 浏览器可执行文件路径（browser 板块）；空串 = 自动探测 Chrome/Edge。
+	BrowserExec string `yaml:"browser_executable" mapstructure:"browser_executable"`
 	// Modules 工具板块启停（重启生效，无热插拔）：缺省键 = 启用；
 	// 显式 false 的板块不加载（工具与文档都不出现）。
 	Modules  map[string]bool `yaml:"modules" mapstructure:"modules"`

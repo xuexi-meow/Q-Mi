@@ -86,10 +86,11 @@ type Manager struct {
 	images *imageStore
 
 	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器；
-	// approvals 越界/危险操作审批管理器。
+	// approvals 越界/危险操作审批管理器；browser 浏览器单实例（懒启动）。
 	registry  *ToolRegistry
 	tasks     *TaskManager
 	approvals *ApprovalManager
+	browser   *browserManager
 
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
@@ -124,6 +125,7 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	m.registry = NewRegistry(enabledModules(cfg)...)
 	m.tasks = NewTaskManager(m.deliverTaskResult)
 	m.approvals = NewApprovalManager(m.notifyApproval, m.deliverApprovalResult)
+	m.browser = newBrowserManager(cfg.BrowserExec, defaultBrowserProfileDir)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
 	return m
@@ -386,6 +388,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 		Images:    m.images,
 		Tasks:     m.tasks,
 		Approvals: m.approvals,
+		Browser:   m.browser,
 		Events:    m.events,
 		Workspace: m.cfg.WorkspaceDir,
 		NotesPath: m.notesPath,

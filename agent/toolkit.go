@@ -21,6 +21,7 @@ type ToolContext struct {
 	Timer     *TimerStore      // 可为 nil（schedule/cancel_timer 报错）
 	Images    *imageStore      // 可为 nil（view_message_images/自动带图报错）
 	Tasks     *TaskManager     // 可为 nil（_async/任务管理工具报错）
+	Browser   *browserManager  // 可为 nil（browser_* 工具报错）
 	Approvals *ApprovalManager // 可为 nil（越界/危险操作直接报错）
 	Events    *EventLog        // 可为 nil（self_events 报错）
 	Workspace string           // 文件操作工作区根目录（空 = 默认 agent/workspace）
@@ -216,6 +217,9 @@ func defaultModules() []ToolModule {
 		module{name: "computer", oneliner: "电脑操作：文件读写/下载/命令行",
 			intro: "工作区（默认 agent/workspace）内的文件操作与非危险命令自动执行；工作区外路径或危险命令会向管理员发起审批（回复「同意 <id>」执行）。媒体进出：save_message_media 把消息里的图/视频存进工作区；send_message 的 image/video/file 段与 upload_group_file 可直接使用 download_file/save_message_media 返回的 napcat_path。",
 			tools: computerTools},
+		module{name: "browser", oneliner: "真实浏览器：打开网页/读内容/点击/输入/截图",
+			intro: "真实 Chrome/Edge（无头）。流程：browser_navigate 打开 → browser_read_page 拿正文与可交互元素索引（idx）→ 按 idx 点击/输入 → browser_screenshot 亲眼看页面。截图直接附在消息里，验证操作结果用眼睛而不是猜。",
+			tools: browserTools},
 		module{name: "system", oneliner: "定时器、后台任务管理、行为回溯",
 			tools: systemTools},
 	}

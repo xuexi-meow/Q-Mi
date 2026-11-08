@@ -85,6 +85,10 @@ func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }
 
+func boolProp(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
+}
+
 // memoryTools 记忆板块：历史查询/搜索/消息图片查看。查询结果自动附带最新
 // 几条消息的图片（images_attached 标注）；store/images 为 nil 时工具报错。
 func memoryTools(ctx *ToolContext) []Tool {

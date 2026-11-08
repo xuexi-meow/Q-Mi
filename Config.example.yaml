@@ -29,11 +29,13 @@ agent:
   guide_file: "agent/guide.md"   # agent 行为/格式约束(工具用法细节走 help 工具)
   # image_dir: "agent/images"    # 图片内容寻址缓存目录(sha256 落盘,按消息锚定去重,超 2GB 自动清最旧)；缺省即该路径
   # workspace_dir: "agent/workspace"  # 电脑操作工作区(文件读写/下载的围栏根目录)；缺省即该路径
+  # browser_executable: "C:/Program Files/Google/Chrome/Application/chrome.exe"  # 浏览器路径；缺省自动探测 Chrome/Edge
   # modules:                     # 工具板块启停(重启生效)：缺省键 = 启用，显式 false 不加载
   #   qzone: true
   #   admin: true
   #   sticker: true
   #   computer: true
+  #   browser: true
   debounce: 3s
   self_wake: "10m"       # 定时轮询：缺省 10 分钟一次，"off" 关闭；轮询只是唤醒 agent，发不发言由模型自己决定
   temperature: 0.8

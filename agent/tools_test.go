@@ -158,7 +158,10 @@ var wantToolNames = []string{
 	"napcat_api", "napcat_docs",
 	// system
 	// computer
+	// computer
 	"read_file", "write_file", "list_dir", "delete_file", "download_file", "run_command", "save_message_media",
+	// browser
+	"browser_navigate", "browser_read_page", "browser_click", "browser_type", "browser_scroll", "browser_screenshot",
 	// system
 	"schedule", "cancel_timer", "task_list", "task_get", "task_cancel", "self_events",
 }

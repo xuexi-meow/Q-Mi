@@ -20,7 +20,7 @@ import (
 	// 注册所有事件处理函数(handler 包的 init 里调用 event.Register)
 	_ "Q-Mi/handler"
 	// agent 包在 init 里注册消息事件,把 AI 成员接入管线
-	_ "Q-Mi/agent"
+	"Q-Mi/agent"
 )
 
 func main() {
@@ -95,6 +95,7 @@ func run(ctx context.Context) error {
 			slog.Warn("关闭 WebUI 失败", "err", err)
 		}
 	}
+	agent.CloseBrowser() // 无头浏览器进程随 Q-Mi 退出，不残留
 	if err := c.Server.Shutdown(context.Background()); err != nil {
 		return fmt.Errorf("关闭 HTTP 服务失败: %w", err)
 	}

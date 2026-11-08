@@ -13,3 +13,4 @@ agent/timers.json
 Config.yaml
 agent/images/
 agent/workspace/
+agent/browser-profile/

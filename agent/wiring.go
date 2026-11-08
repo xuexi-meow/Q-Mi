@@ -40,6 +40,7 @@ func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
 	b := NewDefaultBuilder(store, cfg)
 	m := NewManager(b, NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store, cfgQQ)
 	b.SetToolDocs(m.registry.PromptDocs())
+	globalBrowser = m.browser
 	m.StartSelfWake(selfWakeInterval(cfg))
 	return m
 }

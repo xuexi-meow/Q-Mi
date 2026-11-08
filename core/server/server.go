@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"Q-Mi/event"
@@ -73,11 +75,26 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Token != "" {
-		// OneBot HTTP 上报按原始请求体计算 HMAC-SHA1，而非 Bearer 鉴权。
+		// 两种 OneBot HTTP 上报端共用同一 token：
+		// - NapCat：按原始请求体计算 HMAC-SHA1 签名（X-Signature: sha1=<hex>）。
+		// - SnowLuma：OneBot 标准鉴权，Authorization: Bearer <token> 或 ?access_token=<token>。
+		// 任一方式匹配即放行，全部不匹配才返回 401。
 		mac := hmac.New(sha1.New, []byte(s.Token))
 		mac.Write(body)
 		expected := "sha1=" + hex.EncodeToString(mac.Sum(nil))
-		if !hmac.Equal([]byte(expected), []byte(r.Header.Get("X-Signature"))) {
+		authorized := hmac.Equal([]byte(expected), []byte(r.Header.Get("X-Signature")))
+		if !authorized {
+			// Authorization: Bearer <token> 精确匹配（常量时间比较）。
+			auth := r.Header.Get("Authorization")
+			if strings.HasPrefix(auth, "Bearer ") {
+				authorized = subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(s.Token)) == 1
+			}
+		}
+		if !authorized {
+			// URL 查询参数 access_token=<token> 精确匹配（常量时间比较），与请求体无关。
+			authorized = subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("access_token")), []byte(s.Token)) == 1
+		}
+		if !authorized {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

@@ -72,6 +72,53 @@ func TestHandleHTTPValidatesBeforeDispatch(t *testing.T) {
 	}
 }
 
+// OneBot 标准鉴权（SnowLuma）：Authorization: Bearer <token> 或 ?access_token=<token>。
+// 与 NapCat 的 X-Signature HMAC-SHA1 鉴权并存，任一通过即放行。
+func TestHandleHTTPBearerAndQueryTokenAuth(t *testing.T) {
+	key := t.Name() + "." + strconv.FormatInt(time.Now().UnixNano(), 10)
+	received := make(chan struct{}, 10)
+	event.Register(key, func(json.RawMessage) { received <- struct{}{} })
+	s := &Server{Token: "test-secret"}
+	body := `{"post_type":"` + key + `"}`
+	sign := func(payload, secret string) string {
+		mac := hmac.New(sha1.New, []byte(secret))
+		mac.Write([]byte(payload))
+		return "sha1=" + hex.EncodeToString(mac.Sum(nil))
+	}
+	cases := []struct {
+		name, url, bearer, signature, body string
+		status                             int
+	}{
+		{"bearer correct", "/Q-Mi", "Bearer test-secret", "", body, http.StatusOK},
+		{"bearer wrong", "/Q-Mi", "Bearer wrong-token", "", body, http.StatusUnauthorized},
+		{"bearer missing prefix", "/Q-Mi", "test-secret", "", body, http.StatusUnauthorized},
+		{"query access_token correct, body independent", "/Q-Mi?access_token=test-secret", "", "", body, http.StatusOK},
+		{"query access_token correct with bad json body", "/Q-Mi?access_token=test-secret", "", "", `{`, http.StatusBadRequest},
+		{"query access_token wrong", "/Q-Mi?access_token=wrong", "", "", body, http.StatusUnauthorized},
+		{"hmac priority over wrong bearer", "/Q-Mi", "Bearer wrong-token", sign(body, "test-secret"), body, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, tc.url, strings.NewReader(tc.body))
+			if tc.bearer != "" {
+				r.Header.Set("Authorization", tc.bearer)
+			}
+			if tc.signature != "" {
+				r.Header.Set("X-Signature", tc.signature)
+			}
+			w := httptest.NewRecorder()
+			s.handleHTTP(w, r)
+			if w.Code != tc.status {
+				t.Fatalf("status=%d want=%d", w.Code, tc.status)
+			}
+		})
+	}
+	event.Wait()
+	if len(received) != 3 {
+		t.Fatalf("只有合法请求应分发，实际=%d", len(received))
+	}
+}
+
 func TestShutdownStopsListeningAndDrainsEvents(t *testing.T) {
 	key := t.Name() + "." + strconv.FormatInt(time.Now().UnixNano(), 10)
 	started := make(chan struct{})

@@ -731,15 +731,20 @@ func handleMembers(w http.ResponseWriter, r *http.Request) {
 }
 
 // dangerousNapcatActions /api/napcat 直调中需 params.confirm=true 确认的动作
-// 集合（与 agent/tools.go 的 dangerousNapcatActions 同一份清单；该集合未导出，
-// 此处复制维护，见 napcatActionTypes 的重复维护说明）。
+// 集合。基础清单与 agent/tools.go 的 dangerousNapcatActions 同源（该集合未导出，
+// 此处复制维护，见 napcatActionTypes 的重复维护说明）；P4 QQ 空间两项
+// （set_qzone_ban / set_qzone_msg_right）只在 WebUI 侧要求显式确认——账号级
+// 配置改动对人工界面应二次确认，agent 侧未列入管理员门槛。
 var dangerousNapcatActions = map[string]bool{
-	"set_group_kick":  true,
-	"set_group_leave": true,
-	"delete_friend":   true,
-	"set_qq_avatar":   true,
-	"set_qq_profile":  true,
-	"set_group_name":  true,
+	"set_group_kick":      true,
+	"set_group_leave":     true,
+	"delete_friend":       true,
+	"set_qq_avatar":       true,
+	"set_qq_profile":      true,
+	"set_group_name":      true,
+	"delete_qzone_msg":    true,
+	"set_qzone_ban":       true,
+	"set_qzone_msg_right": true,
 }
 
 // napcatActionRegistry 动作名（无 / 前缀）→ 请求结构体类型，与 agent 包

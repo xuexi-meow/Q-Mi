@@ -1205,6 +1205,29 @@ func TestAPINapcatW4(t *testing.T) {
 		t.Errorf("confirm 不应透传给 NapCat: %v", m.Body)
 	}
 
+	// P4：delete_qzone_msg 已入危险集合——无 confirm 400 不触网
+	callsBefore = m.Calls
+	resp, body = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok",
+		`{"action":"delete_qzone_msg","params":{"tid":"t1"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("delete_qzone_msg 无 confirm = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if m.Calls != callsBefore {
+		t.Errorf("delete_qzone_msg 无 confirm 不应触达 NapCat, calls = %d", m.Calls)
+	}
+	// 带 confirm → 放行且 confirm 剥离
+	resp, body = sendJSON(t, http.MethodPost, base+"/api/napcat", "tok",
+		`{"action":"delete_qzone_msg","params":{"tid":"t1","confirm":true}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete_qzone_msg 带 confirm = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if m.Path != "/delete_qzone_msg" || m.Body["tid"] != "t1" {
+		t.Errorf("delete_qzone_msg 透传错误: %s %v", m.Path, m.Body)
+	}
+	if _, has := m.Body["confirm"]; has {
+		t.Errorf("confirm 不应透传给 NapCat: %v", m.Body)
+	}
+
 	// GET 返回白名单全集与危险动作清单（前端下拉用）
 	resp, body = get(t, base+"/api/napcat", "tok")
 	if resp.StatusCode != http.StatusOK {
@@ -1225,7 +1248,10 @@ func TestAPINapcatW4(t *testing.T) {
 			t.Errorf("actions 缺少 %q", want)
 		}
 	}
-	for _, want := range []string{"set_group_kick", "set_group_leave", "delete_friend", "set_qq_avatar", "set_qq_profile", "set_group_name"} {
+	for _, want := range []string{
+		"set_group_kick", "set_group_leave", "delete_friend", "set_qq_avatar",
+		"set_qq_profile", "set_group_name", "delete_qzone_msg", "set_qzone_ban", "set_qzone_msg_right",
+	} {
 		if !containsStr(list.Dangerous, want) {
 			t.Errorf("dangerous 缺少 %q", want)
 		}

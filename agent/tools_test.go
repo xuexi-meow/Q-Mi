@@ -121,6 +121,9 @@ var wantToolNames = []string{
 	"upload_group_file", "get_group_files",
 	// P3-2 万能逃生舱
 	"napcat_api", "napcat_docs",
+	// P4 QQ 空间工具
+	"post_qzone", "browse_qzone_feeds", "read_qzone_post",
+	"qzone_like", "comment_qzone", "qzone_profile", "delete_qzone",
 	// 收尾
 	"help",
 }
@@ -679,5 +682,322 @@ func TestTimerToolsUnavailableWithoutStore(t *testing.T) {
 		if !strings.Contains(err.Error(), "定时器不可用") {
 			t.Errorf("%s 无计时器应报「定时器不可用」, got %v", name, err)
 		}
+	}
+}
+
+// ================= P4 QQ 空间工具 =================
+
+// TestPostQzoneTool post_qzone 走 /send_qzone_msg：content 必填、images 可选
+// （文档：NapCat 自动上传，无需额外上传步骤）；输出 tid/time。
+func TestPostQzoneTool(t *testing.T) {
+	nap := startP3NapCat(t, func(string, map[string]any) any {
+		return map[string]any{"tid": "abc123", "time": 1700000000}
+	})
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "post_qzone", `{"text":"今天天气不错"}`)
+	if nap.count() != 1 || nap.path(0) != "/send_qzone_msg" {
+		t.Fatalf("NapCat 应收到 1 次 /send_qzone_msg, got %v", nap.paths)
+	}
+	b := nap.body(0)
+	if str(t, b, "content") != "今天天气不错" {
+		t.Errorf("content 透传错误: %v", b)
+	}
+	if _, has := b["images"]; has {
+		t.Errorf("无图时不应带 images 字段: %v", b)
+	}
+	if _, has := b["ugc_right"]; has {
+		t.Errorf("不应默认带 ugc_right（留给 napcat_api 设置权限）: %v", b)
+	}
+	if got := objOf(t, out)["tid"]; got != "abc123" {
+		t.Errorf("输出应含 tid, got %s", out)
+	}
+
+	// 带图：images 原样透传给 NapCat 自动上传
+	runToolOK(t, tools, "post_qzone", `{"text":"带图","images":["https://a.example/x.jpg"]}`)
+	imgs, ok := nap.body(1)["images"].([]any)
+	if !ok || len(imgs) != 1 || imgs[0] != "https://a.example/x.jpg" {
+		t.Errorf("images 透传错误: %v", nap.body(1))
+	}
+
+	// text 非空校验：报错且不触网
+	runToolErr(t, tools, "post_qzone", `{"text":""}`)
+	runToolErr(t, tools, "post_qzone", `{}`)
+	if nap.count() != 2 {
+		t.Errorf("非法参数不应发请求, got %d", nap.count())
+	}
+}
+
+// TestBrowseQzoneFeedsTool browse_qzone_feeds 走 /get_qzone_feeds（SnowLuma 形态，
+// 只传 page_num）：输出精简行（uin/author/time/summary/image_count/tid），
+// 每条摘要限 100 字符、最多 10 条，has_more 透出。
+func TestBrowseQzoneFeedsTool(t *testing.T) {
+	feeds := make([]any, 0, 12)
+	for i := 0; i < 12; i++ {
+		feeds = append(feeds, map[string]any{
+			"uin": 10000 + i, "nickname": fmt.Sprintf("好友%d", i),
+			"time": 1700000000 + i*60, "tid": fmt.Sprintf("t%d", i),
+			"content": fmt.Sprintf("动态内容%d", i),
+			"images":  []any{"a.jpg", "b.jpg"}, "like_count": 1, "comment_count": 2,
+		})
+	}
+	feeds[0].(map[string]any)["content"] = strings.Repeat("长", 150)
+	nap := startP3NapCat(t, func(string, map[string]any) any {
+		return map[string]any{"feeds": feeds, "has_more": true, "next_cursor": nil}
+	})
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "browse_qzone_feeds", "")
+	if nap.count() != 1 || nap.path(0) != "/get_qzone_feeds" {
+		t.Fatalf("NapCat 应收到 1 次 /get_qzone_feeds, got %v", nap.paths)
+	}
+	if num(t, nap.body(0), "page_num") != 1 {
+		t.Errorf("page_num 默认应为 1: %v", nap.body(0))
+	}
+	if _, has := nap.body(0)["format"]; has {
+		t.Errorf("SnowLuma 形态不应传 format: %v", nap.body(0))
+	}
+	obj := objOf(t, out)
+	rows, ok := obj["feeds"].([]any)
+	if !ok || len(rows) != 10 {
+		t.Fatalf("最多返回 10 条, got %d (%s)", len(rows), out)
+	}
+	if obj["has_more"] != true {
+		t.Errorf("has_more 应透出: %s", out)
+	}
+	first := rows[0].(map[string]any)
+	if n := len([]rune(first["summary"].(string))); n > 100 {
+		t.Errorf("summary 未按 100 字符截断: %d", n)
+	}
+	if first["tid"] != "t0" || first["author"] != "好友0" || first["uin"] != float64(10000) {
+		t.Errorf("首条字段错误: %v", first)
+	}
+	if first["image_count"] != float64(2) {
+		t.Errorf("image_count 应为图片数, got %v", first["image_count"])
+	}
+	if first["time"] != time.Unix(1700000000, 0).Format(timeLayout) {
+		t.Errorf("time 应格式化, got %v", first["time"])
+	}
+
+	// 翻页：page_num 透传
+	runToolOK(t, tools, "browse_qzone_feeds", `{"page_num":2}`)
+	if num(t, nap.body(1), "page_num") != 2 {
+		t.Errorf("page_num 透传错误: %v", nap.body(1))
+	}
+	// page_num 非法值回退默认 1
+	runToolOK(t, tools, "browse_qzone_feeds", `{"page_num":-3}`)
+	if num(t, nap.body(2), "page_num") != 1 {
+		t.Errorf("page_num 非法应回退 1: %v", nap.body(2))
+	}
+}
+
+// TestReadQzonePostTool read_qzone_post 走 /get_qzone_msg_detail（SnowLuma 形态：
+// tid+target_uin）：正文限 200 字、评论限 10 条、单条限 100 字，target_uin
+// 缺省不带（默认自己的空间）。
+func TestReadQzonePostTool(t *testing.T) {
+	detail := map[string]any{
+		"tid": "t1", "content": strings.Repeat("帖", 250), "comment_num": 2,
+		"comments": []any{
+			map[string]any{"uin": 10002, "name": "甲", "time": 1700000100, "content": "沙发",
+				"comment_id": "c1", "replies": []any{
+					map[string]any{"uin": 10003, "name": "乙", "time": 1700000200,
+						"content": "板凳", "comment_id": "c2",
+						"parent_comment_id": "c1", "parent_comment_uin": 10002},
+				}},
+			map[string]any{"uin": 10003, "name": "乙", "time": 1700000300,
+				"content": "赞", "comment_id": "c3", "replies": []any{}},
+		},
+	}
+	nap := startP3NapCat(t, func(path string, body map[string]any) any {
+		if tid, _ := body["tid"].(string); tid == "many" {
+			many := make([]any, 0, 12)
+			for i := 0; i < 12; i++ {
+				many = append(many, map[string]any{"uin": i, "name": "谁",
+					"time": 1700000000, "content": "水", "comment_id": fmt.Sprintf("c%d", i), "replies": []any{}})
+			}
+			return map[string]any{"tid": "many", "content": "正文", "comment_num": 12, "comments": many}
+		}
+		return detail
+	})
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "read_qzone_post", `{"tid":"t1"}`)
+	if nap.count() != 1 || nap.path(0) != "/get_qzone_msg_detail" {
+		t.Fatalf("NapCat 应收到 1 次 /get_qzone_msg_detail, got %v", nap.paths)
+	}
+	b := nap.body(0)
+	if str(t, b, "tid") != "t1" {
+		t.Errorf("tid 透传错误: %v", b)
+	}
+	if _, has := b["target_uin"]; has {
+		t.Errorf("target_uin 缺省时不应出现（默认自己的空间）: %v", b)
+	}
+	if _, has := b["feed_ref"]; has {
+		t.Errorf("SnowLuma 形态不应带 feed_ref: %v", b)
+	}
+	obj := objOf(t, out)
+	if n := len([]rune(obj["content"].(string))); n > 200 {
+		t.Errorf("正文未按 200 字截断: %d", n)
+	}
+	comments, ok := obj["comments"].([]any)
+	if !ok || len(comments) != 2 {
+		t.Fatalf("评论应原样精简返回 2 条, got %d (%s)", len(comments), out)
+	}
+	c0 := comments[0].(map[string]any)
+	if c0["name"] != "甲" || c0["content"] != "沙发" {
+		t.Errorf("评论字段错误: %v", c0)
+	}
+	replies, ok := c0["replies"].([]any)
+	if !ok || len(replies) != 1 || replies[0].(map[string]any)["name"] != "乙" {
+		t.Errorf("楼中楼回复错误: %v", c0["replies"])
+	}
+
+	// 指定作者空间：target_uin 透传
+	runToolOK(t, tools, "read_qzone_post", `{"tid":"t1","target_uin":10002}`)
+	if num(t, nap.body(1), "target_uin") != 10002 {
+		t.Errorf("target_uin 透传错误: %v", nap.body(1))
+	}
+
+	// 评论多于 10 条时截断到 10
+	out = runToolOK(t, tools, "read_qzone_post", `{"tid":"many"}`)
+	comments = objOf(t, out)["comments"].([]any)
+	if len(comments) != 10 {
+		t.Errorf("评论应截断到 10 条, got %d", len(comments))
+	}
+
+	// tid 必填
+	runToolErr(t, tools, "read_qzone_post", `{}`)
+}
+
+// TestQzoneLikeTool qzone_like 合并点赞/取消：enable 默认 true 走 /like_qzone，
+// false 走 /unlike_qzone；SnowLuma 形态传 tid/target_uin（缺省省略）。
+func TestQzoneLikeTool(t *testing.T) {
+	nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
+	tools, _, _ := testToolSet(t, nil)
+
+	runToolOK(t, tools, "qzone_like", `{"tid":"t1","target_uin":10002}`)
+	if nap.path(0) != "/like_qzone" {
+		t.Errorf("默认应走 /like_qzone, got %s", nap.path(0))
+	}
+	b := nap.body(0)
+	if str(t, b, "tid") != "t1" || num(t, b, "target_uin") != 10002 {
+		t.Errorf("点赞参数错误: %v", b)
+	}
+
+	if out := runToolOK(t, tools, "qzone_like", `{"tid":"t1","enable":false}`); out != "{}" {
+		t.Errorf("取消点赞输出 = %q, want {}", out)
+	}
+	if nap.path(1) != "/unlike_qzone" {
+		t.Errorf("enable=false 应走 /unlike_qzone, got %s", nap.path(1))
+	}
+	if _, has := nap.body(1)["target_uin"]; has {
+		t.Errorf("target_uin 缺省不应出现: %v", nap.body(1))
+	}
+
+	runToolErr(t, tools, "qzone_like", `{"target_uin":10002}`) // tid 必填
+	if nap.count() != 2 {
+		t.Errorf("非法参数不应发请求, got %d", nap.count())
+	}
+}
+
+// TestCommentQzoneTool comment_qzone 走 /comment_qzone（SnowLuma 一级评论：
+// tid+content+target_uin 可选），不暴露楼中楼参数；返回 comment_id。
+func TestCommentQzoneTool(t *testing.T) {
+	nap := startP3NapCat(t, func(string, map[string]any) any {
+		return map[string]any{"comment_id": "c9"}
+	})
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "comment_qzone", `{"tid":"t1","content":"拍得真好"}`)
+	if nap.count() != 1 || nap.path(0) != "/comment_qzone" {
+		t.Fatalf("NapCat 应收到 1 次 /comment_qzone, got %v", nap.paths)
+	}
+	b := nap.body(0)
+	if str(t, b, "tid") != "t1" || str(t, b, "content") != "拍得真好" {
+		t.Errorf("评论参数错误: %v", b)
+	}
+	if _, has := b["target_uin"]; has {
+		t.Errorf("target_uin 缺省不应出现: %v", b)
+	}
+	if _, has := b["comment_id"]; has {
+		t.Errorf("一级评论不应带楼中楼参数: %v", b)
+	}
+	if objOf(t, out)["comment_id"] != "c9" {
+		t.Errorf("输出应含 comment_id: %s", out)
+	}
+
+	// 指定作者空间
+	runToolOK(t, tools, "comment_qzone", `{"tid":"t1","content":"好","target_uin":10002}`)
+	if num(t, nap.body(1), "target_uin") != 10002 {
+		t.Errorf("target_uin 透传错误: %v", nap.body(1))
+	}
+
+	runToolErr(t, tools, "comment_qzone", `{"tid":"t1","content":""}`)
+	runToolErr(t, tools, "comment_qzone", `{"tid":"t1"}`)
+	if nap.count() != 2 {
+		t.Errorf("非法参数不应发请求, got %d", nap.count())
+	}
+}
+
+// TestQzoneProfileTool qzone_profile 走 /get_qzone_profile 且不带 target_uin
+// （读取当前账号），输出 name/description。
+func TestQzoneProfileTool(t *testing.T) {
+	nap := startP3NapCat(t, func(string, map[string]any) any {
+		return map[string]any{"name": "我的空间", "description": "记录生活"}
+	})
+	tools, _, _ := testToolSet(t, nil)
+
+	out := runToolOK(t, tools, "qzone_profile", "")
+	if nap.count() != 1 || nap.path(0) != "/get_qzone_profile" {
+		t.Fatalf("NapCat 应收到 1 次 /get_qzone_profile, got %v", nap.paths)
+	}
+	if len(nap.body(0)) != 0 {
+		t.Errorf("当前账号不应带 target_uin: %v", nap.body(0))
+	}
+	obj := objOf(t, out)
+	if obj["name"] != "我的空间" || obj["description"] != "记录生活" {
+		t.Errorf("输出错误: %s", out)
+	}
+}
+
+// TestDeleteQzoneTool delete_qzone 是危险工具：非管理员报权限错误且不触网，
+// 管理员放行走 /delete_qzone_msg；napcat_api 逃生舱同样把 delete_qzone_msg
+// 列入危险集合。
+func TestDeleteQzoneTool(t *testing.T) {
+	nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
+	tools, _, _ := testToolSet(t, nil) // 非管理员
+
+	err := runToolErr(t, tools, "delete_qzone", `{"tid":"t1"}`)
+	if !strings.Contains(err.Error(), "管理员权限") {
+		t.Errorf("非管理员应报权限错误: %v", err)
+	}
+	if nap.count() != 0 {
+		t.Errorf("非管理员不应发请求, got %d", nap.count())
+	}
+
+	// 逃生舱：delete_qzone_msg 同为危险动作
+	err = runToolErr(t, tools, "napcat_api", `{"action":"delete_qzone_msg","params":{"tid":"t1"}}`)
+	if !strings.Contains(err.Error(), "管理员权限") {
+		t.Errorf("逃生舱危险动作应报权限错误: %v", err)
+	}
+	if nap.count() != 0 {
+		t.Errorf("逃生舱危险动作不应发请求, got %d", nap.count())
+	}
+
+	admin := testToolSetAdmin(t)
+	if out := runToolOK(t, admin, "delete_qzone", `{"tid":"t1"}`); out != "{}" {
+		t.Errorf("管理员删除输出 = %q, want {}", out)
+	}
+	if nap.count() != 1 || nap.path(0) != "/delete_qzone_msg" {
+		t.Fatalf("管理员应发 1 次 /delete_qzone_msg, got %v", nap.paths)
+	}
+	if str(t, nap.body(0), "tid") != "t1" {
+		t.Errorf("tid 透传错误: %v", nap.body(0))
+	}
+
+	runToolErr(t, admin, "delete_qzone", `{"tid":""}`)
+	runToolErr(t, admin, "delete_qzone", `{}`)
+	if nap.count() != 1 {
+		t.Errorf("tid 空不应发请求, got %d", nap.count())
 	}
 }

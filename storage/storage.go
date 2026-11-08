@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS stickers (
     created_at       REAL NOT NULL
 );
 
+-- 图片内容寻址映射:消息第 idx 张图 → 磁盘内容哈希(文件在 agent/images/<sha256>)
+CREATE TABLE IF NOT EXISTS message_images (
+    message_id INTEGER NOT NULL,
+    idx        INTEGER NOT NULL,
+    sha256     TEXT NOT NULL,
+    mime       TEXT NOT NULL,
+    PRIMARY KEY (message_id, idx)
+);
+
 -- FTS5 独立表:索引内容由 PutMessage 在 Go 侧按字分词后写入
 -- (unicode61 分词器会把连续 CJK 当成单个 token,无法子串匹配,
 --  触发器又做不了按字拆分,故弃用 content 表 + 触发器方案)

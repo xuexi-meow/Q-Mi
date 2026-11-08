@@ -87,6 +87,7 @@ func TestUrgentMessageInterruptsSlowTurn(t *testing.T) {
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
 	m.debugDir = t.TempDir()
+	m.images = newImageStore(t.TempDir(), nil) // 防测试下载图片污染包目录
 	napcat := startFakeNapCat(t)
 
 	m.Enqueue(msg("group", 888, "第一条"))
@@ -153,6 +154,7 @@ func TestNonUrgentDuringSlowTurnDoesNotInterrupt(t *testing.T) {
 	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
+	m.images = newImageStore(t.TempDir(), nil) // 防测试下载图片污染包目录
 	napcat := startFakeNapCat(t)
 
 	m.Enqueue(msg("group", 888, "first"))

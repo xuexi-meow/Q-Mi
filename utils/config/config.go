@@ -116,6 +116,8 @@ type AgentConfig struct {
 	Model         string        `yaml:"model" mapstructure:"model"`
 	PersonaFile   string        `yaml:"persona_file" mapstructure:"persona_file"`
 	GuideFile     string        `yaml:"guide_file" mapstructure:"guide_file"`
+	// ImageDir 内容寻址图片缓存落盘目录；空串 = 默认 agent/images。
+	ImageDir      string        `yaml:"image_dir" mapstructure:"image_dir"`
 	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
 	// SelfWake 定时轮询间隔（P3.6 代码级唤醒兜底）：空串=默认 10 分钟；
 	// "off"/"0"=关闭；其余必须为 ≥30s 的合法 duration（下限防误配成高频轮询）。

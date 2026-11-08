@@ -26,13 +26,14 @@ import (
 
 // IncomingMessage 事件接线层投给 Manager 的一条原始消息。
 type IncomingMessage struct {
+	MessageID  int64  // OneBot 消息 ID（图片锚定用）
 	ChatType   string // "private" / "group"
 	ChatID     int64  // 群号；私聊 = 对方 QQ
 	SelfID     int64  // 机器人自身 QQ
 	SenderID   int64
 	SenderName string
 	Text       string
-	Images     []string // 消息里的图片 URL（P2.7 多模态，wiring 提取）
+	Images     []imageRef // 消息里的图片段（P2.7 多模态，wiring 提取）
 	Time       time.Time
 	Urgent     bool // 紧急（私聊/群@，wiring 判定）：思考中收到则打断当前 turn（spec §5）
 }
@@ -48,6 +49,7 @@ const (
 	defaultNotesPath  = "agent/notes.json"
 	defaultStatePath  = "agent/state.json"
 	defaultTimersPath = "agent/timers.json" // P3.5 定时器记录
+	defaultImagesDir  = "agent/images"      // 内容寻址图片落盘目录
 )
 
 // turnQueueCap 每个 worker 的 turn 队列缓冲；满了之后投递方阻塞等待。
@@ -77,10 +79,10 @@ type Manager struct {
 	notesPath string
 	statePath string
 
-	// images 图片下载缓存：与 builder 的历史多模态共用同一份（正/负缓存
-	// 跨 builder 与 view_message_images 工具共享）；自定义 builder（测试桩）
-	// 无缓存时 manager 自建。
-	images *imageCache
+	// images 图片存储：优先复用 DefaultBuilder 自带的（历史多模态与工具
+	// 共享同一份映射与磁盘缓存）；其他 builder（测试桩）没有缓存，manager
+	// 自建一份。
+	images *imageStore
 
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
@@ -110,7 +112,7 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	if db, ok := builder.(*DefaultBuilder); ok {
 		m.images = db.Images()
 	} else {
-		m.images = newImageCache()
+		m.images = newImageStore(defaultImagesDir, store)
 	}
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
@@ -144,6 +146,7 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 		go m.workerLoop(key, s.ch)
 	}
 	s.pending = append(s.pending, TurnMessage{
+		MessageID:  msg.MessageID,
 		SenderID:   msg.SenderID,
 		SenderName: msg.SenderName,
 		Text:       msg.Text,
@@ -317,6 +320,15 @@ func (m *Manager) handleTurn(turn *Turn) {
 			return
 		}
 
+		// 用量打点：缓存命中率掉坑 = 前缀被打断的信号（webui 概览有累计视图）。
+		u := resp.Usage
+		recordUsage(u)
+		m.events.Record(turn.ChatType, turn.ChatID, KindUsage,
+			fmt.Sprintf("hit=%d miss=%d out=%d", u.PromptCacheHitTokens, u.PromptCacheMissTokens, u.CompletionTokens))
+		slog.Info("用量", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+			"cache_hit", u.PromptCacheHitTokens, "cache_miss", u.PromptCacheMissTokens,
+			"prompt", u.PromptTokens, "output", u.CompletionTokens)
+
 		// P2.5 思考链控制台输出：reasoning/content/工具调用/结束全打 Info，
 		// 不截断（要看全文）、不加配置开关。
 		if rc := resp.ReasoningContent(); rc != "" {
@@ -368,7 +380,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 		// 无并发问题。
 		if len(turn.pendingImages) > 0 {
 			parts := make([]ContentPart, 0, len(turn.pendingImages)+1)
-			parts = append(parts, ContentPart{Type: "text", Text: "这是你刚才要求查看的图片"})
+			parts = append(parts, ContentPart{Type: "text", Text: "以下图片来自上一轮工具结果（查询自动附带或你主动查看）"})
 			for _, du := range turn.pendingImages {
 				parts = append(parts, imagePart(du))
 			}

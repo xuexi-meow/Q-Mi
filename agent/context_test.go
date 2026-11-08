@@ -67,6 +67,7 @@ func TestBuildEmptyTurnReturnsOnlySystem(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -92,34 +93,47 @@ func TestBuildEmptyTurnReturnsOnlySystem(t *testing.T) {
 // TestBuildSystemContainsMoodAndAgentGuide system 拼上静态 agent 格式说明段
 // 与当前情绪状态行（spec §2.2）；无 mood 时不带情绪行，mood 只追加在尾部
 // （缓存前缀稳定）。
-func TestBuildSystemContainsMoodAndAgentGuide(t *testing.T) {
+func TestBuildMoodInTailNotSystem(t *testing.T) {
 	s := openTestStore(t)
 	cfg := config.AgentConfig{
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 	now := time.Unix(1762400000, 0)
 
 	withMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now, Mood: "有点开心"})
 	sys := contentText(withMood[0])
-	if !strings.Contains(sys, "当前情绪状态: 有点开心") {
-		t.Errorf("system 未携带情绪状态: %q", sys)
+	if strings.Contains(sys, "当前情绪状态") {
+		t.Errorf("情绪不应进 system（会击穿缓存前缀）: %q", sys)
 	}
 	for _, keyword := range []string{"send_message", "finish", "help", "think", "update_mood"} {
 		if !strings.Contains(sys, keyword) {
 			t.Errorf("agent 格式说明未提及工具 %s: %q", keyword, sys)
 		}
 	}
+	// 无新消息时 mood 无处安放——带一条新消息验证 tail 注入
+	withMood = b.Build(&Turn{
+		ChatType: "group", ChatID: 888, SelfID: 9527, Now: now, Mood: "有点开心",
+		NewMessages: []TurnMessage{
+			{ChatType: "group", ChatID: 888, SenderID: 10001, SenderName: "小明", Text: "在吗", Time: now.Add(-time.Second)},
+		},
+	})
+	first := contentText(withMood[len(withMood)-1])
+	want := "当前情绪状态: 有点开心\n当前时间: " + now.Format("2006-01-02 15:04") + "\n"
+	if !strings.Contains(first, want) {
+		t.Errorf("情绪行应注入首条新消息头部（时间之前）:\ngot:  %q\nwant contains: %q", first, want)
+	}
 
 	withoutMood := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now})
-	if strings.Contains(contentText(withoutMood[0]), "当前情绪状态") {
-		t.Errorf("无 mood 时不应有情绪行: %q", withoutMood[0].Content)
+	// system 与带 mood 时逐字节一致：mood 变化不影响缓存前缀
+	if contentText(withoutMood[0]) != contentText(withMood[0]) {
+		t.Errorf("system 应与 mood 无关:\nwith:    %q\nwithout: %q", withMood[0].Content, withoutMood[0].Content)
 	}
-	// mood 只追加在 system 尾部，前缀不变
-	if !strings.HasPrefix(sys, contentText(withoutMood[0])+"\n当前情绪状态: 有点开心") {
-		t.Errorf("情绪行应只追加在 system 尾部:\nsys:   %q\nbase:  %q", sys, withoutMood[0].Content)
+	if strings.Contains(contentText(withoutMood[len(withoutMood)-1]), "当前情绪状态") {
+		t.Errorf("无 mood 时 tail 不应有情绪行: %q", withoutMood[len(withoutMood)-1].Content)
 	}
 }
 
@@ -133,6 +147,7 @@ func TestNewDefaultBuilderMissingPersonaWarnsOnceAndFallsBack(t *testing.T) {
 		PersonaFile: missing,
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 
 	b := NewDefaultBuilder(s, cfg)
@@ -176,6 +191,7 @@ func TestNewDefaultBuilderMissingGuideFallsBack(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   filepath.Join(t.TempDir(), "absent-guide.md"),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 
 	b := NewDefaultBuilder(s, cfg)
@@ -197,6 +213,7 @@ func TestBuilderUsesGuideFileContent(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, customGuide),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 
 	b := NewDefaultBuilder(s, cfg)
@@ -254,6 +271,7 @@ func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -287,6 +305,7 @@ func TestBuildHistoryExcludesRecalled(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -317,6 +336,7 @@ func TestBuildWithNilStoreReturnsOnlySystem(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(nil, cfg)
 
@@ -375,6 +395,7 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -409,6 +430,52 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 	}
 }
 
+// TestBuildHistoryPrefixStableBeyondQueryCap 回归：库中消息超过 max+trim（查询
+// 被 Limit 截断）后，窗口仍以时间水印为锚整块推进——未裁剪时历史 = 上一轮
+// 历史原样追加一条；裁剪时 = 上一轮历史砍掉头部 trim 块再追加。相对条数裁剪
+// 在此区间会退化为逐条滑窗，每条新消息换头击穿缓存。
+func TestBuildHistoryPrefixStableBeyondQueryCap(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
+	}
+	b := NewDefaultBuilder(s, cfg)
+
+	base := time.Unix(1762400000, 0)
+	prev := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base})
+	evictions := 0
+	for i := 1; i <= 100; i++ {
+		putRecord(t, s, int64(i), "recv", "group", 928952016, 10001, "群友A",
+			fmt.Sprintf("m%03d", i), base.Add(time.Duration(i)*time.Second).Unix())
+		cur := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Duration(i) * time.Second)})
+		histPrev, histCur := prev[1:], cur[1:] // 去 system
+		switch {
+		case len(histCur) == len(histPrev)+1: // 未裁剪：原样追加
+			for j := range histPrev {
+				if !reflect.DeepEqual(histPrev[j], histCur[j]) {
+					t.Fatalf("i=%d 未裁剪轮历史前缀被破坏 at %d:\nprev: %+v\ncur:  %+v", i, j, histPrev[j], histCur[j])
+				}
+			}
+		case len(histCur) == len(histPrev)-b.trim+1: // 裁剪：砍头部 trim 块再追加
+			evictions++
+			for j := range histCur[:len(histCur)-1] {
+				if !reflect.DeepEqual(histPrev[b.trim+j], histCur[j]) {
+					t.Fatalf("i=%d 裁剪轮保留段与上轮尾部不对齐 at %d:\nprev: %+v\ncur:  %+v", i, b.trim+j, histPrev[b.trim+j], histCur[j])
+				}
+			}
+		default:
+			t.Fatalf("i=%d 历史条数异常: prev=%d cur=%d", i, len(histPrev), len(histCur))
+		}
+		prev = cur
+	}
+	if evictions == 0 {
+		t.Fatal("100 条消息应发生至少一次块裁剪")
+	}
+}
+
 // TestBuildAppendsNewMessagesWithTimeHeader 本轮新消息以 user 角色逐条追加在
 // 末尾，行格式与历史一致（含来源标签，昵称空回退 QQ号）；首条头部带当前时间
 // （2006-01-02 15:04），时间只出现一次。
@@ -418,6 +485,7 @@ func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -458,6 +526,7 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -520,6 +589,7 @@ func TestBuildSystemStaticAcrossNow(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -560,6 +630,7 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 
@@ -592,9 +663,9 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 
 // ---------- P2.7 多模态上下文 ----------
 
-// TestExtractImageURLs 从消息段 JSON 提取图片 URL：只取 type=="image" 且
-// data.url 非空的段；空 url / 缺 url / 非 image 段跳过。
-func TestExtractImageURLs(t *testing.T) {
+// TestExtractImageRefs 从消息段 JSON 提取图片段（Idx 对全部 image 段计数，
+// 含缺 url 的段，与 storage 映射锚一致）；非 image 段跳过。
+func TestExtractImageRefs(t *testing.T) {
 	segs := `[
 	 {"type":"text","data":{"text":"看图"}},
 	 {"type":"image","data":{"file":"a.image","url":"https://multimedia.nt.qq.com.cn/1","sub_type":0}},
@@ -603,36 +674,41 @@ func TestExtractImageURLs(t *testing.T) {
 	 {"type":"face","data":{"id":"1","url":"https://face.example/1"}},
 	 {"type":"image","data":{"file":"d.image","url":"https://multimedia.nt.qq.com.cn/2"}}
 	]`
-	got := extractImageURLs([]byte(segs))
-	want := []string{"https://multimedia.nt.qq.com.cn/1", "https://multimedia.nt.qq.com.cn/2"}
+	got := extractImageRefs([]byte(segs))
+	want := []imageRef{
+		{Idx: 0, URL: "https://multimedia.nt.qq.com.cn/1"},
+		{Idx: 1, URL: ""},
+		{Idx: 2, URL: ""},
+		{Idx: 3, URL: "https://multimedia.nt.qq.com.cn/2"},
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("extractImageURLs = %v, want %v", got, want)
+		t.Errorf("extractImageRefs = %v, want %v", got, want)
 	}
 }
 
-// TestExtractImageURLsCapsAtFour 最多提取 4 条图片 URL。
-func TestExtractImageURLsCapsAtFour(t *testing.T) {
+// TestExtractImageRefsCapsAtFour 最多提取 4 个图片段。
+func TestExtractImageRefsCapsAtFour(t *testing.T) {
 	segs := `[` +
 		`{"type":"image","data":{"url":"https://img.example/1"}},` +
 		`{"type":"image","data":{"url":"https://img.example/2"}},` +
 		`{"type":"image","data":{"url":"https://img.example/3"}},` +
 		`{"type":"image","data":{"url":"https://img.example/4"}},` +
 		`{"type":"image","data":{"url":"https://img.example/5"}}]`
-	got := extractImageURLs([]byte(segs))
-	want := []string{
-		"https://img.example/1", "https://img.example/2",
-		"https://img.example/3", "https://img.example/4",
+	got := extractImageRefs([]byte(segs))
+	want := []imageRef{
+		{Idx: 0, URL: "https://img.example/1"}, {Idx: 1, URL: "https://img.example/2"},
+		{Idx: 2, URL: "https://img.example/3"}, {Idx: 3, URL: "https://img.example/4"},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("extractImageURLs = %v, want %v", got, want)
+		t.Errorf("extractImageRefs = %v, want %v", got, want)
 	}
 }
 
-// TestExtractImageURLsInvalidInput 空输入与非法 JSON 返回 nil。
-func TestExtractImageURLsInvalidInput(t *testing.T) {
+// TestExtractImageRefsInvalidInput 空输入与非法 JSON 返回 nil。
+func TestExtractImageRefsInvalidInput(t *testing.T) {
 	for _, in := range [][]byte{nil, {}, []byte("not json"), []byte(`{"type":"image"}`)} {
-		if got := extractImageURLs(in); got != nil {
-			t.Errorf("extractImageURLs(%s) = %v, want nil", in, got)
+		if got := extractImageRefs(in); got != nil {
+			t.Errorf("extractImageRefs(%s) = %v, want nil", in, got)
 		}
 	}
 }
@@ -655,6 +731,7 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -733,6 +810,7 @@ func TestBuildHistorySentImageRowStaysString(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -769,6 +847,7 @@ func TestBuildHistoryMultimodalDisabledKeepsRawCQ(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(false),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -808,6 +887,7 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 			PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 			GuideFile:   writeGuideFile(t, agentGuideText),
 			History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 			Multimodal:  boolPtr(multimodal),
 		}
 		b := NewDefaultBuilder(s, cfg)
@@ -815,7 +895,7 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 			ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: now,
 			NewMessages: []TurnMessage{
 				{ChatType: "group", ChatID: 928952016, SenderID: 10001, SenderName: "小明",
-					Text: "看这张图", Images: []string{imgURL}, Time: newT},
+					Text: "看这张图", Images: []imageRef{{Idx: 0, URL: imgURL}}, Time: newT},
 				{ChatType: "group", ChatID: 928952016, SenderID: 10002, SenderName: "小红",
 					Text: "纯文本", Time: now.Add(-10 * time.Second)},
 			},
@@ -861,6 +941,7 @@ func TestBuildHistoryImageRowDropsFailedImage(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -910,6 +991,7 @@ func TestBuildHistoryImageWindowLastFive(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -957,6 +1039,7 @@ func TestBuildHistoryImageWindowCountsAllLines(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 		Multimodal:  boolPtr(true),
 	}
 	b := NewDefaultBuilder(s, cfg)
@@ -1013,10 +1096,11 @@ func TestMultimodalDropsFailedImages(t *testing.T) {
 		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 		GuideFile:   writeGuideFile(t, agentGuideText),
 		History:     config.AgentHistory{Max: 40, Trim: 20},
+		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
 	b.multimodal = true
-	b.images = newImageCacheWithClient(srv.Client())
+	b.images = newImageStoreWithClient(t.TempDir(), s, srv.Client())
 
 	good := srv.URL + "/good.png"
 	bad := srv.URL + "/bad.jpg"

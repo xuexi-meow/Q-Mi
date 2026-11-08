@@ -50,10 +50,12 @@ func urgentFromEvent(chatType string, msgs []*evmsg.Message, selfID int64) bool 
 	return bot.AtUserID(msgs, selfID)
 }
 
-// eventImageURLs 从事件消息段提取图片 URL（P2.7 多模态）：
-// 只取 type=="image" 且 url 非空的段；段未解析时懒解析，解析失败跳过。
-func eventImageURLs(msgs []*evmsg.Message) []string {
-	var urls []string
+// eventImageRefs 从事件消息段提取图片段（P2.7 多模态）：按 image 段顺序取
+// (Idx, URL)，Idx 对全部 image 段计数（含缺 url 的段），与 storage 映射锚
+// 一致；段未解析时懒解析，解析失败跳过。
+func eventImageRefs(msgs []*evmsg.Message) []imageRef {
+	var refs []imageRef
+	idx := 0
 	for _, m := range msgs {
 		if m == nil || m.Type != string(apimsg.TypeImage) {
 			continue
@@ -64,10 +66,11 @@ func eventImageURLs(msgs []*evmsg.Message) []string {
 			}
 		}
 		if img, ok := m.Data.(evmsg.Image); ok && img.Url != nil && *img.Url != "" {
-			urls = append(urls, *img.Url)
+			refs = append(refs, imageRef{Idx: idx, URL: *img.Url})
 		}
+		idx++
 	}
-	return urls
+	return refs
 }
 
 func init() {
@@ -78,13 +81,14 @@ func init() {
 		}
 		// 私聊一律响应
 		m.Enqueue(IncomingMessage{
+			MessageID:  int64(e.MessageID),
 			ChatType:   "private",
 			ChatID:     int64(e.UserID),
 			SelfID:     int64(e.SelfID),
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
-			Images:     eventImageURLs(e.Message),
+			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("private", e.Message, int64(e.SelfID)),
 		})
@@ -97,13 +101,14 @@ func init() {
 		// P2 起群聊不再设 @ 门槛（spec §3）：未 @ 也入队进思考循环，
 		// 回不回由模型自决；self_id 取事件自带字段,不依赖配置的 qq_number
 		m.Enqueue(IncomingMessage{
+			MessageID:  int64(e.MessageID),
 			ChatType:   "group",
 			ChatID:     int64(e.GroupID),
 			SelfID:     int64(e.SelfID),
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
-			Images:     eventImageURLs(e.Message),
+			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),
 		})

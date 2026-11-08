@@ -279,8 +279,8 @@ func kindsEqual(a, b []string) bool {
 }
 
 // TestHandleTurnRecordsThinkingChainEvents handleTurn 各关键点位写入事件：
-// 进入 turn（turn_start 带新消息摘要）、reasoning、output、tool_call、
-// tool 错误结果（tool_result）、finish。
+// 进入 turn（turn_start 带新消息摘要）、每轮用量（usage）、reasoning、
+// output、tool_call、tool 错误结果（tool_result）、finish。
 func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 	b := &stubBuilder{}
 	cfg := testCfg(20 * time.Millisecond)
@@ -296,7 +296,7 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 
 	evs := m.events.After(0)
 	kinds := kindsOf(evs)
-	want := []string{KindTurnStart, KindReasoning, KindOutput, KindToolCall, KindToolResult, KindFinish}
+	want := []string{KindTurnStart, KindUsage, KindReasoning, KindOutput, KindToolCall, KindToolResult, KindUsage, KindFinish}
 	if !kindsEqual(kinds, want) {
 		t.Fatalf("事件 kind 序列 = %v, want %v", kinds, want)
 	}
@@ -306,17 +306,20 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 	if evs[0].Text != "测试用户: 在吗" {
 		t.Errorf("turn_start 摘要 = %q, want 「测试用户: 在吗」", evs[0].Text)
 	}
-	if evs[1].Text != "先查查记录" {
-		t.Errorf("reasoning 事件文本 = %q, want 全文", evs[1].Text)
+	if evs[1].Kind != KindUsage || evs[1].Text != "hit=0 miss=0 out=0" {
+		t.Errorf("usage 事件 = %q, want hit=0 miss=0 out=0", evs[1].Text)
 	}
-	if evs[2].Text != "让我想想" {
-		t.Errorf("output 事件文本 = %q, want 全文", evs[2].Text)
+	if evs[2].Text != "先查查记录" {
+		t.Errorf("reasoning 事件文本 = %q, want 全文", evs[2].Text)
 	}
-	if !strings.Contains(evs[3].Text, "no_such_tool") || !strings.Contains(evs[3].Text, "{}") {
-		t.Errorf("tool_call 事件 = %q, want 含工具名与参数", evs[3].Text)
+	if evs[3].Text != "让我想想" {
+		t.Errorf("output 事件文本 = %q, want 全文", evs[3].Text)
 	}
-	if !strings.Contains(evs[4].Text, "no_such_tool") || !strings.Contains(evs[4].Text, "未知工具") {
-		t.Errorf("tool_result 事件 = %q, want 含工具名与错误简述", evs[4].Text)
+	if !strings.Contains(evs[4].Text, "no_such_tool") || !strings.Contains(evs[4].Text, "{}") {
+		t.Errorf("tool_call 事件 = %q, want 含工具名与参数", evs[4].Text)
+	}
+	if !strings.Contains(evs[5].Text, "no_such_tool") || !strings.Contains(evs[5].Text, "未知工具") {
+		t.Errorf("tool_result 事件 = %q, want 含工具名与错误简述", evs[5].Text)
 	}
 }
 

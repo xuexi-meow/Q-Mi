@@ -1,5 +1,5 @@
 // agent/context.go 实现上下文组装（spec P2 §2.2/§3.5）：缓存分层
-// system(纯静态) → 全会话混合历史(只追加,块裁剪) → [思考笔记]+本轮新消息(末尾,含当前时间)。
+// system(纯静态) → 全会话混合历史(只追加,时间水印块裁剪) → [思考笔记]+情绪+本轮新消息(末尾,含当前时间)。
 // P2.7 多模态：multimodal 开启时，带图片的历史行/新消息行 content 变为
 // OpenAI 多模态数组（文本部分 + image_url 部分）。
 // ContextBuilder 是可替换接缝，DefaultBuilder 为默认实现。
@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"Q-Mi/storage"
@@ -39,7 +40,7 @@ type Turn struct {
 	ChatID      int64  // 本轮新消息所属会话：群号；私聊 = 对方 QQ
 	SelfID      int64  // 机器人自身 QQ
 	Now         time.Time
-	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入 system 尾部
+	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入末尾 user 块头部（进 system 会击穿缓存前缀）
 	Notes       []Note        // 思考笔记（manager 从 notes.json 读出），注入末尾 user 块头部
 	NewMessages []TurnMessage // 每条自带所属会话（历史已跨会话混合）
 	// pendingImages 本轮工具（view_message_images）申请查看的图片，data URL
@@ -50,14 +51,23 @@ type Turn struct {
 
 // TurnMessage 本轮防抖窗口内的一条新消息。
 type TurnMessage struct {
+	MessageID  int64  // OneBot 消息 ID（图片以 (message_id, 图片序号) 为锚做内容寻址缓存）
 	ChatType   string // 该消息所属会话类型 "private" / "group"
 	ChatID     int64  // 该消息所属会话 ID：群号；私聊 = 对方 QQ
 	SenderID   int64
 	SenderName string
 	Text       string
-	Images     []string // 消息里的图片 URL（P2.7 多模态，wiring 提取）
+	Images     []imageRef // 消息里的图片段（P2.7 多模态，wiring 提取；URL 可能失效）
 	IsSelf     bool
 	Time       time.Time
+}
+
+// imageRef 一张图片段：Idx 为该消息内 image 段的序号（含缺 url 的段，保证
+// 与 storage.message_images 映射锚一致），URL 为下载来源（QQ 临时链，可能
+// 已失效，失效时经映射/磁盘兜底）。
+type imageRef struct {
+	Idx int
+	URL string
 }
 
 // ContextBuilder 上下文组装接口。agent 流程只依赖该接口，
@@ -74,12 +84,21 @@ type DefaultBuilder struct {
 	persona    string
 	guide      string
 	multimodal bool        // P2.7：开启时带图片的消息行以多模态内容直送模型
-	images     *imageCache // P3-3：图片 URL → base64 data URL 本地下载缓存（多会话 worker 共享）
+	images     *imageStore // 内容寻址图片存储（多会话 worker 共享，磁盘为事实源）
+
+	// mu/anchorTime 历史窗口裁剪锚：anchorTime 为当前窗口最早一条消息的
+	// 时间（秒，含亚秒）。窗口 = 时间 ≥ 锚的行，只在窗口超过 max 时整块
+	// 推进 trim——两次推进之间窗口头部字节级不变，prompt cache 前缀稳定。
+	// 若按"最近 N 条"相对条数裁剪，查询被 Limit 截断后窗口会随每条新消息
+	// 滑动一格，导致每次 turn 历史段全量未命中。多会话 worker 共享 builder，
+	// 锚的读写以 mu 保护（并发下锚只单调推进，最多损失一次命中）。
+	mu         sync.Mutex
+	anchorTime float64
 }
 
 // Images 暴露图片下载缓存（manager 的 view_message_images 工具与历史多模态
 // 共用同一份正/负缓存）。
-func (b *DefaultBuilder) Images() *imageCache { return b.images }
+func (b *DefaultBuilder) Images() *imageStore { return b.images }
 
 // 编译期保证 DefaultBuilder 满足接口。
 var _ ContextBuilder = (*DefaultBuilder)(nil)
@@ -87,12 +106,16 @@ var _ ContextBuilder = (*DefaultBuilder)(nil)
 // NewDefaultBuilder 构造默认 builder。persona/guide 文件缺失则告警一次
 // 并使用内置兜底文本，不阻断运行。
 func NewDefaultBuilder(store *storage.Store, cfg config.AgentConfig) *DefaultBuilder {
+	imgDir := cfg.ImageDir
+	if imgDir == "" {
+		imgDir = defaultImagesDir
+	}
 	b := &DefaultBuilder{
 		store:      store,
 		max:        cfg.History.Max,
 		trim:       cfg.History.Trim,
 		multimodal: cfg.MultimodalEnabled(),
-		images:     newImageCache(),
+		images:     newImageStore(imgDir, store),
 	}
 	data, err := os.ReadFile(cfg.PersonaFile)
 	if err != nil {
@@ -167,14 +190,13 @@ func senderLabel(senderID int64, senderName string, isSelf bool) string {
 
 // Build 组装消息序列（spec P2 §2.2）：
 //
-//	system:  persona + agent格式说明 + 机器人自身QQ号 (+当前情绪状态) ← 静态,缓存锚点
-//	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加
-//	user:   [思考笔记] + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
+//	system:  persona + agent格式说明 + 机器人自身QQ号 ← 全静态,缓存锚点
+//	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加,时间水印块裁剪
+//	user:   [思考笔记] + 情绪 + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
 func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
+	// system 全静态（persona+guide+账号QQ）：情绪等任何易变内容都不进 system，
+	// 否则一次变化击穿整段缓存前缀（历史块 + 全部图片）。
 	system := b.persona + "\n" + b.guide + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
-	if turn.Mood != "" {
-		system += "\n当前情绪状态: " + turn.Mood
-	}
 	msgs := []ChatMessage{{Role: "system", Content: system}}
 	b.appendHistory(&msgs, turn)
 	msgs = b.appendNewMessages(msgs, turn)
@@ -205,15 +227,8 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 	for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 { // 倒序 → 正序
 		records[i], records[j] = records[j], records[i]
 	}
-	// 超过 max 时按 trim 从头整块砍掉（查询 limit 为 max+trim，故最多砍一块；
-	// 整块跳删保证两次调用间历史前缀字节级一致 → 命中 prompt cache）
-	if n := len(records); b.max > 0 && b.trim > 0 && n > b.max {
-		drop := (n - b.max + b.trim - 1) / b.trim * b.trim
-		if drop > n {
-			drop = n
-		}
-		records = records[drop:]
-	}
+	// 块裁剪（时间水印锚）：保证两次调用间窗口头部字节级一致 → 命中 prompt cache
+	records = b.evictStable(records)
 	for i, r := range records {
 		isSelf := r.Direction == "sent"
 		role := "user"
@@ -230,10 +245,10 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		// 是否带图，按行计数）才多模态化；更早的带图行保持纯文本，但同样把
 		// [CQ:image,...] 换成 [图片] 标注（模型据此知道该行带过图）。
 		if b.multimodal && role == "user" {
-			if urls := extractImageURLs(r.Segments); len(urls) > 0 {
+			if refs := extractImageRefs(r.Segments); len(refs) > 0 {
 				text := replaceImageCQ(line)
 				if len(records)-i <= historyImageWindow {
-					content = b.multimodalContent(text, urls)
+					content = b.multimodalContent(r.MessageID, text, refs)
 				} else {
 					content = text
 				}
@@ -243,10 +258,45 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 	}
 }
 
+// evictStable 以时间水印为锚的块裁剪：窗口 = 时间 ≥ anchorTime 的行，仅在
+// 窗口超过 max 时整块推进 trim（新锚 = 保留段最早一行的时间）。两次推进之间
+// 窗口头部不变，历史段前缀字节级稳定。按相对条数裁剪在查询被 Limit 截断后
+// （库中消息 > max+trim）会退化为逐条滑窗，每条新消息都换头击穿缓存，故锚定
+// 绝对时间。同秒边界整组进/出窗：锚按行时间取值，若切在同秒组中间，下一轮
+// 更早的同秒行会重新进窗换头。并发安全：锚只单调推进，并发 worker 最多损失
+// 一次命中，不会读到回退的锚。
+func (b *DefaultBuilder) evictStable(records []*storage.MessageRecord) []*storage.MessageRecord {
+	if b.max <= 0 || b.trim <= 0 || len(records) == 0 {
+		return records
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	window := records
+	if b.anchorTime > 0 {
+		i := 0
+		for i < len(window) && window[i].Time < b.anchorTime {
+			i++
+		}
+		window = window[i:]
+	}
+	if len(window) <= b.max {
+		return window
+	}
+	drop := (len(window) - b.max + b.trim - 1) / b.trim * b.trim
+	if drop > len(window) {
+		drop = len(window)
+	}
+	for drop > 0 && window[drop-1].Time == window[drop].Time {
+		drop--
+	}
+	b.anchorTime = window[drop].Time
+	return window[drop:]
+}
+
 // appendNewMessages 把本轮新消息以 user 角色逐条追加在末尾（保留原始节奏，
-// 不做文本拼接），行格式与历史一致（含来源标签）；当前时间只出现在首条新
-// 消息的头部，思考笔记若有则以 "[思考笔记]" 块作为首条新消息的前缀（在当前
-// 时间之前）——不进 system，否则缓存前缀随笔记/时间失效。
+// 不做文本拼接），行格式与历史一致（含来源标签）；首条新消息头部依次为
+// [思考笔记] 块、当前情绪状态、当前时间——全部放末尾不进 system，否则缓存
+// 前缀随笔记/情绪/时间失效。
 // multimodal 开启时，带 Images 的新消息行同样多模态化（P2.7）。
 func (b *DefaultBuilder) appendNewMessages(msgs []ChatMessage, turn *Turn) []ChatMessage {
 	for i, m := range turn.NewMessages {
@@ -254,13 +304,16 @@ func (b *DefaultBuilder) appendNewMessages(msgs []ChatMessage, turn *Turn) []Cha
 			senderLabel(m.SenderID, m.SenderName, m.IsSelf), truncateContent(m.Text))
 		if i == 0 {
 			content = "当前时间: " + turn.Now.Format(nowLayout) + "\n" + content
+			if turn.Mood != "" {
+				content = "当前情绪状态: " + turn.Mood + "\n" + content
+			}
 			if len(turn.Notes) > 0 {
 				content = FormatNotes(turn.Notes) + "\n\n" + content
 			}
 		}
 		var c any = content
 		if b.multimodal && len(m.Images) > 0 {
-			c = b.multimodalContent(content, m.Images)
+			c = b.multimodalContent(m.MessageID, content, m.Images)
 		}
 		msgs = append(msgs, ChatMessage{Role: "user", Content: c})
 	}
@@ -270,9 +323,11 @@ func (b *DefaultBuilder) appendNewMessages(msgs []ChatMessage, turn *Turn) []Cha
 // maxImagesPerMessage 单条历史消息最多携带的图片数（防上下文体积爆炸）。
 const maxImagesPerMessage = 4
 
-// extractImageURLs 解析消息段 JSON，取出 type=="image" 且 data.url 非空的
-// 图片 URL（最多 maxImagesPerMessage 条）；输入为空或非法 JSON 返回 nil。
-func extractImageURLs(segmentsJSON []byte) []string {
+// extractImageRefs 解析消息段 JSON，按 image 段顺序取（Idx, URL）。Idx 对该
+// 消息内全部 image 段计数（含缺 url 的段），与 storage.message_images 映射
+// 锚保持一致；URL 为空的段保留占位（multimodalContent 会跳过）。最多取
+// maxImagesPerMessage 个；输入为空或非法 JSON 返回 nil。
+func extractImageRefs(segmentsJSON []byte) []imageRef {
 	if len(segmentsJSON) == 0 {
 		return nil
 	}
@@ -285,17 +340,19 @@ func extractImageURLs(segmentsJSON []byte) []string {
 	if err := json.Unmarshal(segmentsJSON, &segs); err != nil {
 		return nil
 	}
-	var urls []string
+	var refs []imageRef
+	idx := 0
 	for _, seg := range segs {
-		if seg.Type != "image" || seg.Data.URL == "" {
+		if seg.Type != "image" {
 			continue
 		}
-		urls = append(urls, seg.Data.URL)
-		if len(urls) >= maxImagesPerMessage {
+		if len(refs) >= maxImagesPerMessage {
 			break
 		}
+		refs = append(refs, imageRef{Idx: idx, URL: seg.Data.URL})
+		idx++
 	}
-	return urls
+	return refs
 }
 
 // cqImageRe 匹配 [CQ:image,...] 码（值内的逗号转义为 &#44;，不含 ]）。
@@ -313,17 +370,17 @@ func imagePart(url string) ContentPart {
 	}{URL: url}}
 }
 
-// multimodalContent 把行文本与图片 URL 组装成 OpenAI 多模态内容数组：
-// 首项为文本，其后每个 URL 一项 image_url。URL 先经 imageCache 尝试本地
-// 下载转 base64 data URL（P3-3）；下载失败的图片直接剔除（文本行已带
-// [图片] 标注）——QQ 旧链接 rkey 过期后原 URL 必然 400，回传会拖垮整个
-// 请求（P3-3 修复前实测）。
-func (b *DefaultBuilder) multimodalContent(text string, urls []string) []ContentPart {
-	parts := make([]ContentPart, 0, len(urls)+1)
+// multimodalContent 把行文本与图片段组装成 OpenAI 多模态内容数组：首项为
+// 文本，其后每张可解析的图一项 image_url。图片经 imageStore 以
+// (messageID, idx) 为锚解析——映射/磁盘命中直接读盘，未命中才按 URL 下载
+// （QQ 临时链可能已失效）；解析失败的图片直接剔除（文本行已带 [图片] 标注）
+// ——失效链接回传会拖垮整个请求（P3-3 修复前实测）。
+func (b *DefaultBuilder) multimodalContent(messageID int64, text string, refs []imageRef) []ContentPart {
+	parts := make([]ContentPart, 0, len(refs)+1)
 	parts = append(parts, ContentPart{Type: "text", Text: text})
-	for _, u := range urls {
-		du := b.images.dataURL(u)
-		if du == u { // data URL 与原 URL 永不相等，相等即下载失败
+	for _, ref := range refs {
+		du := b.images.dataURLFor(messageID, ref.Idx, ref.URL)
+		if !strings.HasPrefix(du, "data:") { // 下载失败回退原 url，剔除该图
 			continue
 		}
 		parts = append(parts, imagePart(du))

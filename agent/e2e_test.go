@@ -115,6 +115,7 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 			Model: "test-model", PersonaFile: "persona.md",
 			Debounce: 20 * time.Millisecond, Temperature: 0.8,
 			History: config.AgentHistory{Max: 40, Trim: 20},
+			ImageDir:   t.TempDir(),
 		},
 	}
 	a.Store = st
@@ -240,6 +241,7 @@ func TestEndToEndGroupImageMessageMultimodal(t *testing.T) {
 			Model: "test-model", PersonaFile: "persona.md",
 			Debounce: 20 * time.Millisecond, Temperature: 0.8,
 			History:    config.AgentHistory{Max: 40, Trim: 20},
+			ImageDir:   t.TempDir(),
 			Multimodal: boolPtr(true),
 		},
 	}

@@ -65,9 +65,9 @@ func testToolSetWithTimers(t *testing.T) ([]Tool, *TimerStore) {
 	return newToolSet(nil, notesPath, statePath, false, turn, timer, nil), timer
 }
 
-// testToolSetForViewImages 带 store、chat 上下文 turn 与图片缓存的工具集
-// （view_message_images 测试用），返回工具集与工具会写入的 turn。
-func testToolSetForViewImages(t *testing.T, store *storage.Store, images *imageCache) ([]Tool, *Turn) {
+// testToolSetForViewImages 带 store、chat 上下文 turn 与图片存储的工具集
+// （view_message_images / 查询自动带图测试用），返回工具集与工具会写入的 turn。
+func testToolSetForViewImages(t *testing.T, store *storage.Store, images *imageStore) ([]Tool, *Turn) {
 	t.Helper()
 	dir := t.TempDir()
 	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
@@ -1048,7 +1048,7 @@ func TestViewMessageImagesDirectSuccess(t *testing.T) {
 		t.Errorf("直连成功不应调用 NapCat, got %s", path)
 		return nil
 	})
-	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+	tools, turn := testToolSetForViewImages(t, s, newImageStore(t.TempDir(), s))
 
 	out := runToolOK(t, tools, "view_message_images", `{"message_id":7}`)
 	obj := objOf(t, out)
@@ -1095,7 +1095,7 @@ func TestViewMessageImagesGetImageChainSwitch(t *testing.T) {
 		}
 		return nil
 	})
-	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+	tools, turn := testToolSetForViewImages(t, s, newImageStore(t.TempDir(), s))
 
 	out := runToolOK(t, tools, "view_message_images", `{"message_id":8}`)
 	obj := objOf(t, out)
@@ -1124,7 +1124,7 @@ func TestViewMessageImagesDoubleFailureSkips(t *testing.T) {
 		}
 		return nil
 	})
-	tools, turn := testToolSetForViewImages(t, s, newImageCache())
+	tools, turn := testToolSetForViewImages(t, s, newImageStore(t.TempDir(), s))
 
 	out := runToolOK(t, tools, "view_message_images", `{"message_id":9}`)
 	obj := objOf(t, out)
@@ -1151,7 +1151,7 @@ func TestViewMessageImagesNoImageErrors(t *testing.T) {
 		SenderName: "小明", RawMessage: "纯文本消息", Time: 1762400000,
 	})
 	startP3NapCat(t, func(string, map[string]any) any { return nil })
-	tools, _ := testToolSetForViewImages(t, s, newImageCache())
+	tools, _ := testToolSetForViewImages(t, s, newImageStore(t.TempDir(), s))
 
 	err := runToolErr(t, tools, "view_message_images", `{"message_id":10}`)
 	if !strings.Contains(err.Error(), "没有图片") {
@@ -1160,4 +1160,65 @@ func TestViewMessageImagesNoImageErrors(t *testing.T) {
 	// message_id 缺失 / 未知消息同样报错
 	runToolErr(t, tools, "view_message_images", `{}`)
 	runToolErr(t, tools, "view_message_images", `{"message_id":404}`)
+}
+
+// ================= 查询工具自动带图 =================
+
+// TestQueryMessageRowsAutoAttachesImages 查询结果行带 images 张数标记，最新
+// 消息的图片自动解析并附进 turn.pendingImages（封顶 maxAutoAttachImages 张），
+// 附上的行有 images_attached 标记。
+func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
+	s := openTestStore(t)
+	imgSrv, _ := servePNG(t, "image/png")
+	ims := newImageStore(t.TempDir(), s)
+
+	base := int64(1762400000)
+	// 3 条消息 × 每条 2 张图（同 URL，内容寻址去重）= 6 张，附带应封顶 5 张
+	for i := int64(1); i <= 3; i++ {
+		u := imgSrv.URL + "/a.png"
+		putRecordFull(t, s, &storage.MessageRecord{
+			MessageID: i, Direction: "recv", ChatType: "group", ChatID: 888, UserID: 10001,
+			SenderName: "小明",
+			RawMessage: "[CQ:image][CQ:image]",
+			Segments:   []byte(`[{"type":"image","data":{"url":"` + u + `"}},{"type":"image","data":{"url":"` + u + `"}}]`),
+			Time:       float64(base + i),
+		})
+	}
+	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
+	out, err := queryMessageRows(s, ims, turn, storage.MessageFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("queryMessageRows: %v", err)
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("输出应为 JSON 数组: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("应返回 3 行, got %d", len(rows))
+	}
+	for _, row := range rows {
+		if row["images"] != float64(2) {
+			t.Errorf("行 images = %v, want 2", row["images"])
+		}
+	}
+	if len(turn.pendingImages) != maxAutoAttachImages {
+		t.Fatalf("pendingImages 应封顶 %d 张, got %d", maxAutoAttachImages, len(turn.pendingImages))
+	}
+	// 最新一条（message_id=3）整行 2 张都附上；次新行 2 张；最旧行只附上第
+	// 5 张（封顶截断，6 张里只带 5）——三行都有 images_attached 标记
+	if rows[2]["message_id"] != float64(3) || rows[2]["images_attached"] != true {
+		t.Errorf("最新行应整行附图: %v", rows[2])
+	}
+	if rows[1]["message_id"] != float64(2) || rows[1]["images_attached"] != true {
+		t.Errorf("次新行应附第 5 张: %v", rows[1])
+	}
+	if rows[0]["message_id"] != float64(1) || rows[0]["images_attached"] != true {
+		t.Errorf("最旧行应附第 5 张（封顶截断）: %v", rows[0])
+	}
+	for _, du := range turn.pendingImages {
+		if !strings.HasPrefix(du, "data:image/png;base64,") {
+			t.Errorf("pendingImages 应为 png data URL: %q", du[:40])
+		}
+	}
 }

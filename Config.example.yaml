@@ -27,6 +27,7 @@ agent:
   model: "deepseek-chat"
   persona_file: "agent/persona.md"
   guide_file: "agent/guide.md"   # agent 行为/格式约束(工具用法细节走 help 工具)
+  # image_dir: "agent/images"    # 图片内容寻址缓存目录(sha256 落盘,按消息锚定去重,超 2GB 自动清最旧)；缺省即该路径
   debounce: 3s
   self_wake: "10m"       # 定时轮询：缺省 10 分钟一次，"off" 关闭；轮询只是唤醒 agent，发不发言由模型自己决定
   temperature: 0.8

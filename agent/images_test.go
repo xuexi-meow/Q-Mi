@@ -1,15 +1,18 @@
 package agent
 
 import (
-	"bytes"
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"Q-Mi/storage"
 )
 
 // pngBytes 一段带 PNG 魔数的假图字节（仅用于下载/编码断言，无需完整合法图片）。
@@ -37,149 +40,206 @@ func servePNG(t *testing.T, contentType string) (*httptest.Server, *atomic.Int64
 	return srv, &hits
 }
 
-// TestImageCachePutGet 缓存基础读写：未 put 不命中，put 后命中且值一致。
-func TestImageCachePutGet(t *testing.T) {
-	c := newImageCache()
-	if _, ok := c.get("https://img.example/1"); ok {
-		t.Error("未 put 时 get 不应命中")
-	}
-	c.put("https://img.example/1", pngDataURL)
-	v, ok := c.get("https://img.example/1")
-	if !ok || v != pngDataURL {
-		t.Errorf("get = (%q, %v), want (%q, true)", v, ok, pngDataURL)
-	}
+// testImageStore 内容寻址存储（内存库 + 临时目录）。
+func testImageStore(t *testing.T) (*imageStore, *storage.Store) {
+	t.Helper()
+	s := openTestStore(t)
+	return newImageStore(t.TempDir(), s), s
 }
 
-// TestImageCacheDataURLSuccess 成功下载 → 返回 data:image/png;base64 前缀的
-// data URL，且 base64 解码后与响应体完全一致。
-func TestImageCacheDataURLSuccess(t *testing.T) {
+// TestImageStoreDataURLForDownloadsAndSaves 首次解析：下载 → 落盘 → 写映射 →
+// 返回 data URL；base64 解码后与响应体一致。
+func TestImageStoreDataURLForDownloadsAndSaves(t *testing.T) {
 	srv, _ := servePNG(t, "image/png")
-	c := newImageCache()
+	ims, st := testImageStore(t)
 
-	got := c.dataURL(srv.URL + "/a.png")
+	got := ims.dataURLFor(42, 0, srv.URL+"/a.png")
 
-	if !strings.HasPrefix(got, "data:image/png;base64,") {
-		t.Fatalf("dataURL 前缀不符: %q", got)
-	}
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, "data:image/png;base64,"))
-	if err != nil {
-		t.Fatalf("base64 解码失败: %v", err)
-	}
-	if !bytes.Equal(raw, pngBytes) {
-		t.Errorf("data URL 载荷与响应体不一致: got %d bytes, want %d bytes", len(raw), len(pngBytes))
-	}
 	if got != pngDataURL {
-		t.Errorf("dataURL = %q, want %q", got, pngDataURL)
+		t.Fatalf("dataURL = %q, want %q", got, pngDataURL)
+	}
+	refs, err := st.ImageRefs(42)
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("ImageRefs(42) = %v, %v, want 1 条映射", refs, err)
+	}
+	if refs[0].Idx != 0 || refs[0].Mime != "image/png" {
+		t.Errorf("映射 = %+v, want idx=0 mime=image/png", refs[0])
+	}
+	data, err := os.ReadFile(filepath.Join(ims.dir, refs[0].Sha256))
+	if err != nil {
+		t.Fatalf("落盘文件读取失败: %v", err)
+	}
+	if string(data) != string(pngBytes) {
+		t.Errorf("落盘内容与响应体不一致: got %d bytes, want %d bytes", len(data), len(pngBytes))
 	}
 }
 
-// TestImageCacheDataURLCachesSingleRequest 同一 url 两次调用只发一次 HTTP
-// 请求（计数器），两次结果一致。
-func TestImageCacheDataURLCachesSingleRequest(t *testing.T) {
+// TestImageStoreDataURLForAnchoredNoSecondRequest 同一 (message_id, idx) 再次
+// 解析（即使 URL 已换新链）命中映射/磁盘，零 HTTP 请求。
+func TestImageStoreDataURLForAnchoredNoSecondRequest(t *testing.T) {
 	srv, hits := servePNG(t, "image/png")
-	c := newImageCache()
-	u := srv.URL + "/a.png"
+	ims, _ := testImageStore(t)
 
-	first := c.dataURL(u)
-	second := c.dataURL(u)
+	first := ims.dataURLFor(42, 0, srv.URL+"/a.png")
+	second := ims.dataURLFor(42, 0, srv.URL+"/new-rkey.png") // 换了 rkey 的新链
 
-	if first != second {
-		t.Errorf("两次结果不一致: %q vs %q", first, second)
+	if first != second || first != pngDataURL {
+		t.Errorf("锚定解析结果不一致: %q vs %q", first, second)
 	}
 	if hits.Load() != 1 {
-		t.Errorf("HTTP 请求数 = %d, want 1 (第二次应命中缓存)", hits.Load())
+		t.Errorf("HTTP 请求数 = %d, want 1（第二次应命中映射，哪怕 URL 变了）", hits.Load())
 	}
 }
 
-// TestImageCacheDataURLNegativeCache 失败结果进负缓存（哨兵 ""）：同一 url
-// 第二次调用命中负缓存、不再发 HTTP 请求（计数器恒 1），仍回退原 url。
-// 正/负缓存均不淘汰——rkey 过期的死链在这个进程内注定永远失败。
-func TestImageCacheDataURLNegativeCache(t *testing.T) {
+// TestImageStoreDataURLForSameURLNoSecondRequest 无消息锚（messageID=0）时
+// 同一 URL 经 url→哈希 去重，也只下载一次。
+func TestImageStoreDataURLForSameURLNoSecondRequest(t *testing.T) {
+	srv, hits := servePNG(t, "image/png")
+	ims, _ := testImageStore(t)
+
+	ims.dataURLFor(0, 0, srv.URL+"/a.png")
+	again := ims.dataURLFor(0, 0, srv.URL+"/a.png")
+
+	if again != pngDataURL {
+		t.Errorf("无锚解析 = %q, want data URL", again)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("HTTP 请求数 = %d, want 1（同 URL 应去重）", hits.Load())
+	}
+}
+
+// TestImageStoreSurvivesRestart 重启（新 imageStore 实例 + 同目录同库）后
+// 映射/磁盘仍命中，零下载——历史多模态字节跨重启稳定。
+func TestImageStoreSurvivesRestart(t *testing.T) {
+	srv, hits := servePNG(t, "image/png")
+	dir := t.TempDir()
+	st := openTestStore(t)
+	ims := newImageStore(dir, st)
+	want := ims.dataURLFor(7, 1, srv.URL+"/a.png")
+
+	reborn := newImageStore(dir, st)
+	got := reborn.dataURLFor(7, 1, srv.URL+"/a.png")
+
+	if got != want || got != pngDataURL {
+		t.Errorf("重启后解析 = %q, want %q", got, want)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("HTTP 请求数 = %d, want 1（重启后应命中磁盘，不再下载）", hits.Load())
+	}
+}
+
+// TestImageStoreDedupsSameContent 不同消息/不同 URL 传同一张图（字节相同）
+// 只落一个文件（内容寻址）。
+func TestImageStoreDedupsSameContent(t *testing.T) {
+	srv, hits := servePNG(t, "image/png")
+	ims, _ := testImageStore(t)
+
+	ims.dataURLFor(1, 0, srv.URL+"/one.png")
+	ims.dataURLFor(2, 0, srv.URL+"/two.png")
+
+	entries, err := os.ReadDir(ims.dir)
+	if err != nil {
+		t.Fatalf("读目录失败: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("目录文件数 = %d, want 1（同内容共享同一文件）", len(entries))
+	}
+	if hits.Load() != 2 {
+		t.Errorf("HTTP 请求数 = %d, want 2（不同 URL 无法预知同内容，各下载一次）", hits.Load())
+	}
+}
+
+// TestImageStoreDataURLForNegativeCache 失败结果进 URL 负缓存：TTL 内同一 URL
+// 不再发 HTTP；TTL 过后允许重试。
+func TestImageStoreDataURLForNegativeCache(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)
-	c := newImageCache()
+	ims, _ := testImageStore(t)
 	u := srv.URL + "/a.png"
 
-	if got := c.dataURL(u); got != u {
+	if got := ims.dataURLFor(1, 0, u); got != u {
 		t.Errorf("失败应回退原 url, got %q", got)
 	}
-	if got := c.dataURL(u); got != u {
+	if got := ims.dataURLFor(1, 0, u); got != u {
 		t.Errorf("负缓存命中仍应回退原 url, got %q", got)
 	}
 	if hits.Load() != 1 {
-		t.Errorf("HTTP 请求数 = %d, want 1（失败已进负缓存,第二次不应再发请求）", hits.Load())
+		t.Errorf("HTTP 请求数 = %d, want 1（失败已进负缓存）", hits.Load())
+	}
+	// TTL 过后允许重试（仍失败，但确实重新请求了）
+	ims.mu.Lock()
+	ims.neg[u] = time.Now().Add(-2 * negCacheTTL)
+	ims.mu.Unlock()
+	_ = ims.dataURLFor(1, 0, u)
+	if hits.Load() != 2 {
+		t.Errorf("TTL 过后应重试，HTTP 请求数 = %d, want 2", hits.Load())
 	}
 }
 
-// TestImageCacheDataURLTimeoutFallsBack 下载超时（服务端 sleep 100ms，
-// client 超时 30ms）→ 回退原 url，不缓存失败结果。
-func TestImageCacheDataURLTimeoutFallsBack(t *testing.T) {
+// TestImageStoreDataURLForTimeoutFallsBack 下载超时（服务端 sleep 100ms，
+// client 超时 30ms）→ 回退原 url。
+func TestImageStoreDataURLForTimeoutFallsBack(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		_, _ = w.Write(pngBytes)
 	}))
 	t.Cleanup(srv.Close)
-	c := newImageCacheWithClient(&http.Client{Timeout: 30 * time.Millisecond})
-	u := srv.URL + "/slow.png"
+	ims := newImageStoreWithClient(t.TempDir(), nil, &http.Client{Timeout: 30 * time.Millisecond})
 
-	if got := c.dataURL(u); got != u {
+	if got := ims.dataURLFor(0, 0, srv.URL+"/slow.png"); got != srv.URL+"/slow.png" {
 		t.Errorf("超时应回退原 url, got %q", got)
 	}
 }
 
-// TestImageCacheDataURLSniffsMagicNumber 响应无 Content-Type 时按魔数识别
+// TestImageStoreDataURLForSniffsMagicNumber 响应无 Content-Type 时按魔数识别
 // （PNG 头 → image/png）。
-func TestImageCacheDataURLSniffsMagicNumber(t *testing.T) {
+func TestImageStoreDataURLForSniffsMagicNumber(t *testing.T) {
 	srv, _ := servePNG(t, "")
-	c := newImageCache()
+	ims, _ := testImageStore(t)
 
-	got := c.dataURL(srv.URL + "/raw")
-
-	if got != pngDataURL {
+	if got := ims.dataURLFor(0, 0, srv.URL+"/raw"); got != pngDataURL {
 		t.Errorf("无 Content-Type 应按魔数识别为 image/png, got %q", got)
 	}
 }
 
-// TestImageCacheDataURLUnknownBodyFallsBack 无 Content-Type 且魔数无法识别
+// TestImageStoreDataURLForUnknownBodyFallsBack 无 Content-Type 且魔数无法识别
 // → 回退原 url。
-func TestImageCacheDataURLUnknownBodyFallsBack(t *testing.T) {
+func TestImageStoreDataURLForUnknownBodyFallsBack(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("plain text, not an image"))
 	}))
 	t.Cleanup(srv.Close)
-	c := newImageCache()
-	u := srv.URL + "/x"
+	ims, _ := testImageStore(t)
 
-	if got := c.dataURL(u); got != u {
+	if got := ims.dataURLFor(0, 0, srv.URL+"/x"); got != srv.URL+"/x" {
 		t.Errorf("无法识别的响应体应回退原 url, got %q", got)
 	}
 }
 
-// TestImageCacheDataURLRejectsOversize 超过 20MB 上限的响应 → 回退原 url。
-func TestImageCacheDataURLRejectsOversize(t *testing.T) {
+// TestImageStoreDataURLForRejectsOversize 超过 20MB 上限的响应 → 回退原 url。
+func TestImageStoreDataURLForRejectsOversize(t *testing.T) {
 	big := make([]byte, maxImageBytes+1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(big)
 	}))
 	t.Cleanup(srv.Close)
-	c := newImageCache()
-	u := srv.URL + "/big.png"
+	ims, _ := testImageStore(t)
 
-	if got := c.dataURL(u); got != u {
+	if got := ims.dataURLFor(0, 0, srv.URL+"/big.png"); got != srv.URL+"/big.png" {
 		t.Errorf("超限响应应回退原 url, got %q", got)
 	}
 }
 
-// TestImageCacheDataURLConcurrentSameResult 多 goroutine 并发对同一 url 调用
-// dataURL（-race 下验证并发安全），所有结果一致且为成功 data URL。
-func TestImageCacheDataURLConcurrentSameResult(t *testing.T) {
+// TestImageStoreDataURLForConcurrentSameResult 多 goroutine 并发对同一 url
+// 调用（-race 下验证并发安全），所有结果一致且为成功 data URL。
+func TestImageStoreDataURLForConcurrentSameResult(t *testing.T) {
 	srv, _ := servePNG(t, "image/png")
-	c := newImageCache()
+	ims, _ := testImageStore(t)
 	u := srv.URL + "/c.png"
 
 	const n = 16
@@ -189,7 +249,7 @@ func TestImageCacheDataURLConcurrentSameResult(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = c.dataURL(u)
+			results[i] = ims.dataURLFor(0, 0, u)
 		}()
 	}
 	wg.Wait()
@@ -201,17 +261,17 @@ func TestImageCacheDataURLConcurrentSameResult(t *testing.T) {
 	}
 }
 
-// TestDataURLRejectsHeaderLies CDN 把 AVIF（魔数 ftyp+avif）误标成 image/jpeg
-// 时必须拒绝——只信魔数不信 header；否则该图会以 "unsupported image" 拖垮
-// 整个请求（线上实测）。
-func TestDataURLRejectsHeaderLies(t *testing.T) {
+// TestImageStoreDataURLForRejectsHeaderLies CDN 把 AVIF（魔数 ftyp+avif）误标
+// 成 image/jpeg 时必须拒绝——只信魔数不信 header；否则该图会以
+// "unsupported image" 拖垮整个请求（线上实测）。
+func TestImageStoreDataURLForRejectsHeaderLies(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Write([]byte("\x00\x00\x00\x20ftypavif\x00\x00\x00\x00avifmif1fake-payload"))
 	}))
 	defer srv.Close()
-	c := newImageCacheWithClient(srv.Client())
-	if got := c.dataURL(srv.URL + "/a.jpg"); !strings.HasPrefix(got, "http") {
+	ims, _ := testImageStore(t)
+	if got := ims.dataURLFor(0, 0, srv.URL+"/a.jpg"); !strings.HasPrefix(got, "http") {
 		t.Fatalf("AVIF 伪装 jpeg 应下载失败回退原 URL, got %q", got[:40])
 	}
 	// 真 jpeg 带 octet-stream 头应凭魔数成功
@@ -220,8 +280,31 @@ func TestDataURLRejectsHeaderLies(t *testing.T) {
 		w.Write([]byte("\xFF\xD8\xFF\xE0jpeg-bytes"))
 	}))
 	defer ok.Close()
-	c2 := newImageCacheWithClient(ok.Client())
-	if got := c2.dataURL(ok.URL + "/b.jpg"); !strings.HasPrefix(got, "data:image/jpeg;base64,") {
+	ims2, _ := testImageStore(t)
+	if got := ims2.dataURLFor(0, 0, ok.URL+"/b.jpg"); !strings.HasPrefix(got, "data:image/jpeg;base64,") {
 		t.Fatalf("真 jpeg 应凭魔数识别成功, got %q", got[:40])
+	}
+}
+
+// TestImageStoreDataURLForMissingFileFallsBack 映射在但文件被清理（如超容量
+// 被删）→ 落回 URL 重新下载并重建映射。
+func TestImageStoreDataURLForMissingFileFallsBack(t *testing.T) {
+	srv, hits := servePNG(t, "image/png")
+	ims, st := testImageStore(t)
+
+	first := ims.dataURLFor(9, 0, srv.URL+"/a.png")
+	refs, _ := st.ImageRefs(9)
+	if err := os.Remove(filepath.Join(ims.dir, refs[0].Sha256)); err != nil {
+		t.Fatalf("删除落盘文件失败: %v", err)
+	}
+	// 重建实例（清掉 url→哈希 去重），模拟重启后文件被外部清理
+	ims2 := newImageStore(ims.dir, st)
+	second := ims2.dataURLFor(9, 0, srv.URL+"/a.png")
+
+	if second != first || second != pngDataURL {
+		t.Errorf("文件缺失回退解析 = %q, want %q", second, first)
+	}
+	if hits.Load() != 2 {
+		t.Errorf("HTTP 请求数 = %d, want 2（文件被删后应重新下载）", hits.Load())
 	}
 }

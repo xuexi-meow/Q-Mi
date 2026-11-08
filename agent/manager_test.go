@@ -186,6 +186,9 @@ func newTestManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder) (*Mana
 	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
+	// stub builder 无图片存储，manager 兜底的那份改指到临时目录，
+	// 避免测试下载图片时把 agent/images 落到包目录（甚至 agent/agent/images）
+	m.images = newImageStore(t.TempDir(), m.store)
 	t.Cleanup(func() { srv.Close() })
 	return m, f
 }
@@ -387,7 +390,7 @@ func TestEnqueueCarriesImagesIntoTurn(t *testing.T) {
 	startFakeNapCat(t)
 
 	im := msg("group", 888, "看图")
-	im.Images = []string{"https://multimedia.nt.qq.com.cn/1"}
+	im.Images = []imageRef{{Idx: 0, URL: "https://multimedia.nt.qq.com.cn/1"}}
 	m.Enqueue(im)
 
 	waitFor(t, 3*time.Second, func() bool { return f.count() == 1 }, "LLM 应收到请求")
@@ -396,7 +399,7 @@ func TestEnqueueCarriesImagesIntoTurn(t *testing.T) {
 		t.Fatalf("turn 应有 1 条新消息, got %d", len(turn.NewMessages))
 	}
 	got := turn.NewMessages[0].Images
-	want := []string{"https://multimedia.nt.qq.com.cn/1"}
+	want := []imageRef{{Idx: 0, URL: "https://multimedia.nt.qq.com.cn/1"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("TurnMessage.Images = %v, want %v", got, want)
 	}
@@ -451,7 +454,7 @@ func TestHandleTurnAttachesPendingImagesAfterTools(t *testing.T) {
 	if !ok || p0["type"] != "text" {
 		t.Fatalf("parts[0] 应为 text, got %#v", arr[0])
 	}
-	if text, _ := p0["text"].(string); !strings.Contains(text, "这是你刚才要求查看的图片") {
+	if text, _ := p0["text"].(string); !strings.Contains(text, "来自上一轮工具结果") {
 		t.Errorf("text 部分不符: %q", text)
 	}
 	p1, ok := arr[1].(map[string]any)

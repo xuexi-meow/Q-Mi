@@ -49,6 +49,7 @@ func newLoopManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder, store 
 	dir := t.TempDir()
 	m.notesPath = filepath.Join(dir, "notes.json")
 	m.statePath = filepath.Join(dir, "state.json")
+	m.images = newImageStore(filepath.Join(dir, "images"), store) // 兜底图片存储指到临时目录，防测试污染包目录
 	napcat := startFakeNapCat(t)
 	return m, f, napcat
 }

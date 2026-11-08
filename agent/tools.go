@@ -82,8 +82,8 @@ func intProp(desc string) map[string]any {
 // 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
 // turn 为本轮 chat 上下文（schedule 从中捕获会话，可为 nil）；timer 为
 // 计时器存储（P3.5，nil 时 schedule/cancel_timer 返回 error）；images 为
-// 图片下载缓存（view_message_images 用，nil 时该工具报错）。
-func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore, images *imageCache) []Tool {
+// 内容寻址图片存储（view_message_images 与查询工具自动带图用，nil 时报错）。
+func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore, images *imageStore) []Tool {
 	// schedule 的会话上下文在构造期从 turn 捕获（工具 Run 拿不到 turn）。
 	var curChatType string
 	var curChatID, curSelfID int64
@@ -115,7 +115,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				if limit > 100 {
 					limit = 100
 				}
-				return queryMessageRows(store, storage.MessageFilter{
+				return queryMessageRows(store, images, turn, storage.MessageFilter{
 					ChatType: p.ChatType,
 					ChatID:   p.ChatID,
 					Limit:    limit,
@@ -151,7 +151,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				if limit > 50 {
 					limit = 50
 				}
-				return queryMessageRows(store, storage.MessageFilter{
+				return queryMessageRows(store, images, turn, storage.MessageFilter{
 					ChatType: p.ChatType,
 					ChatID:   p.ChatID,
 					Limit:    limit,
@@ -160,7 +160,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 		},
 		{
 			Name:        "view_message_images",
-			Description: "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。历史上下文只携带最近几条消息的图片，更早的图用它按需查看。",
+			Description: "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。查询工具的结果会自动附带最新几条消息的图片，单条消息的图或自动附带跳过的图用这个工具补看。",
 			Parameters: objectParams(map[string]any{
 				"message_id": intProp("消息 ID（从聊天记录或上下文里拿）"),
 			}, []string{"message_id"}),
@@ -169,7 +169,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					return "", errors.New("记忆库未启用，无法查看消息图片")
 				}
 				if images == nil {
-					return "", errors.New("图片下载缓存不可用，无法查看消息图片")
+					return "", errors.New("图片存储不可用，无法查看消息图片")
 				}
 				var p struct {
 					MessageID int64 `json:"message_id"`
@@ -187,7 +187,8 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				if rec == nil {
 					return "", fmt.Errorf("没有找到消息 %d", p.MessageID)
 				}
-				// 解析 image 段：url 供直连下载，file 留作 get_image 换链
+				// 解析 image 段：idx 对全部 image 段计数（与 storage 映射锚
+				// 一致）；url 供下载，file 留作 get_image 换链
 				var segs []struct {
 					Type string `json:"type"`
 					Data struct {
@@ -200,28 +201,36 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 						return "", fmt.Errorf("解析消息 %d 的消息段失败: %w", p.MessageID, err)
 					}
 				}
-				type imgSeg struct{ url, file string }
+				type imgSeg struct {
+					idx      int
+					url, file string
+				}
 				var imgs []imgSeg
+				idx := 0
 				for _, seg := range segs {
-					if seg.Type != "image" || (seg.Data.URL == "" && seg.Data.File == "") {
+					if seg.Type != "image" {
 						continue
 					}
-					imgs = append(imgs, imgSeg{url: seg.Data.URL, file: seg.Data.File})
+					if seg.Data.URL != "" || seg.Data.File != "" {
+						imgs = append(imgs, imgSeg{idx: idx, url: seg.Data.URL, file: seg.Data.File})
+					}
+					idx++
 				}
 				if len(imgs) == 0 {
 					return "", fmt.Errorf("消息 %d 里没有图片", p.MessageID)
 				}
-				// 逐张取 data URL：原 url 直连下载 → 失败走 NapCat get_image
-				// 换新链 → 仍不可用（如换链只给 NapCat 侧本地路径，跨 WSL
-				// 读不了）则该图跳过并在结果里注明。
+				// 逐张取 data URL：锚定解析（映射/磁盘命中零网络）→ 原 url
+				// 直连下载 → 失败走 NapCat get_image 换新链（成功则同一锚点
+				// 回填映射，下次零网络）→ 仍不可用（如换链只给 NapCat 侧本地
+				// 路径，跨 WSL 读不了）则该图跳过并在结果里注明。
 				var (
 					dus   []string
 					skips []string
 				)
-				for i, img := range imgs {
+				for _, img := range imgs {
 					du := ""
 					if img.url != "" {
-						du = images.dataURL(img.url) // 成功必为 data: 前缀；失败回退原 url
+						du = images.dataURLFor(p.MessageID, img.idx, img.url) // 成功必为 data: 前缀；失败回退原 url
 					}
 					if !strings.HasPrefix(du, "data:") && img.file != "" {
 						if data, err := callNapCat(&api.GetImage{File: img.file}); err == nil {
@@ -230,7 +239,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 								URL  string `json:"url"`
 							}
 							if jerr := json.Unmarshal(data, &gi); jerr == nil && isDownloadableURL(gi.URL) {
-								if d2 := images.dataURL(gi.URL); strings.HasPrefix(d2, "data:") {
+								if d2 := images.dataURLFor(p.MessageID, img.idx, gi.URL); strings.HasPrefix(d2, "data:") {
 									du = d2
 								}
 							}
@@ -239,11 +248,11 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					if !strings.HasPrefix(du, "data:") {
 						switch {
 						case img.url == "":
-							skips = append(skips, fmt.Sprintf("第 %d 张：消息段缺 url，换链也未取得可用链接", i+1))
+							skips = append(skips, fmt.Sprintf("第 %d 张：消息段缺 url，换链也未取得可用链接", img.idx+1))
 						case img.file == "":
-							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 下载失败且消息段没有 file 可换链", i+1))
+							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 下载失败且消息段没有 file 可换链", img.idx+1))
 						default:
-							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 与 get_image 换链均不可用（可能只有 NapCat 侧本地路径），已跳过", i+1))
+							skips = append(skips, fmt.Sprintf("第 %d 张：原 url 与 get_image 换链均不可用（可能只有 NapCat 侧本地路径），已跳过", img.idx+1))
 						}
 						continue
 					}
@@ -350,7 +359,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 		},
 		{
 			Name:        "update_mood",
-			Description: "更新自己的当前情绪状态，会注入到之后的 system 提示中。",
+			Description: "更新自己的当前情绪状态，会注入到之后的对话开头；只在情绪真的变化时调用。",
 			Parameters: objectParams(map[string]any{
 				"mood": strProp("新的情绪状态，如 开心 / 无聊 / 有点生气"),
 			}, []string{"mood"}),
@@ -649,9 +658,16 @@ func marshalCompact(v any) (string, error) {
 	return string(data), nil
 }
 
+// maxAutoAttachImages 查询工具单次自动附图上限（多模态直送下一条消息）。
+const maxAutoAttachImages = 5
+
 // queryMessageRows 查询（可选 FTS 关键词）并把结果序列化为与上下文行
-// 同构的紧凑 JSON 数组（旧→新）：message_id/chat_type/chat_id/sender_name/text/time。
-func queryMessageRows(store *storage.Store, f storage.MessageFilter, keyword ...string) (string, error) {
+// 同构的紧凑 JSON 数组（旧→新）：message_id/chat_type/chat_id/sender_name/
+// text/time，带图行额外有 images（图片张数）。最新消息的图片自动解析并附在
+// 下一条消息里（turn/images 非 nil 时），单次最多 maxAutoAttachImages 张，
+// 附上的行带 images_attached 标记——查到具体消息即看图，URL 失效的旧图自动
+// 跳过（可再调 view_message_images 走换链兜底）。
+func queryMessageRows(store *storage.Store, images *imageStore, turn *Turn, f storage.MessageFilter, keyword ...string) (string, error) {
 	if store == nil {
 		return "", fmt.Errorf("记忆库未启用，无法查询消息")
 	}
@@ -670,14 +686,42 @@ func queryMessageRows(store *storage.Store, f storage.MessageFilter, keyword ...
 	rows := make([]map[string]any, 0, len(records))
 	for i := len(records) - 1; i >= 0; i-- { // 倒序 → 正序（旧→新）
 		r := records[i]
-		rows = append(rows, map[string]any{
+		row := map[string]any{
 			"message_id":  r.MessageID,
 			"chat_type":   r.ChatType,
 			"chat_id":     r.ChatID,
 			"sender_name": r.SenderName,
 			"text":        r.RawMessage,
 			"time":        time.Unix(int64(r.Time), 0).Format(timeLayout),
-		})
+		}
+		if refs := extractImageRefs(r.Segments); len(refs) > 0 {
+			row["images"] = len(refs)
+		}
+		rows = append(rows, row)
+	}
+	// 自动附图：从最新记录往前解析（records 为时间倒序，最新在前）
+	if turn != nil && images != nil {
+		attached := 0
+		for i := 0; i < len(records) && attached < maxAutoAttachImages; i++ {
+			r := records[i]
+			refs := extractImageRefs(r.Segments)
+			if len(refs) == 0 {
+				continue
+			}
+			row := rows[len(records)-1-i] // 正序行数组里对应本条记录的下标
+			for _, ref := range refs {
+				if attached >= maxAutoAttachImages {
+					break
+				}
+				du := images.dataURLFor(r.MessageID, ref.Idx, ref.URL)
+				if !strings.HasPrefix(du, "data:") { // URL 失效等，跳过
+					continue
+				}
+				turn.pendingImages = append(turn.pendingImages, du)
+				row["images_attached"] = true
+				attached++
+			}
+		}
 	}
 	return marshalCompact(rows)
 }

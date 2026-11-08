@@ -27,11 +27,18 @@ import (
 
 // Tool 一个可被 LLM 调用的工具。Run 收到原始 JSON 参数，返回紧凑 JSON
 // 字符串；Run 为 nil 表示纯标记工具（finish），由循环特殊处理、不执行。
+// Usage/Asyncable 与定义同处一地：加工具 = 写齐本结构体，文档与 schema 自动生成。
 type Tool struct {
 	Name        string
-	Description string
+	Description string // 一句话（schema 用，模型选工具的第一线索）
 	Parameters  any
-	Run         func(args json.RawMessage) (string, error)
+	// Usage 完整使用说明（markdown）：参数明细/最小示例/错误形态。
+	// 随 PromptDocs 注入 system 静态区；必须确定性（禁时间戳/随机）。
+	Usage string
+	// Asyncable 允许模型以 {"_async":true,...} 调用走后台任务（方案 B）。
+	// 仅慢 IO 类工具声明；Asyncable 工具的 Usage 里必须写明异步语义。
+	Asyncable bool
+	Run       func(args json.RawMessage) (string, error)
 }
 
 // toolDefs 把工具集转成 OpenAI tools 请求参数。
@@ -76,21 +83,11 @@ func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }
 
-// newToolSet 构造全部工具。notesPath/statePath 由 manager 注入（默认
-// agent/notes.json、agent/state.json，测试注入临时目录）；store 为 nil 时
-// 查询类工具返回 error。isAdmin 由 manager 按 turn 发送者是否管理员判定，
-// 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
-// turn 为本轮 chat 上下文（schedule 从中捕获会话，可为 nil）；timer 为
-// 计时器存储（P3.5，nil 时 schedule/cancel_timer 返回 error）；images 为
-// 内容寻址图片存储（view_message_images 与查询工具自动带图用，nil 时报错）。
-func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool, turn *Turn, timer *TimerStore, images *imageStore) []Tool {
-	// schedule 的会话上下文在构造期从 turn 捕获（工具 Run 拿不到 turn）。
-	var curChatType string
-	var curChatID, curSelfID int64
-	if turn != nil {
-		curChatType, curChatID, curSelfID = turn.ChatType, turn.ChatID, turn.SelfID
-	}
-	tools := []Tool{
+// memoryTools 记忆板块：历史查询/搜索/消息图片查看。查询结果自动附带最新
+// 几条消息的图片（images_attached 标注）；store/images 为 nil 时工具报错。
+func memoryTools(ctx *ToolContext) []Tool {
+	store, images, turn := ctx.Store, ctx.Images, ctx.Turn
+	return []Tool{
 		{
 			Name:        "get_recent_messages",
 			Description: "查询最近的聊天记录（跨会话混合，按时间正序返回 JSON 数组）。",
@@ -276,6 +273,13 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				return marshalCompact(out)
 			},
 		},
+	}
+}
+
+// coreTools 核心板块：发消息、思考笔记、情绪、结束。finish 是唯一的轮终止工具。
+func coreTools(ctx *ToolContext) []Tool {
+	store, notesPath, statePath := ctx.Store, ctx.NotesPath, ctx.StatePath
+	return []Tool{
 		{
 			Name:        "send_message",
 			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/mface/sticker/dice/rps/json/image），两者二选一。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
@@ -299,6 +303,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 					},
 				},
 			}, []string{"chat_type", "chat_id"}),
+			Usage: "示例——引用回复某人并 @ 他说话：\n`{\"chat_type\":\"group\",\"chat_id\":928952016,\"segments\":[{\"type\":\"reply\",\"data\":{\"id\":12345}},{\"type\":\"at\",\"data\":{\"qq\":10001}},{\"type\":\"text\",\"data\":{\"text\":\"来了\"}}]}`\n错误形态：text/segments 皆缺或同给 → 报错回填；段类型不在白名单 → 报错；text 单次累计 ≤8000 字符。",
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
 					ChatType string         `json:"chat_type"`
@@ -376,7 +381,19 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				return "{}", writeState(statePath, p.Mood)
 			},
 		},
-		// ================= 表情收藏与发送 =================
+		{
+			Name:        "finish",
+			Description: "结束本轮思考。可以发了消息再结束，也可以什么都不发直接结束；调用后本轮终止。",
+			Parameters:  objectParams(nil, nil),
+			Usage:       "无参数。finish 前已发出的消息均已生效；不调用 send_message 直接 finish = 本轮不回复。",
+		},
+	}
+}
+
+// stickerTools 表情收藏板块：本地收藏夹 + QQ 账号级收藏表情。
+func stickerTools(ctx *ToolContext) []Tool {
+	store := ctx.Store
+	return []Tool{
 		{
 			Name:        "save_sticker",
 			Description: "把一条消息里的表情/图片收藏起来（自带表情 face、商城表情 mface、图片 image），之后可用 send_message 的 sticker 段随时发出去。seg_index 是该消息里第几个消息段（从 0 开始，默认 0）。",
@@ -543,6 +560,19 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				return marshalCompact(map[string]any{"path": path, "added": true})
 			},
 		},
+	}
+}
+
+// systemTools 系统板块：定时器、后台任务管理、行为回溯。
+func systemTools(ctx *ToolContext) []Tool {
+	timer := ctx.Timer
+	// schedule 的会话上下文在构造期从 turn 捕获（工具 Run 拿不到 turn）。
+	var curChatType string
+	var curChatID, curSelfID int64
+	if turn := ctx.Turn; turn != nil {
+		curChatType, curChatID, curSelfID = turn.ChatType, turn.ChatID, turn.SelfID
+	}
+	tools := []Tool{
 		// P3-5 定时器工具：到点经 fire 回调合成为 [定时提醒] 消息排队唤醒。
 		{
 			Name:        "schedule",
@@ -551,6 +581,7 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				"delay_seconds": intProp("多少秒后提醒，1 ~ 604800（最长 7 天）"),
 				"note":          strProp("到点提醒内容：写清楚到时要做什么、发给谁（会话与内容）"),
 			}, []string{"delay_seconds", "note"}),
+			Usage: "示例——十分钟后在当前群跟进：\n`{\"delay_seconds\":600,\"note\":\"在群 928952016 看看他回了没，回了就接话\"}`\n错误形态：delay 超出 1~604800 或 note 为空 → 报错回填。",
 			Run: func(args json.RawMessage) (string, error) {
 				if timer == nil {
 					return "", errors.New("定时器不可用")
@@ -603,39 +634,10 @@ func newToolSet(store *storage.Store, notesPath, statePath string, isAdmin bool,
 				return marshalCompact(map[string]any{"cancelled": true})
 			},
 		},
-		{
-			Name:        "finish",
-			Description: "结束本轮思考。可以发了消息再结束，也可以什么都不发直接结束；调用后本轮终止。",
-			Parameters:  objectParams(nil, nil),
-		},
 	}
-	// P3-2 QQ 能力工具与逃生舱，插在 help 之前（help 捕获完整工具集）。
-	tools = append(tools, qqTools(isAdmin)...)
-
-	// help 的 Run 捕获完整工具集（含自身，单一源头）。
-	help := Tool{
-		Name:        "help",
-		Description: "返回全部工具的名称、描述与参数用法说明（JSON 数组）。不确定其他工具怎么用时先调用它。",
-		Parameters:  objectParams(nil, nil),
-		Run: func(json.RawMessage) (string, error) {
-			return marshalCompact(helpPayload(tools))
-		},
-	}
-	tools = append(tools, help)
+	// T5/T6：后台任务管理工具（task_list/task_get/task_cancel）与行为回溯
+	// （self_events）在此追加。
 	return tools
-}
-
-// helpPayload 从工具定义生成 help 输出（单一源头，无独立文档）。
-func helpPayload(tools []Tool) []map[string]any {
-	out := make([]map[string]any, 0, len(tools))
-	for _, t := range tools {
-		out = append(out, map[string]any{
-			"name":        t.Name,
-			"description": t.Description,
-			"parameters":  t.Parameters,
-		})
-	}
-	return out
 }
 
 // decodeArgs 解析工具参数；空参数视为无参。
@@ -1097,29 +1099,31 @@ func downloadFilePath(data json.RawMessage) string {
 	return ""
 }
 
-// qqTools 构造 P3-2 的 QQ 能力工具（26 个人性化封装 + 逃生舱 2 个）。
-// isAdmin 决定危险工具是否放行。
-func qqTools(isAdmin bool) []Tool {
+// emptyOK 调用成功即返回 "{}"。
+func emptyOK(_ json.RawMessage, err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	return "{}", nil
+}
+
+// passthrough data 原样返回（NapCat 返回的本身就是紧凑 JSON）。
+func passthrough(data json.RawMessage, err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// qqTools admin 板块：QQ 能力工具（群/好友/文件/请求处理）与 napcat 逃生舱。
+// admin 决定危险工具是否放行。
+func qqTools(admin bool) []Tool {
 	// requireAdmin 危险工具的统一门槛。
 	requireAdmin := func() error {
-		if !isAdmin {
+		if !admin {
 			return errAdminRequired
 		}
 		return nil
-	}
-	// emptyOK 调用成功即返回 "{}"。
-	emptyOK := func(_ json.RawMessage, err error) (string, error) {
-		if err != nil {
-			return "", err
-		}
-		return "{}", nil
-	}
-	// passthrough data 原样返回（NapCat 返回的本身就是紧凑 JSON）。
-	passthrough := func(data json.RawMessage, err error) (string, error) {
-		if err != nil {
-			return "", err
-		}
-		return string(data), nil
 	}
 
 	return []Tool{
@@ -1769,6 +1773,8 @@ func qqTools(isAdmin bool) []Tool {
 				"file":     strProp("本地文件绝对路径"),
 				"name":     strProp("上传后显示的文件名"),
 			}, []string{"group_id", "file", "name"}),
+			Usage: "上传耗时与文件大小相关，大文件建议 `\"_async\": true` 后台执行：立即返回任务回执，完成后自动送达结果。\n错误形态：file 为 http/base64 链接 → 报错；群文件系统未开启 → NapCat 报错回填。",
+			Asyncable: true,
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
 					GroupID int64  `json:"group_id"`
@@ -1830,6 +1836,7 @@ func qqTools(isAdmin bool) []Tool {
 					"description": "动作参数对象，键为文档里的参数名；无参动作可省略",
 				},
 			}, []string{"action"}),
+			Usage: "示例——查群荣耀：\n`{\"action\":\"get_group_honor_info\",\"params\":{\"group_id\":928952016,\"type\":\"legend\"}}`\n未知动作会列出全部可用动作名；params 键名必须与文档一致（驼峰），解析失败报错回填。",
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
 					Action string          `json:"action"`
@@ -1851,7 +1858,7 @@ func qqTools(isAdmin bool) []Tool {
 					sort.Strings(names)
 					return "", fmt.Errorf("未知动作 %q，可用动作：%s", p.Action, strings.Join(names, ", "))
 				}
-				if !isAdmin && dangerousNapcatActions[name] {
+				if !admin && dangerousNapcatActions[name] {
 					return "", errAdminRequired
 				}
 				reqVal := reflect.New(typ) // *T，T 为该动作的请求结构体
@@ -1871,8 +1878,19 @@ func qqTools(isAdmin bool) []Tool {
 				return strings.TrimSpace(napcatActionsJSON), nil
 			},
 		},
-		// ================= P4：QQ 空间工具（全部走 SnowLuma 形态：tid/target_uin，
-		// 不用 feed_ref，两种定位方式不能混用） =================
+	}
+}
+
+// qzoneTools QQ 空间板块（全部走 SnowLuma 形态：tid/target_uin，
+// 不用 feed_ref，两种定位方式不能混用）。
+func qzoneTools(admin bool) []Tool {
+	requireAdmin := func() error {
+		if !admin {
+			return errAdminRequired
+		}
+		return nil
+	}
+	return []Tool{
 		{
 			Name:        "post_qzone",
 			Description: "在自己的 QQ 空间发一条说说：text 必填；images 可选，传图片链接数组（http/https/file/base64 均可，NapCat 自动上传）。空间是公开内容，发布前想清楚。",

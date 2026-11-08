@@ -27,7 +27,7 @@ const agentGuideText = `[Agent 工作方式]
 你在思考循环中：可先调用工具查资料、记笔记、调整状态，再决定是否回复。
 - 要说话必须调用 send_message（可多次调用，分条发送）；不调用即本轮不回复。
 - think(note) 记录思考笔记，下一轮对话可见；update_mood(mood) 更新你的情绪。
-- 查历史用 get_recent_messages，搜历史用 search_messages；用法不确定先调 help。
+- 查历史用 get_recent_messages，搜历史用 search_messages；工具用法见 system 提示里的工具使用说明。
 - 想结束本轮思考就调用 finish；finish 前已发出的消息均已生效。`
 
 // defaultGuidePath guide_file 未配置时的默认路径。

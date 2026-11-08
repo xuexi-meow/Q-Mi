@@ -84,6 +84,10 @@ type Manager struct {
 	// 自建一份。
 	images *imageStore
 
+	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器。
+	registry *ToolRegistry
+	tasks    *TaskManager
+
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
 	mu       sync.Mutex // 保护 sessions 及其中 pending/timer
@@ -114,6 +118,8 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	} else {
 		m.images = newImageStore(defaultImagesDir, store)
 	}
+	m.registry = NewRegistry(defaultModules()...)
+	m.tasks = NewTaskManager(m.deliverTaskResult)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
 	return m
@@ -211,6 +217,29 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 	}
 }
 
+// deliverTaskResult 后台任务完成投递：格式化为合成消息入来源会话队列
+//（复用防抖/打断/排队语义：worker 空闲立即开新 turn，思考中排队接上）。
+// 已取消的任务不经过此回调（TaskManager 保证）。
+func (m *Manager) deliverTaskResult(t BackgroundTask) {
+	var line string
+	switch t.Status {
+	case TaskDone:
+		line = fmt.Sprintf("[后台任务 #%d] %s 完成: %s", t.ID, t.Tool, t.Result)
+	case TaskFailed:
+		line = fmt.Sprintf("[后台任务 #%d] %s 失败: %s", t.ID, t.Tool, t.Err)
+	default:
+		return
+	}
+	m.Enqueue(IncomingMessage{
+		ChatType:   t.ChatType,
+		ChatID:     t.ChatID,
+		SelfID:     t.SelfID,
+		SenderID:   t.SelfID,
+		SenderName: "后台任务",
+		Text:       truncateRunes(line, maxEventText),
+	})
+}
+
 // fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
 // （发送者「定时」、SenderID=SelfID、文本 [定时提醒] 前缀）。走正常防抖
 // 排队，不打断正在进行的思考；非紧急。
@@ -286,7 +315,17 @@ func (m *Manager) handleTurn(turn *Turn) {
 			break
 		}
 	}
-	tools := newToolSet(m.store, m.notesPath, m.statePath, isAdmin, turn, m.timerStore, m.images)
+	tools := m.registry.Build(&ToolContext{
+		Store:     m.store,
+		Turn:      turn,
+		Timer:     m.timerStore,
+		Images:    m.images,
+		Tasks:     m.tasks,
+		Events:    m.events,
+		NotesPath: m.notesPath,
+		StatePath: m.statePath,
+		Admin:     isAdmin,
+	})
 	defs := toolDefs(tools)
 	maxRounds := m.cfg.MaxToolRounds
 	if maxRounds <= 0 {

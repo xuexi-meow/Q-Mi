@@ -109,7 +109,7 @@ func TestBuildMoodInTailNotSystem(t *testing.T) {
 	if strings.Contains(sys, "当前情绪状态") {
 		t.Errorf("情绪不应进 system（会击穿缓存前缀）: %q", sys)
 	}
-	for _, keyword := range []string{"send_message", "finish", "help", "think", "update_mood"} {
+	for _, keyword := range []string{"send_message", "finish", "think", "update_mood"} {
 		if !strings.Contains(sys, keyword) {
 			t.Errorf("agent 格式说明未提及工具 %s: %q", keyword, sys)
 		}

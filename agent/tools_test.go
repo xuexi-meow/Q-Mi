@@ -34,23 +34,33 @@ func readState(t *testing.T, path string) (agentStateFile, error) {
 
 func osStat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
+// buildTools 用 ctx 从默认注册表拼工具集（测试统一入口，等价生产路径）。
+func buildTools(ctx *ToolContext) []Tool {
+	return NewRegistry(defaultModules()...).Build(ctx)
+}
+
 // testToolSet 用临时 notes/state 路径构造工具集，避免测试污染 agent/ 目录。
-// 默认非管理员（isAdmin=false）；需要管理员视角用 testToolSetAdmin。
+// 默认非管理员；需要管理员视角用 testToolSetAdmin。
 // 不带计时器与 chat 上下文（schedule/cancel_timer 应报「定时器不可用」）。
-// images 为图片下载缓存（view_message_images 用），按需注入。
+// images 为图片存储（view_message_images 用），按需注入。
 func testToolSet(t *testing.T, store *storage.Store) ([]Tool, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	notesPath := filepath.Join(dir, "notes.json")
 	statePath := filepath.Join(dir, "state.json")
-	return newToolSet(store, notesPath, statePath, false, nil, nil, nil), notesPath, statePath
+	tools := buildTools(&ToolContext{Store: store, NotesPath: notesPath, StatePath: statePath})
+	return tools, notesPath, statePath
 }
 
 // testToolSetAdmin 管理员视角的工具集（危险工具放行）。
 func testToolSetAdmin(t *testing.T) []Tool {
 	t.Helper()
 	dir := t.TempDir()
-	return newToolSet(nil, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"), true, nil, nil, nil)
+	return buildTools(&ToolContext{
+		NotesPath: filepath.Join(dir, "notes.json"),
+		StatePath: filepath.Join(dir, "state.json"),
+		Admin:     true,
+	})
 }
 
 // testToolSetWithTimers 带真实 TimerStore（临时路径）与 chat 上下文 turn 的
@@ -58,11 +68,15 @@ func testToolSetAdmin(t *testing.T) []Tool {
 func testToolSetWithTimers(t *testing.T) ([]Tool, *TimerStore) {
 	t.Helper()
 	dir := t.TempDir()
-	notesPath := filepath.Join(dir, "notes.json")
-	statePath := filepath.Join(dir, "state.json")
 	timer := NewTimerStore(filepath.Join(dir, "timers.json"), func(ScheduledTimer) {})
 	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
-	return newToolSet(nil, notesPath, statePath, false, turn, timer, nil), timer
+	tools := buildTools(&ToolContext{
+		NotesPath: filepath.Join(dir, "notes.json"),
+		StatePath: filepath.Join(dir, "state.json"),
+		Turn:      turn,
+		Timer:     timer,
+	})
+	return tools, timer
 }
 
 // testToolSetForViewImages 带 store、chat 上下文 turn 与图片存储的工具集
@@ -71,8 +85,14 @@ func testToolSetForViewImages(t *testing.T, store *storage.Store, images *imageS
 	t.Helper()
 	dir := t.TempDir()
 	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999}
-	return newToolSet(store, filepath.Join(dir, "notes.json"), filepath.Join(dir, "state.json"),
-		false, turn, nil, images), turn
+	tools := buildTools(&ToolContext{
+		Store:     store,
+		NotesPath: filepath.Join(dir, "notes.json"),
+		StatePath: filepath.Join(dir, "state.json"),
+		Turn:      turn,
+		Images:    images,
+	})
+	return tools, turn
 }
 
 // findTool 按名字取工具。
@@ -112,16 +132,19 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 	return err
 }
 
-// wantToolNames P2 核心工具 + P3-2 QQ 能力工具（顺序即工具集顺序，help 恒在末尾）。
+// wantToolNames 全部内置工具（顺序 = 模块注册顺序：core → memory → sticker →
+// qzone → admin → system；help 已由 PromptDocs 取代）。
 var wantToolNames = []string{
+	// core
+	"send_message", "think", "update_mood", "finish",
+	// memory
 	"get_recent_messages", "search_messages", "view_message_images",
-	"send_message", "think", "update_mood",
-	// 表情收藏与发送
+	// sticker
 	"save_sticker", "list_stickers", "delete_sticker", "collect_qq_sticker",
-	// P3-5 定时器工具
-	"schedule", "cancel_timer",
-	"finish",
-	// P3-2 人性化 QQ 工具
+	// qzone
+	"post_qzone", "browse_qzone_feeds", "read_qzone_post",
+	"qzone_like", "comment_qzone", "qzone_profile", "delete_qzone",
+	// admin：QQ 能力工具 + 逃生舱
 	"recall_message", "get_friend_list",
 	"lookup_user", "lookup_groups", "lookup_group", "lookup_members", "lookup_member",
 	"set_group_card", "set_group_special_title",
@@ -132,13 +155,9 @@ var wantToolNames = []string{
 	"handle_friend_request", "handle_group_request",
 	"get_msg_history", "get_forward_detail",
 	"upload_group_file", "get_group_files",
-	// P3-2 万能逃生舱
 	"napcat_api", "napcat_docs",
-	// P4 QQ 空间工具
-	"post_qzone", "browse_qzone_feeds", "read_qzone_post",
-	"qzone_like", "comment_qzone", "qzone_profile", "delete_qzone",
-	// 收尾
-	"help",
+	// system
+	"schedule", "cancel_timer",
 }
 
 // dangerousToolNames 需要管理员权限的工具。
@@ -185,41 +204,6 @@ func TestDangerousToolsBlockedForNonAdmin(t *testing.T) {
 				t.Errorf("管理员调用 %s 应发出 1 次请求, got %d", name, nap.count())
 			}
 		})
-	}
-}
-
-// TestHelpToolDescribesAllTools help 从工具定义生成全部工具的
-// 名称+描述+参数 schema（单一源头），JSON 数组、无空白。
-func TestHelpToolDescribesAllTools(t *testing.T) {
-	tools, _, _ := testToolSet(t, nil)
-
-	out := runToolOK(t, tools, "help", "")
-	if strings.ContainsAny(out, "\n\t") || strings.Contains(out, ": ") {
-		t.Errorf("help 输出应为紧凑 JSON: %q", out)
-	}
-	var items []map[string]any
-	if err := json.Unmarshal([]byte(out), &items); err != nil {
-		t.Fatalf("help 输出不是 JSON 数组: %v (%s)", err, out)
-	}
-	if len(items) != len(wantToolNames) {
-		t.Fatalf("help 条目数 = %d, want %d", len(items), len(wantToolNames))
-	}
-	seen := map[string]bool{}
-	for _, it := range items {
-		name, _ := it["name"].(string)
-		desc, _ := it["description"].(string)
-		if name == "" || desc == "" {
-			t.Errorf("help 条目缺 name/description: %v", it)
-		}
-		if _, ok := it["parameters"]; !ok {
-			t.Errorf("help 条目 %q 缺 parameters", name)
-		}
-		seen[name] = true
-	}
-	for _, name := range wantToolNames {
-		if !seen[name] {
-			t.Errorf("help 未列出工具 %q", name)
-		}
 	}
 }
 

@@ -61,14 +61,14 @@ type toolMsg struct {
 	Content    string
 }
 
-// TestThinkLoopFullSequence 假 LLM 依次返回 [help 调用, think+get_recent_messages
+// TestThinkLoopFullSequence 假 LLM 依次返回 [think 调用, think+get_recent_messages
 // 调用, send_message 调用, finish]：断言 tool 消息按序回填、think 落盘 notes.json、
 // 假 NapCat 收到 send_message、循环在 finish 后正常终止。
 func TestThinkLoopFullSequence(t *testing.T) {
 	b := &stubBuilder{}
 	cfg := testCfg(20 * time.Millisecond)
 	script := []string{
-		toolCallResp("c1", "help", ""),
+		toolCallResp("c1", "think", `{"note":"x"}`),
 		twoToolCallResp("c2", "think", `{"note":"先记一笔"}`, "c3", "get_recent_messages", `{"limit":5}`),
 		toolCallResp("c4", "send_message", `{"chat_type":"group","chat_id":888,"text":"嗨"}`),
 		toolCallResp("c5", "finish", ""),
@@ -94,19 +94,15 @@ func TestThinkLoopFullSequence(t *testing.T) {
 	if got := len(f.reqs[1].Messages); got != 3 {
 		t.Fatalf("请求1 应有 3 条消息(user+assistant+tool), got %d", got)
 	}
-	if name := f.reqs[1].Messages[1].ToolCalls[0].Function.Name; name != "help" {
-		t.Errorf("请求1 的 assistant 调用 = %q, want help", name)
+	if name := f.reqs[1].Messages[1].ToolCalls[0].Function.Name; name != "think" {
+		t.Errorf("请求1 的 assistant 调用 = %q, want think", name)
 	}
 	tool1 := f.reqs[1].Messages[2]
 	if tool1.Role != "tool" || tool1.ToolCallID != "c1" {
 		t.Errorf("请求1 的 tool 消息 = %+v, want role=tool tool_call_id=c1", tool1)
 	}
-	var helpItems []map[string]any
-	if err := json.Unmarshal([]byte(contentText(tool1)), &helpItems); err != nil {
-		t.Fatalf("help 结果不是 JSON 数组: %v (%s)", err, tool1.Content)
-	}
-	if len(helpItems) != len(wantToolNames) {
-		t.Errorf("help 结果应列 %d 个工具, got %d", len(wantToolNames), len(helpItems))
+	if got := contentText(tool1); got != "{}" {
+		t.Errorf("think 结果 = %q, want {}", got)
 	}
 
 	// 请求2: think + get_recent_messages 两个 tool 消息按序回填
@@ -137,9 +133,9 @@ func TestThinkLoopFullSequence(t *testing.T) {
 		t.Errorf("send_message 的 tool 消息 = %+v, want tool/c4/{\"message_id\":1}", msgs3[7])
 	}
 
-	// think 已落盘 notes.json
+	// think 已落盘 notes.json（脚本两次 think：x、先记一笔）
 	notes, err := LoadNotes(m.notesPath)
-	if err != nil || len(notes) != 1 || notes[0].Text != "先记一笔" {
+	if err != nil || len(notes) != 2 || notes[0].Text != "x" || notes[1].Text != "先记一笔" {
 		t.Errorf("think 应落盘 notes.json: notes=%+v err=%v", notes, err)
 	}
 
@@ -328,7 +324,7 @@ func TestHandleTurnMaxToolRoundsForcesEnd(t *testing.T) {
 	cfg.MaxToolRounds = 2
 	script := []string{
 		toolCallResp("c1", "send_message", `{"chat_type":"group","chat_id":888,"text":"先发一条"}`),
-		toolCallResp("c2", "help", ""), // 第 2 轮还在调工具 → 被强制结束
+		toolCallResp("c2", "think", `{"note":"x"}`), // 第 2 轮还在调工具 → 被强制结束
 	}
 	m, f, napcat := newLoopManager(t, cfg, b, nil, script)
 
@@ -347,7 +343,7 @@ func TestHandleTurnMaxToolRoundsForcesEnd(t *testing.T) {
 func TestHandleTurnDefaultMaxToolRoundsZeroFallsBackToTen(t *testing.T) {
 	b := &stubBuilder{}
 	cfg := testCfg(20 * time.Millisecond) // MaxToolRounds 未配置 = 0
-	script := []string{toolCallResp("c1", "help", "")}
+	script := []string{toolCallResp("c1", "think", `{"note":"x"}`)}
 	m, f, napcat := newLoopManager(t, cfg, b, nil, script)
 
 	m.Enqueue(msg("group", 888, "在吗"))

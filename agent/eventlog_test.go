@@ -388,7 +388,7 @@ func TestHandleTurnRecordsMaxRoundsAndInterrupted(t *testing.T) {
 		b := &stubBuilder{}
 		cfg := testCfg(20 * time.Millisecond)
 		cfg.MaxToolRounds = 2
-		script := []string{toolCallResp("c1", "help", "")}
+		script := []string{toolCallResp("c1", "think", `{"note":"x"}`)}
 		m, f, _ := newLoopManager(t, cfg, b, nil, script)
 		m.Enqueue(msg("group", 888, "在吗"))
 		waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "应恰好发出 2 次 LLM 请求")
@@ -402,7 +402,7 @@ func TestHandleTurnRecordsMaxRoundsAndInterrupted(t *testing.T) {
 	t.Run("interrupted", func(t *testing.T) {
 		b := &stubBuilder{}
 		cfg := testCfg(60 * time.Millisecond)
-		m, f, _ := newLoopManager(t, cfg, b, nil, []string{toolCallResp("c1", "help", "")})
+		m, f, _ := newLoopManager(t, cfg, b, nil, []string{toolCallResp("c1", "think", `{"note":"x"}`)})
 		started := make(chan struct{})
 		released := make(chan struct{})
 		f.mu.Lock()

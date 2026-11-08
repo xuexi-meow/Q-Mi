@@ -107,6 +107,16 @@ type NapcatConn struct {
 	Token  string `yaml:"token"`
 }
 
+// ModelTier 一个模型档位（model profile）：接入参数 + 能力标签。
+// capabilities 自由标记（tools/vision/video/thinking…），路由与文档据此
+// 判断该档能处理什么内容。
+type ModelTier struct {
+	BaseURL      string   `yaml:"base_url" mapstructure:"base_url"`
+	APIKey       string   `yaml:"api_key" mapstructure:"api_key"`
+	Model        string   `yaml:"model" mapstructure:"model"`
+	Capabilities []string `yaml:"capabilities" mapstructure:"capabilities"`
+}
+
 // AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
 // 注意：viper UnmarshalKey 走 mapstructure，多单词键需 mapstructure 标签。
 type AgentConfig struct {
@@ -122,6 +132,12 @@ type AgentConfig struct {
 	WorkspaceDir string `yaml:"workspace_dir" mapstructure:"workspace_dir"`
 	// BrowserExec 浏览器可执行文件路径（browser 板块）；空串 = 自动探测 Chrome/Edge。
 	BrowserExec string `yaml:"browser_executable" mapstructure:"browser_executable"`
+	// Models 分档模型档位（model profile）：键为档位名（chat / background /
+	// video / 自定义），值为该档的接入参数与能力标签。路由规则（manager）：
+	// 含视频内容 → video 档（未配置则 chat 并降级提示）；后台类唤醒
+	// （轮询/通知/定时/任务回执）→ background 档；其余 → chat。
+	// 不配置 Models 时整体回退到顶层 base_url/api_key/model（作为 chat 档）。
+	Models map[string]ModelTier `yaml:"models" mapstructure:"models"`
 	// Modules 工具板块启停（重启生效，无热插拔）：缺省键 = 启用；
 	// 显式 false 的板块不加载（工具与文档都不出现）。
 	Modules  map[string]bool `yaml:"modules" mapstructure:"modules"`
@@ -240,8 +256,7 @@ func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, ag
 }
 
 // validateAgentConfig 校验启用的 agent 块。
-func validateAgentConfig(agent *AgentConfig) error {
-	baseURL := strings.TrimSpace(agent.BaseURL)
+func validateAgentConfig(agent *AgentConfig) error {	baseURL := strings.TrimSpace(agent.BaseURL)
 	u, err := url.ParseRequestURI(baseURL)
 	if err != nil {
 		return fmt.Errorf("agent.base_url: %w", err)
@@ -263,6 +278,18 @@ func validateAgentConfig(agent *AgentConfig) error {
 	}
 	if agent.Debounce <= 0 {
 		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)
+	}
+	// models 分档：每个显式配置的档位必须有完整接入参数
+	for name, tier := range agent.Models {
+		if strings.TrimSpace(tier.BaseURL) == "" {
+			return fmt.Errorf("agent.models.%s.base_url must not be empty", name)
+		}
+		if strings.TrimSpace(tier.APIKey) == "" {
+			return fmt.Errorf("agent.models.%s.api_key must not be empty", name)
+		}
+		if strings.TrimSpace(tier.Model) == "" {
+			return fmt.Errorf("agent.models.%s.model must not be empty", name)
+		}
 	}
 	// self_wake P3.6：空串=默认 10 分钟，"off"/"0"=关闭；其余须解析成功且 ≥30s。
 	if s := strings.TrimSpace(agent.SelfWake); s != "" && s != "off" && s != "0" {

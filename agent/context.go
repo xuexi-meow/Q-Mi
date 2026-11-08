@@ -38,6 +38,7 @@ const defaultGuidePath = "agent/guide.md"
 type Turn struct {
 	ChatType    string // 本轮新消息所属会话类型，"private" / "group"（SendLLM 回复用）
 	ChatID      int64  // 本轮新消息所属会话：群号；私聊 = 对方 QQ
+	Wake        string // 唤醒类型（模型档位路由用；空 = chat）
 	SelfID      int64  // 机器人自身 QQ
 	Now         time.Time
 	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入末尾 user 块头部（进 system 会击穿缓存前缀）
@@ -61,9 +62,16 @@ func (t *Turn) AddPendingImage(du string) {
 	t.pendingImages = append(t.pendingImages, du)
 }
 
+// 唤醒类型（路由模型档位用）。
+const (
+	WakeChat       = "chat"       // 有人找它 / 它主动说话
+	WakeBackground = "background" // 轮询/通知/定时/任务回执等后台唤醒
+)
+
 // TurnMessage 本轮防抖窗口内的一条新消息。
 type TurnMessage struct {
 	MessageID  int64  // OneBot 消息 ID（图片以 (message_id, 图片序号) 为锚做内容寻址缓存）
+	Wake       string // 唤醒类型：WakeChat / WakeBackground（空 = chat）
 	ChatType   string // 该消息所属会话类型 "private" / "group"
 	ChatID     int64  // 该消息所属会话 ID：群号；私聊 = 对方 QQ
 	SenderID   int64

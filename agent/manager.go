@@ -28,6 +28,7 @@ import (
 // IncomingMessage 事件接线层投给 Manager 的一条原始消息。
 type IncomingMessage struct {
 	MessageID  int64  // OneBot 消息 ID（图片锚定用）
+	Wake       string // 唤醒类型：WakeChat / WakeBackground（空 = chat）
 	ChatType   string // "private" / "group"
 	ChatID     int64  // 群号；私聊 = 对方 QQ
 	SelfID     int64  // 机器人自身 QQ
@@ -86,11 +87,13 @@ type Manager struct {
 	images *imageStore
 
 	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器；
-	// approvals 越界/危险操作审批管理器；browser 浏览器单实例（懒启动）。
+	// approvals 越界/危险操作审批管理器；browser 浏览器单实例（懒启动）；
+	// clients 模型档位池（chat 必有；background/video 按配置）。
 	registry  *ToolRegistry
 	tasks     *TaskManager
 	approvals *ApprovalManager
 	browser   *browserManager
+	clients   map[string]*Client
 
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
@@ -126,9 +129,21 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	m.tasks = NewTaskManager(m.deliverTaskResult)
 	m.approvals = NewApprovalManager(m.notifyApproval, m.deliverApprovalResult)
 	m.browser = newBrowserManager(cfg.BrowserExec, defaultBrowserProfileDir)
+	m.clients = buildClients(cfg, client)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
 	return m
+}
+
+// wakeFor 防抖窗口的唤醒类型合并：任一消息是 chat（或紧急）即整轮 chat
+//（聊天质量优先），纯后台唤醒才降级到 background 档。
+func wakeFor(pending []TurnMessage) string {
+	for _, m := range pending {
+		if m.Wake == WakeChat || m.Wake == "" {
+			return WakeChat
+		}
+	}
+	return WakeBackground
 }
 
 // sessionKey 会话键。
@@ -157,8 +172,13 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 		m.sessions[key] = s
 		go m.workerLoop(key, s.ch)
 	}
+	wake := msg.Wake
+	if wake == "" {
+		wake = WakeChat
+	}
 	s.pending = append(s.pending, TurnMessage{
 		MessageID:  msg.MessageID,
+		Wake:       wake,
 		SenderID:   msg.SenderID,
 		SenderName: msg.SenderName,
 		Text:       msg.Text,
@@ -206,6 +226,7 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 			turn := &Turn{
 				ChatType:    chatType,
 				ChatID:      chatID,
+				Wake:        wakeFor(s.pending),
 				SelfID:      selfID,
 				Now:         time.Now(),
 				NewMessages: s.pending,
@@ -237,6 +258,7 @@ func (m *Manager) deliverTaskResult(t BackgroundTask) {
 		return
 	}
 	m.Enqueue(IncomingMessage{
+		Wake:       WakeBackground,
 		ChatType:   t.ChatType,
 		ChatID:     t.ChatID,
 		SelfID:     t.SelfID,
@@ -278,6 +300,7 @@ func (m *Manager) deliverApprovalResult(a Approval, result string, runErr error)
 		line = fmt.Sprintf("[审批 #%d] %s 完成: %s", a.ID, a.Tool, result)
 	}
 	m.Enqueue(IncomingMessage{
+		Wake:       WakeBackground,
 		ChatType:   a.ChatType,
 		ChatID:     a.ChatID,
 		SelfID:     a.SelfID,
@@ -306,11 +329,41 @@ func (m *Manager) TryResolveApproval(text string) bool {
 	return true
 }
 
+// buildClients 构造模型档位池。legacyClient 为顶层 base_url/api_key/model
+// 构造的默认客户端，恒作 chat 档；配置了 agent.models 时各档建独立客户端，
+// 显式的 chat 档覆盖 legacy。未配置 models = 只有 legacy chat 一档。
+func buildClients(cfg config.AgentConfig, legacyClient *Client) map[string]*Client {
+	clients := map[string]*Client{WakeChat: legacyClient}
+	for name, tier := range cfg.Models {
+		if tier.BaseURL == "" || tier.APIKey == "" {
+			clients[name] = legacyClient
+			continue
+		}
+		clients[name] = NewClient(tier.BaseURL, tier.APIKey, llmRequestTimeout)
+	}
+	return clients
+}
+
+// clientFor 按唤醒类型选模型档位：chat 档必选；background 类唤醒在配置了
+// background 档时降档。返回 (档位名, 客户端)；chat 档缺失时返回 nil 由
+// 调用方报错。
+func (m *Manager) clientFor(turn *Turn) (*Client, string) {
+	name := turn.Wake
+	if name == "" {
+		name = WakeChat
+	}
+	if c, ok := m.clients[name]; ok {
+		return c, name
+	}
+	return m.clients[WakeChat], WakeChat
+}
+
 // fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
 // （发送者「定时」、SenderID=SelfID、文本 [定时提醒] 前缀）。走正常防抖
 // 排队，不打断正在进行的思考；非紧急。
 func (m *Manager) fireTimer(st ScheduledTimer) {
 	m.Enqueue(IncomingMessage{
+		Wake:       WakeBackground,
 		ChatType:   st.ChatType,
 		ChatID:     st.ChatID,
 		SelfID:     st.SelfID,
@@ -409,7 +462,9 @@ func (m *Manager) handleTurn(turn *Turn) {
 			Temperature: m.cfg.Temperature,
 			Tools:       defs,
 		}
-		resp, chatErr := m.client.Chat(ctx, req)
+		// 按唤醒类型选模型档位（chat/background/video…，分档路由）
+		client, tier := m.clientFor(turn)
+		resp, chatErr := client.Chat(ctx, req)
 		if chatErr != nil {
 			interrupted := errors.Is(chatErr, context.Canceled)
 			if m.cfg.Debug {
@@ -434,7 +489,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 		recordUsage(u)
 		m.events.Record(turn.ChatType, turn.ChatID, KindUsage,
 			fmt.Sprintf("hit=%d miss=%d out=%d", u.PromptCacheHitTokens, u.PromptCacheMissTokens, u.CompletionTokens))
-		slog.Info("用量", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+		slog.Info("用量", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "tier", tier,
 			"cache_hit", u.PromptCacheHitTokens, "cache_miss", u.PromptCacheMissTokens,
 			"prompt", u.PromptTokens, "output", u.CompletionTokens)
 
@@ -736,3 +791,6 @@ func (m *Manager) dumpDebug(turn *Turn, req ChatRequest, round int, resp *ChatRe
 		slog.Warn("debug 落盘失败", "path", path, "err", err)
 	}
 }
+
+// llmRequestTimeout 单次 LLM 请求超时（defaultNewManager 构造客户端用同一值）。
+const llmRequestTimeout = 120 * time.Second

@@ -74,6 +74,7 @@ func (m *Manager) StartSelfWake(interval time.Duration) {
 		defer ticker.Stop()
 		for range ticker.C {
 			m.Enqueue(IncomingMessage{
+				Wake:       WakeBackground,
 				ChatType:   "private",
 				ChatID:     selfID,
 				SelfID:     selfID,

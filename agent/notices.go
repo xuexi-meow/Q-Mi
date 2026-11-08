@@ -36,6 +36,7 @@ func wakeNotice(main event.MainEvent, w NoticeWake) {
 		return
 	}
 	enqueueNotice(IncomingMessage{
+		Wake:       WakeBackground,
 		ChatType:   w.ChatType,
 		ChatID:     w.ChatID,
 		SelfID:     int64(main.SelfID),

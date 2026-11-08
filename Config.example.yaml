@@ -30,6 +30,22 @@ agent:
   # image_dir: "agent/images"    # 图片内容寻址缓存目录(sha256 落盘,按消息锚定去重,超 2GB 自动清最旧)；缺省即该路径
   # workspace_dir: "agent/workspace"  # 电脑操作工作区(文件读写/下载的围栏根目录)；缺省即该路径
   # browser_executable: "C:/Program Files/Google/Chrome/Application/chrome.exe"  # 浏览器路径；缺省自动探测 Chrome/Edge
+  # models:                          # 分档模型（model profile）：按唤醒类型/内容选档；缺省用顶层 base_url/api_key/model 作 chat 档
+  #   chat:                          # 主对话（有人找它/它主动说话）
+  #     base_url: "https://api.deepseek.com"
+  #     api_key: "sk-..."
+  #     model: "deepseek-flash"
+  #     capabilities: [tools, vision]
+  #   background:                    # 后台唤醒（轮询/通知/定时/任务回执）——便宜/免费档
+  #     base_url: "https://open.bigmodel.cn/api/paas/v4"
+  #     api_key: "..."
+  #     model: "glm-4.6v-flash"
+  #     capabilities: [tools, vision]
+  #   video:                         # 含视频内容的 turn（视频传参需要 Files API 支持，见 roadmap）
+  #     base_url: "https://api.minimax.io/v1"
+  #     api_key: "..."
+  #     model: "MiniMax-M3.1-Flash"
+  #     capabilities: [tools, vision, video]
   # modules:                     # 工具板块启停(重启生效)：缺省键 = 启用，显式 false 不加载
   #   qzone: true
   #   admin: true

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"Q-Mi/utils/config"
 )
 
 // TestSameRoundToolCallsRunConcurrently 同轮多工具并发执行：两个慢 poke 的
@@ -210,5 +212,71 @@ func TestSelfEventsTool(t *testing.T) {
 	}
 	if s := runToolOK(t, tools, "self_events", `{"limit":2}`); strings.Count(s, "\n")+1 != 2 {
 		t.Errorf("limit=2 应只返回 2 条: %s", s)
+	}
+}
+
+// ---------- 分档模型路由 ----------
+
+// TestWakeForMerge 防抖窗口唤醒类型合并：任一 chat（或空）即整轮 chat。
+func TestWakeForMerge(t *testing.T) {
+	chat := wakeFor([]TurnMessage{{Wake: WakeChat}, {Wake: WakeBackground}})
+	if chat != WakeChat {
+		t.Errorf("混合窗口应取 chat, got %s", chat)
+	}
+	bg := wakeFor([]TurnMessage{{Wake: WakeBackground}, {Wake: WakeBackground}})
+	if bg != WakeBackground {
+		t.Errorf("纯后台窗口应取 background, got %s", bg)
+	}
+	def := wakeFor([]TurnMessage{{}})
+	if def != WakeChat {
+		t.Errorf("空 Wake 应视为 chat, got %s", def)
+	}
+}
+
+// TestClientForRouting 按唤醒类型选档：background 档配置时后台唤醒降档，
+// 其余回 chat；未配置 background 档时全部 chat。
+func TestClientForRouting(t *testing.T) {
+	m := &Manager{clients: map[string]*Client{
+		WakeChat:       NewClient("https://chat.example", "k1", time.Second),
+		WakeBackground: NewClient("https://bg.example", "k2", time.Second),
+	}}
+	if _, tier := m.clientFor(&Turn{Wake: WakeBackground}); tier != WakeBackground {
+		t.Errorf("background 唤醒应选 background 档, got %s", tier)
+	}
+	if _, tier := m.clientFor(&Turn{}); tier != WakeChat {
+		t.Errorf("无 Wake 应选 chat 档, got %s", tier)
+	}
+	// 未配置 background 档 → 回 chat
+	m2 := &Manager{clients: map[string]*Client{WakeChat: m.clients[WakeChat]}}
+	if c, tier := m2.clientFor(&Turn{Wake: WakeBackground}); tier != WakeChat || c == m.clients[WakeBackground] {
+		t.Errorf("未配置档位应回退 chat")
+	}
+}
+
+// TestBuildClientsLegacyCompat 未配置 agent.models 时只有 legacy chat 一档；
+// 配置后各档独立客户端，显式 chat 档覆盖 legacy。
+func TestBuildClientsLegacyCompat(t *testing.T) {
+	legacy := NewClient("https://legacy.example", "k0", time.Second)
+	cfg := config.AgentConfig{}
+	clients := buildClients(cfg, legacy)
+	if len(clients) != 1 || clients[WakeChat] != legacy {
+		t.Fatalf("legacy 模式应只有 chat=legacy")
+	}
+
+	cfg.Models = map[string]config.ModelTier{
+		WakeBackground: {BaseURL: "https://bg.example", APIKey: "k2", Model: "glm-4.6v-flash"},
+	}
+	clients = buildClients(cfg, legacy)
+	if clients[WakeChat] != legacy {
+		t.Errorf("chat 档应保持 legacy")
+	}
+	if clients[WakeBackground] == legacy || clients[WakeBackground] == nil {
+		t.Errorf("background 档应建独立客户端")
+	}
+
+	cfg.Models[WakeChat] = config.ModelTier{BaseURL: "https://chat.example", APIKey: "k1", Model: "deepseek-flash"}
+	clients = buildClients(cfg, legacy)
+	if clients[WakeChat] == legacy {
+		t.Errorf("显式 chat 档应覆盖 legacy")
 	}
 }

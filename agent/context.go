@@ -97,6 +97,7 @@ type DefaultBuilder struct {
 	guide      string
 	multimodal bool        // P2.7：开启时带图片的消息行以多模态内容直送模型
 	images     *imageStore // 内容寻址图片存储（多会话 worker 共享，磁盘为事实源）
+	toolDocs   string      // 工具文档（PromptDocs 输出，system 静态区）
 
 	// mu/anchorTime 历史窗口裁剪锚：anchorTime 为当前窗口最早一条消息的
 	// 时间（秒，含亚秒）。窗口 = 时间 ≥ 锚的行，只在窗口超过 max 时整块
@@ -206,14 +207,23 @@ func senderLabel(senderID int64, senderName string, isSelf bool) string {
 //	历史:    全会话混合的 user/assistant 按时间正序    ← 只追加,时间水印块裁剪
 //	user:   [思考笔记] + 情绪 + 本轮新消息逐条 + 当前时间(首条头部) ← 每次变，放末尾
 func (b *DefaultBuilder) Build(turn *Turn) []ChatMessage {
-	// system 全静态（persona+guide+账号QQ）：情绪等任何易变内容都不进 system，
-	// 否则一次变化击穿整段缓存前缀（历史块 + 全部图片）。
-	system := b.persona + "\n" + b.guide + "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
+	// system 全静态（persona+guide+工具文档+账号QQ）：情绪等任何易变内容都
+	// 不进 system，否则一次变化击穿整段缓存前缀（历史块 + 全部图片）。
+	// 工具文档位于历史之前——历史每轮增长插不进它前面，文档每轮全命中；
+	// 文档变更只发生在重启（registry 构造期生成），代价=一次全量 miss。
+	system := b.persona + "\n" + b.guide
+	if b.toolDocs != "" {
+		system += "\n\n" + b.toolDocs
+	}
+	system += "\n当前账号QQ: " + strconv.FormatInt(turn.SelfID, 10)
 	msgs := []ChatMessage{{Role: "system", Content: system}}
 	b.appendHistory(&msgs, turn)
 	msgs = b.appendNewMessages(msgs, turn)
 	return msgs
 }
+
+// SetToolDocs 注入工具文档（ToolRegistry.PromptDocs 输出，启动时一次）。
+func (b *DefaultBuilder) SetToolDocs(docs string) { b.toolDocs = docs }
 
 // historyImageWindow 历史里允许走多模态转换的行窗口：只有从末尾数最后
 // historyImageWindow 条历史行（无论是否带图，按行计数）才把图片转成

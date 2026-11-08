@@ -1206,3 +1206,19 @@ func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
 		}
 	}
 }
+
+// TestToolDefsMinimalSchema wire 层 schema 全量极简：parameters 恒为
+// {"type":"object"}，参数细节由 system 工具文档承载。
+func TestToolDefsMinimalSchema(t *testing.T) {
+	tools, _, _ := testToolSet(t, nil)
+	defs := toolDefs(tools)
+	if len(defs) == 0 {
+		t.Fatal("无工具定义")
+	}
+	for _, d := range defs {
+		p, ok := d.Function.Parameters.(map[string]any)
+		if !ok || len(p) != 1 || p["type"] != "object" {
+			t.Errorf("%s 的 wire schema 应为 {\"type\":\"object\"}, got %#v", d.Function.Name, d.Function.Parameters)
+		}
+	}
+}

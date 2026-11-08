@@ -41,7 +41,9 @@ type Tool struct {
 	Run       func(args json.RawMessage) (string, error)
 }
 
-// toolDefs 把工具集转成 OpenAI tools 请求参数。
+// toolDefs 把工具集转成 OpenAI tools 请求参数。schema 全量极简（{"type":"object"}）：
+// 参数细节由 system 工具文档承载（PromptDocs 从 Tool.Parameters 渲染），
+// 详见 docs/specs/2026-11-08-tool-registry-design.md §7。
 func toolDefs(tools []Tool) []ToolDef {
 	defs := make([]ToolDef, 0, len(tools))
 	for _, t := range tools {
@@ -50,7 +52,7 @@ func toolDefs(tools []Tool) []ToolDef {
 			Function: ToolSchema{
 				Name:        t.Name,
 				Description: t.Description,
-				Parameters:  t.Parameters,
+				Parameters:  map[string]any{"type": "object"},
 			},
 		})
 	}

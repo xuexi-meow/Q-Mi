@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"Q-Mi/utils/config"
 )
 
 // stubModule 测试用板块。
@@ -93,5 +95,30 @@ func TestPromptDocsDeterministic(t *testing.T) {
 	a, b := r.PromptDocs(), r.PromptDocs()
 	if a != b {
 		t.Fatalf("PromptDocs 两次输出不一致（含时间戳/随机/运行时状态即违规）:\n---a---\n%s\n---b---\n%s", a, b)
+	}
+}
+
+// TestEnabledModulesFiltersByConfig 配置关闭的板块不加载，缺省键 = 启用。
+func TestEnabledModulesFiltersByConfig(t *testing.T) {
+	all := enabledModules(config.AgentConfig{})
+	if len(all) != 6 {
+		t.Fatalf("缺省板块数 = %d, want 6", len(all))
+	}
+	filtered := enabledModules(config.AgentConfig{Modules: map[string]bool{
+		"qzone": false,
+		"admin": false,
+	}})
+	names := make([]string, 0, len(filtered))
+	for _, m := range filtered {
+		names = append(names, m.Name())
+	}
+	want := []string{"core", "memory", "sticker", "system"}
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("过滤后板块 = %v, want %v", names, want)
+	}
+	// 显式 true 也保留
+	kept := enabledModules(config.AgentConfig{Modules: map[string]bool{"core": true, "qzone": false}})
+	if len(kept) != 5 {
+		t.Errorf("显式 true 应保留, got %d 板块", len(kept))
 	}
 }

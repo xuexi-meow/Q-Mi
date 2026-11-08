@@ -979,6 +979,40 @@ func TestBuildHistoryImageRowDropsFailedImage(t *testing.T) {
 	}
 }
 
+// TestBuildToolDocsInStaticZone 工具文档注入 system 尾部（历史之前）：
+// 文档在 system 内且每轮逐字节一致（静态区，历史增长不影响其缓存命中）。
+func TestBuildToolDocsInStaticZone(t *testing.T) {
+	s := openTestStore(t)
+	cfg := config.AgentConfig{
+		PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
+		GuideFile:   writeGuideFile(t, agentGuideText),
+		History:     config.AgentHistory{Max: 40, Trim: 20},
+	}
+	b := NewDefaultBuilder(s, cfg)
+	b.SetToolDocs("# 工具使用说明\n### send_message\n参数……")
+
+	now := time.Unix(1762400000, 0)
+	putRecord(t, s, 1, "recv", "group", 888, 10001, "小明", "在吗", now.Unix())
+	first := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now})
+
+	sys := contentText(first[0])
+	if !strings.Contains(sys, "# 工具使用说明") || !strings.Contains(sys, "当前账号QQ: 9527") {
+		t.Errorf("system 应含工具文档与账号QQ: %q", sys)
+	}
+	if strings.Index(sys, "当前账号QQ") < strings.Index(sys, "# 工具使用说明") {
+		t.Errorf("文档应在账号QQ行之前: %q", sys)
+	}
+	// 历史增长一轮后文档逐字节不变（静态区）
+	putRecord(t, s, 2, "recv", "group", 888, 10001, "小明", "嗯", now.Add(time.Second).Unix())
+	second := b.Build(&Turn{ChatType: "group", ChatID: 888, SelfID: 9527, Now: now.Add(2 * time.Second)})
+	if contentText(second[0]) != sys {
+		t.Errorf("文档变更不该发生在轮间:\nfirst:  %q\nsecond: %q", sys, contentText(second[0]))
+	}
+	if !reflect.DeepEqual(first[0], second[0]) {
+		t.Errorf("system 消息应逐字节一致")
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // TestBuildHistoryImageWindowLastFive 只有从末尾数最后 5 条历史行（按行计数）

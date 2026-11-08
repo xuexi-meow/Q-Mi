@@ -7,10 +7,10 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -385,42 +385,29 @@ func TestCollectQQSticker(t *testing.T) {
 	runToolErr(t, tools, "collect_qq_sticker", `{}`)
 }
 
-// TestGuideFaceTableSyncsQQFaces guide.md 的自带表情对照表必须与
-// qq_faces.go 的 QQFaceNames 完全一致，条数在 30~60 之间。
-func TestGuideFaceTableSyncsQQFaces(t *testing.T) {
-	data, err := os.ReadFile("guide.md")
-	if err != nil {
-		t.Fatalf("读取 guide.md: %v", err)
+// TestStickerIntroRendersFaceTable 表情板块 Intro 从 QQFaceNames 自动渲染
+// 对照表（单一源头在 Go 表，guide.md 不再维护人工副本），条数 30~60。
+func TestStickerIntroRendersFaceTable(t *testing.T) {
+	intro := stickerIntro()
+	rows := 0
+	for _, line := range strings.Split(intro, "\n") {
+		if strings.HasPrefix(line, "|") && !strings.Contains(line, "---") {
+			rows++ // 表头 + 数据行
+		}
 	}
-	fromGuide := map[int]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "|") || strings.Contains(line, "---") {
-			continue
-		}
-		cols := strings.Split(strings.Trim(line, "| "), "|")
-		if len(cols) != 2 {
-			continue
-		}
-		id, err := strconv.Atoi(strings.TrimSpace(cols[0]))
-		if err != nil {
-			continue
-		}
-		fromGuide[id] = strings.TrimSpace(cols[1])
+	wantRows := (len(QQFaceNames) + 1) / 2 // 两列布局
+	if rows-1 != wantRows {
+		t.Fatalf("Intro 对照表数据行 = %d, want %d", rows-1, wantRows)
 	}
-	if len(fromGuide) < 30 || len(fromGuide) > 60 {
-		t.Fatalf("guide 对照表条数 = %d, want 30~60", len(fromGuide))
+	if len(QQFaceNames) < 30 || len(QQFaceNames) > 60 {
+		t.Fatalf("QQFaceNames 条数 = %d, want 30~60", len(QQFaceNames))
 	}
-	if !reflect.DeepEqual(fromGuide, QQFaceNames) {
-		for id, name := range fromGuide {
-			if QQFaceNames[id] != name {
-				t.Errorf("guide 表 id=%d 名称 %q, 内置表 %q", id, name, QQFaceNames[id])
-			}
+	for id, name := range QQFaceNames {
+		if !strings.Contains(intro, fmt.Sprintf("| %d | %s", id, name)) {
+			t.Errorf("Intro 缺 id=%d %q", id, name)
 		}
-		for id, name := range QQFaceNames {
-			if fromGuide[id] != name {
-				t.Errorf("内置表 id=%d 名称 %q 未出现在 guide 表", id, name)
-			}
-		}
+	}
+	if !strings.Contains(intro, "礼仪") {
+		t.Errorf("Intro 应含表情礼仪")
 	}
 }

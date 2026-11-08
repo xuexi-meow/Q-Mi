@@ -110,24 +110,27 @@ type NapcatConn struct {
 // AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
 // 注意：viper UnmarshalKey 走 mapstructure，多单词键需 mapstructure 标签。
 type AgentConfig struct {
-	Enable        bool          `yaml:"enable" mapstructure:"enable"`
-	BaseURL       string        `yaml:"base_url" mapstructure:"base_url"`
-	APIKey        string        `yaml:"api_key" mapstructure:"api_key"`
-	Model         string        `yaml:"model" mapstructure:"model"`
-	PersonaFile   string        `yaml:"persona_file" mapstructure:"persona_file"`
-	GuideFile     string        `yaml:"guide_file" mapstructure:"guide_file"`
+	Enable      bool   `yaml:"enable" mapstructure:"enable"`
+	BaseURL     string `yaml:"base_url" mapstructure:"base_url"`
+	APIKey      string `yaml:"api_key" mapstructure:"api_key"`
+	Model       string `yaml:"model" mapstructure:"model"`
+	PersonaFile string `yaml:"persona_file" mapstructure:"persona_file"`
+	GuideFile   string `yaml:"guide_file" mapstructure:"guide_file"`
 	// ImageDir 内容寻址图片缓存落盘目录；空串 = 默认 agent/images。
-	ImageDir      string        `yaml:"image_dir" mapstructure:"image_dir"`
-	Debounce      time.Duration `yaml:"debounce" mapstructure:"debounce"`
+	ImageDir string `yaml:"image_dir" mapstructure:"image_dir"`
+	// Modules 工具板块启停（重启生效，无热插拔）：缺省键 = 启用；
+	// 显式 false 的板块不加载（工具与文档都不出现）。
+	Modules  map[string]bool `yaml:"modules" mapstructure:"modules"`
+	Debounce time.Duration   `yaml:"debounce" mapstructure:"debounce"`
 	// SelfWake 定时轮询间隔（P3.6 代码级唤醒兜底）：空串=默认 10 分钟；
 	// "off"/"0"=关闭；其余必须为 ≥30s 的合法 duration（下限防误配成高频轮询）。
-	SelfWake      string        `yaml:"self_wake" mapstructure:"self_wake"`
-	Temperature   float64       `yaml:"temperature" mapstructure:"temperature"`
-	Debug         bool          `yaml:"debug" mapstructure:"debug"`
+	SelfWake    string  `yaml:"self_wake" mapstructure:"self_wake"`
+	Temperature float64 `yaml:"temperature" mapstructure:"temperature"`
+	Debug       bool    `yaml:"debug" mapstructure:"debug"`
 	// Multimodal 缺键(nil)视为 true——旧配置文件没有该字段时不应静默关闭。
-	Multimodal    *bool         `yaml:"multimodal" mapstructure:"multimodal"`
-	MaxToolRounds int           `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
-	History       AgentHistory  `yaml:"history" mapstructure:"history"`
+	Multimodal    *bool        `yaml:"multimodal" mapstructure:"multimodal"`
+	MaxToolRounds int          `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
+	History       AgentHistory `yaml:"history" mapstructure:"history"`
 }
 
 // AgentHistory 上下文历史携带策略。

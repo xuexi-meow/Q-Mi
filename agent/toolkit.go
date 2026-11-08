@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"Q-Mi/storage"
+	"Q-Mi/utils/config"
 )
 
 // ToolContext 一次 turn 的工具运行时依赖，模块按需取用。字段与 manager
@@ -80,7 +81,7 @@ func (r *ToolRegistry) PromptDocs() string {
 	b.WriteString("# 工具使用说明\n\n")
 	b.WriteString("## 目录\n\n")
 	for _, m := range r.modules {
-		fmt.Fprintf(&b, "- %s：%s（%s）\n", m.Name(), m.OneLiner(), strings.Join(toolNames(m.Tools(nil)), " "))
+		fmt.Fprintf(&b, "- %s：%s（%s）\n", m.Name(), m.OneLiner(), strings.Join(toolNames(m.Tools(&ToolContext{})), " "))
 	}
 	b.WriteString("\n调用参数经 function calling 传递；每个工具的参数明细/示例见下文。\n\n")
 	for _, m := range r.modules {
@@ -91,7 +92,7 @@ func (r *ToolRegistry) PromptDocs() string {
 		if m.Intro() != "" {
 			b.WriteString(m.Intro() + "\n\n")
 		}
-		for _, t := range m.Tools(nil) {
+		for _, t := range m.Tools(&ToolContext{}) {
 			b.WriteString("### " + t.Name + "\n\n")
 			if t.Description != "" {
 				b.WriteString(t.Description + "\n\n")
@@ -147,6 +148,48 @@ func renderParams(params any) string {
 	return b.String()
 }
 
+// stickerIntro 表情板块 Intro：从 QQFaceNames 自动渲染 face id 对照表
+// （单一源头在 Go 表，guide.md 不再维护人工副本）。
+func stickerIntro() string {
+	ids := make([]int, 0, len(QQFaceNames))
+	for id := range QQFaceNames {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	var b strings.Builder
+	b.WriteString("自带小黄脸用 face 段发，常用 id 对照表（不确定的 id 别乱猜）：\n\n")
+	b.WriteString("| id | 表情 | id | 表情 |\n| --- | --- | --- | --- |\n")
+	for i := 0; i < len(ids); i += 2 {
+		left := ids[i]
+		row := fmt.Sprintf("| %d | %s |", left, QQFaceNames[left])
+		if i+1 < len(ids) {
+			right := ids[i+1]
+			row += fmt.Sprintf(" %d | %s |", right, QQFaceNames[right])
+		} else {
+			row += "  |  |"
+		}
+		b.WriteString(row + "\n")
+	}
+	b.WriteString("\n礼仪：表情是调味料，一条消息里一两个就够；别连发表情刷屏，骰子/猜拳同理。")
+	return b.String()
+}
+
+// enabledModules 按配置 agent.modules 过滤板块（缺省键 = 启用，显式 false =
+// 不加载）。无热插拔：过滤发生在构造期，重启生效。
+func enabledModules(cfg config.AgentConfig) []ToolModule {
+	all := defaultModules()
+	if len(cfg.Modules) == 0 {
+		return all
+	}
+	var out []ToolModule
+	for _, m := range all {
+		if on, ok := cfg.Modules[m.Name()]; !ok || on {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // defaultModules 内置板块（固定顺序；name 对应配置 agent.modules 键）。
 func defaultModules() []ToolModule {
 	return []ToolModule{
@@ -156,9 +199,11 @@ func defaultModules() []ToolModule {
 		module{name: "memory", oneliner: "查聊天记录、搜历史、看消息图片",
 			tools: memoryTools},
 		module{name: "sticker", oneliner: "表情收藏与 QQ 账号级收藏表情",
+			intro: stickerIntro(),
 			tools: stickerTools},
 		module{name: "qzone", oneliner: "QQ 空间：发/删/浏览/读/赞/评/资料",
-			intro: "全部以 tid/target_uin 定位，与 feed_ref 不能混用；空间是公开内容，发布/删除前想清楚。",
+			intro: "全部以 tid/target_uin 定位，与 feed_ref 不能混用；空间是公开内容，发布/删除前想清楚。" +
+				"空友爱看（广场公开动态）没有封装工具，用 napcat_api 调 get_qzone_public_ 前缀的动作（get_qzone_public_feeds / get_qzone_public_feed_detail / get_qzone_public_comments / comment_qzone_public_feed 等）。",
 			tools: func(ctx *ToolContext) []Tool { return qzoneTools(ctx.Admin) }},
 		module{name: "admin", oneliner: "QQ 管理：群/好友/文件/请求处理 + napcat 逃生舱",
 			intro: "危险操作（踢人/退群/设管理员/改名资料类逃生舱动作）需要管理员身份，非管理员调用返回权限错误。",

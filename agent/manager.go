@@ -118,7 +118,7 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	} else {
 		m.images = newImageStore(defaultImagesDir, store)
 	}
-	m.registry = NewRegistry(defaultModules()...)
+	m.registry = NewRegistry(enabledModules(cfg)...)
 	m.tasks = NewTaskManager(m.deliverTaskResult)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0

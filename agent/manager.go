@@ -315,7 +315,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			break
 		}
 	}
-	tools := m.registry.Build(&ToolContext{
+	toolCtx := &ToolContext{
 		Store:     m.store,
 		Turn:      turn,
 		Timer:     m.timerStore,
@@ -325,7 +325,8 @@ func (m *Manager) handleTurn(turn *Turn) {
 		NotesPath: m.notesPath,
 		StatePath: m.statePath,
 		Admin:     isAdmin,
-	})
+	}
+	tools := m.registry.Build(toolCtx)
 	defs := toolDefs(tools)
 	maxRounds := m.cfg.MaxToolRounds
 	if maxRounds <= 0 {
@@ -392,25 +393,44 @@ func (m *Manager) handleTurn(turn *Turn) {
 
 		msgs = append(msgs, ChatMessage{Role: "assistant", Content: resp.TextContent(), ToolCalls: calls})
 		finished := false
-		var results []string
-		for _, call := range calls {
+		type toolOutcome struct {
+			executed bool
+			id       string
+			result   string
+		}
+		// 同轮多工具并发执行、按调用顺序回填（结果顺序=tool_calls 顺序）。
+		outcomes := make([]toolOutcome, len(calls))
+		var wg sync.WaitGroup
+		for i, call := range calls {
 			if call.Function.Name == "finish" {
 				finished = true // 只标记，不执行；同批其他工具先执行
 				continue
 			}
-			slog.Info("工具调用", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
-				"tool", call.Function.Name, "args", call.Function.Arguments)
-			m.events.Record(turn.ChatType, turn.ChatID, KindToolCall, call.Function.Name+" "+call.Function.Arguments)
-			result, toolErr := execTool(tools, call)
-			if toolErr != nil {
-				slog.Info("工具执行失败", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
-					"tool", call.Function.Name, "err", toolErr)
-				m.events.Record(turn.ChatType, turn.ChatID, KindToolResult,
-					fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
-				result = toolErrorJSON(toolErr)
+			wg.Add(1)
+			go func(i int, call ToolCall) {
+				defer wg.Done()
+				slog.Info("工具调用", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+					"tool", call.Function.Name, "args", call.Function.Arguments)
+				m.events.Record(turn.ChatType, turn.ChatID, KindToolCall, call.Function.Name+" "+call.Function.Arguments)
+				result, toolErr := m.execToolCall(toolCtx, tools, call)
+				if toolErr != nil {
+					slog.Info("工具执行失败", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
+						"tool", call.Function.Name, "err", toolErr)
+					m.events.Record(turn.ChatType, turn.ChatID, KindToolResult,
+						fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
+					result = toolErrorJSON(toolErr)
+				}
+				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: result}
+			}(i, call)
+		}
+		wg.Wait()
+		var results []string
+		for _, oc := range outcomes {
+			if !oc.executed {
+				continue // finish 槽位
 			}
-			results = append(results, result)
-			msgs = append(msgs, ChatMessage{Role: "tool", Content: result, ToolCallID: call.ID})
+			results = append(results, oc.result)
+			msgs = append(msgs, ChatMessage{Role: "tool", Content: oc.result, ToolCallID: oc.id})
 		}
 		// P3-4 图片按需上传：本轮工具（view_message_images）申请查看的图片，
 		// 在工具执行完当轮追加为一条 user 多模态消息（下一轮 LLM 请求即可见），
@@ -458,19 +478,76 @@ func (m *Manager) replyText(turn *Turn, content string) {
 	m.events.Record(turn.ChatType, turn.ChatID, KindReply, content)
 }
 
-// execTool 按名字执行工具；未知工具 / Run 缺失 / 执行失败返回 error，
-// 由调用方包装成 {"error": ...} 回填思维链，并打一条简短 Info 日志。
-func execTool(tools []Tool, call ToolCall) (string, error) {
-	for _, t := range tools {
-		if t.Name != call.Function.Name {
-			continue
-		}
-		if t.Run == nil {
+// execToolCall 执行一次工具调用：普通调用同步执行返回结果；Asyncable 工具
+// 带 {"_async":true,...} 时转入 TaskManager 后台执行，立即返回任务回执
+//（结果完成经 deliverTaskResult 唤醒投递，不阻塞本 turn，spec §2.5 方案 B）。
+// 未知工具 / Run 缺失 / 执行失败返回 error，由调用方包装成 {"error": ...} 回填。
+func (m *Manager) execToolCall(ctx *ToolContext, tools []Tool, call ToolCall) (string, error) {
+	var tool *Tool
+	for i := range tools {
+		if tools[i].Name == call.Function.Name {
+			tool = &tools[i]
 			break
 		}
-		return t.Run(json.RawMessage(call.Function.Arguments))
 	}
-	return "", fmt.Errorf("未知工具 %q", call.Function.Name)
+	if tool == nil {
+		return "", fmt.Errorf("未知工具 %q", call.Function.Name)
+	}
+	if tool.Run == nil {
+		return "", fmt.Errorf("工具 %q 不可执行", call.Function.Name)
+	}
+	if asyncRequested(json.RawMessage(call.Function.Arguments)) {
+		if !tool.Asyncable {
+			return "", fmt.Errorf("工具 %q 不支持 _async 后台执行", tool.Name)
+		}
+		if ctx.Turn == nil {
+			return "", fmt.Errorf("无会话上下文，无法后台执行 %q", tool.Name)
+		}
+		args := stripAsyncKey(json.RawMessage(call.Function.Arguments))
+		id := m.tasks.Start(BackgroundTask{
+			Tool:      tool.Name,
+			ArgsBrief: truncateRunes(args, 200),
+			ChatType:  ctx.Turn.ChatType,
+			ChatID:    ctx.Turn.ChatID,
+			SelfID:    ctx.Turn.SelfID,
+		}, func(context.Context) (string, error) {
+			return tool.Run(json.RawMessage(args))
+		})
+		return marshalCompact(map[string]any{
+			"task_id": id,
+			"status":  "started",
+			"note":    "后台执行中，完成后自动送达结果；task_list/task_get 可随时查看，task_cancel 可停止",
+		})
+	}
+	return tool.Run(json.RawMessage(call.Function.Arguments))
+}
+
+// asyncRequested 参数顶层是否带 "_async": true（保留键，仅在顶层生效）。
+func asyncRequested(args json.RawMessage) bool {
+	if len(args) == 0 {
+		return false
+	}
+	var peek struct {
+		Async bool `json:"_async"`
+	}
+	if json.Unmarshal(args, &peek) != nil {
+		return false
+	}
+	return peek.Async
+}
+
+// stripAsyncKey 剥离顶层 _async 键；后台任务的 Run 不应看到该保留键。
+func stripAsyncKey(args json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(args, &m); err != nil || m == nil {
+		return string(args)
+	}
+	delete(m, "_async")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return string(args)
+	}
+	return string(out)
 }
 
 // toolErrorJSON 工具错误的标准回填形态。

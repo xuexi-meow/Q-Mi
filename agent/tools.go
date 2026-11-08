@@ -254,9 +254,7 @@ func memoryTools(ctx *ToolContext) []Tool {
 						continue
 					}
 					dus = append(dus, du)
-					if turn != nil {
-						turn.pendingImages = append(turn.pendingImages, du)
-					}
+					turn.AddPendingImage(du)
 				}
 				note := fmt.Sprintf("共 %d 张图片，已附在下一条消息", len(imgs))
 				if len(dus) < len(imgs) {
@@ -635,8 +633,146 @@ func systemTools(ctx *ToolContext) []Tool {
 			},
 		},
 	}
-	// T5/T6：后台任务管理工具（task_list/task_get/task_cancel）与行为回溯
-	// （self_events）在此追加。
+	// 后台任务管理（方案 B 的可见性/控制面）。
+	tasks := ctx.Tasks
+	tools = append(tools,
+		Tool{
+			Name:        "task_list",
+			Description: "查看你的后台任务列表（_async 发起的任务）：id/工具/状态/耗时/参数摘要。结果全文用 task_get。",
+			Parameters: objectParams(map[string]any{
+				"status": strProp("可选，按状态过滤：running / done / failed / cancelled / all，缺省 all"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				if tasks == nil {
+					return "", errors.New("后台任务不可用")
+				}
+				var p struct {
+					Status string `json:"status"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				list := tasks.List(p.Status)
+				now := time.Now()
+				rows := make([]map[string]any, 0, len(list))
+				for _, t := range list {
+					row := map[string]any{
+						"id": t.ID, "tool": t.Tool, "status": t.Status,
+						"args": t.ArgsBrief,
+					}
+					end := now
+					if t.DoneAt != nil {
+						end = *t.DoneAt
+					}
+					row["elapsed_seconds"] = int(end.Sub(t.StartedAt).Seconds())
+					if t.Err != "" {
+						row["err"] = t.Err
+					}
+					rows = append(rows, row)
+				}
+				return marshalCompact(rows)
+			},
+		},
+		Tool{
+			Name:        "task_get",
+			Description: "查一个后台任务的详情（含完成结果全文）。",
+			Parameters: objectParams(map[string]any{
+				"task_id": intProp("task_list 里的任务 id"),
+			}, []string{"task_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if tasks == nil {
+					return "", errors.New("后台任务不可用")
+				}
+				var p struct {
+					TaskID int64 `json:"task_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				t, ok := tasks.Get(p.TaskID)
+				if !ok {
+					return "", fmt.Errorf("没有找到任务 %d", p.TaskID)
+				}
+				return marshalCompact(t)
+			},
+		},
+		Tool{
+			Name:        "task_cancel",
+			Description: "停止一个还在运行的后台任务（结果不再投递）。已完成/已取消的任务会报错。",
+			Parameters: objectParams(map[string]any{
+				"task_id": intProp("task_list 里的任务 id"),
+			}, []string{"task_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if tasks == nil {
+					return "", errors.New("后台任务不可用")
+				}
+				var p struct {
+					TaskID int64 `json:"task_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				t, err := tasks.Cancel(p.TaskID)
+				if err != nil {
+					return "", err
+				}
+				return marshalCompact(map[string]any{"cancelled": true, "task_id": t.ID, "tool": t.Tool})
+			},
+		},
+	)
+
+	// 行为回溯：EventLog（与 webui 思考链同源）暴露给模型。
+	events := ctx.Events
+	tools = append(tools,
+		Tool{
+			Name:        "self_events",
+			Description: "回溯你自己的近期行为流（思考/工具调用/输出/回复，按时间倒序）。用于回忆上一轮做了什么、为什么没回、调过什么工具，防止前后割裂。只覆盖最近几百条事件，更早的靠消息库与思考笔记。",
+			Parameters: objectParams(map[string]any{
+				"kind":    strProp("可选，按类型过滤：turn_start / reasoning / output / tool_call / tool_result / reply / finish / usage / interrupted / error"),
+				"chat_id": intProp("可选，按会话 ID 过滤"),
+				"limit":   intProp("可选，返回条数，默认 50，最大 200"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				if events == nil {
+					return "", errors.New("行为事件流不可用")
+				}
+				var p struct {
+					Kind    string `json:"kind"`
+					ChatID  int64  `json:"chat_id"`
+					Limit   int    `json:"limit"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				limit := p.Limit
+				if limit <= 0 {
+					limit = 50
+				}
+				if limit > 200 {
+					limit = 200
+				}
+				all := events.After(0)
+				var picked []Event
+				for i := len(all) - 1; i >= 0 && len(picked) < limit; i-- { // 新→旧
+					e := all[i]
+					if p.Kind != "" && e.Kind != p.Kind {
+						continue
+					}
+					if p.ChatID != 0 && e.ChatID != p.ChatID {
+						continue
+					}
+					picked = append(picked, e)
+				}
+				lines := make([]string, 0, len(picked))
+				for _, e := range picked {
+					text := strings.ReplaceAll(e.Text, "\n", " ")
+					lines = append(lines, fmt.Sprintf("#%d [%s] %s %s: %s",
+						e.ID, e.Time.Format(timeLayout), chatSource(e.ChatType, e.ChatID), e.Kind, text))
+				}
+				return strings.Join(lines, "\n"), nil
+			},
+		},
+	)
 	return tools
 }
 
@@ -719,7 +855,7 @@ func queryMessageRows(store *storage.Store, images *imageStore, turn *Turn, f st
 				if !strings.HasPrefix(du, "data:") { // URL 失效等，跳过
 					continue
 				}
-				turn.pendingImages = append(turn.pendingImages, du)
+				turn.AddPendingImage(du)
 				row["images_attached"] = true
 				attached++
 			}

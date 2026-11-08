@@ -43,10 +43,22 @@ type Turn struct {
 	Mood        string        // 当前情绪状态（manager 从 state.json 读出），注入末尾 user 块头部（进 system 会击穿缓存前缀）
 	Notes       []Note        // 思考笔记（manager 从 notes.json 读出），注入末尾 user 块头部
 	NewMessages []TurnMessage // 每条自带所属会话（历史已跨会话混合）
-	// pendingImages 本轮工具（view_message_images）申请查看的图片，data URL
-	// 形态。工具 Run 追加，handleTurn 在每轮工具执行完后把它们作为一条 user
-	// 多模态消息附加进思维链并清空。仅会话串行 worker 内读写，无并发。
+	// pendingImages 本轮工具（view_message_images/查询自动带图）申请查看的
+	// 图片，data URL 形态。工具 Run 追加，handleTurn 在每轮工具执行完后把
+	// 它们作为一条 user 多模态消息附加进思维链并清空。同轮多工具并发执行，
+	// 追加须经 AddPendingImage（pendingMu 保护）；清空只在 worker 串行段。
 	pendingImages []string
+	pendingMu     sync.Mutex
+}
+
+// AddPendingImage 申请把一张图片附到本轮下一条消息（并发工具安全）。
+func (t *Turn) AddPendingImage(du string) {
+	if t == nil {
+		return
+	}
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	t.pendingImages = append(t.pendingImages, du)
 }
 
 // TurnMessage 本轮防抖窗口内的一条新消息。

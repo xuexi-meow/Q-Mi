@@ -157,7 +157,7 @@ var wantToolNames = []string{
 	"upload_group_file", "get_group_files",
 	"napcat_api", "napcat_docs",
 	// system
-	"schedule", "cancel_timer",
+	"schedule", "cancel_timer", "task_list", "task_get", "task_cancel", "self_events",
 }
 
 // dangerousToolNames 需要管理员权限的工具。

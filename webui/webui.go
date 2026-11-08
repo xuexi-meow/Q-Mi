@@ -176,13 +176,14 @@ type napcatStatus struct {
 
 // overview /api/overview 响应。messages/notices 为 -1 表示记忆库不可用。
 type overview struct {
-	Napcat        napcatStatus `json:"napcat"`
-	UptimeSeconds int64        `json:"uptime_seconds"`
-	Messages      int64        `json:"messages"`
-	Notices       int64        `json:"notices"`
-	Mood          string       `json:"mood"`
-	NotesCount    int          `json:"notes_count"`
-	TimersCount   int          `json:"timers_count"`
+	Napcat        napcatStatus        `json:"napcat"`
+	UptimeSeconds int64               `json:"uptime_seconds"`
+	Messages      int64               `json:"messages"`
+	Notices       int64               `json:"notices"`
+	Mood          string              `json:"mood"`
+	NotesCount    int                 `json:"notes_count"`
+	TimersCount   int                 `json:"timers_count"`
+	Usage         agent.UsageSnapshot `json:"usage"`
 }
 
 // handleOverview 并行收集 NapCat 状态/版本、storage 统计、mood/notes/timers
@@ -193,6 +194,7 @@ func handleOverview(w http.ResponseWriter, r *http.Request) {
 		Mood:          agent.MoodGet(),
 		NotesCount:    len(agent.NotesList()),
 		TimersCount:   agent.TimerCount(),
+		Usage:         agent.UsageTotals(),
 	}
 
 	var wg sync.WaitGroup

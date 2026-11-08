@@ -79,12 +79,23 @@ type responseMessage struct {
 	ReasoningContent string     `json:"reasoning_content"`
 }
 
+// Usage 用量统计（OpenAI usage 字段 + DeepSeek 缓存命中扩展）：
+// hit/miss 用于观察 prompt cache 命中率，输出 token 是长任务成本大头。
+type Usage struct {
+	PromptTokens          int `json:"prompt_tokens"`
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+	CompletionTokens      int `json:"completion_tokens"`
+	TotalTokens           int `json:"total_tokens"`
+}
+
 // ChatResponse chat/completions 响应体，仅解析用到的字段。
 type ChatResponse struct {
 	Choices []struct {
 		Index   int             `json:"index"`
 		Message responseMessage `json:"message"`
 	} `json:"choices"`
+	Usage Usage `json:"usage"`
 }
 
 // TextContent 返回 choices[0].message.content 的文本：content 为字符串时

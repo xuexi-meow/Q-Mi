@@ -52,6 +52,7 @@ main { max-width: 960px; margin: 24px auto; padding: 0 16px; }
 .ebadge.error        { background: rgba(248,113,113,.2); color: var(--bad); }
 .ebadge.finish       { background: rgba(139,145,160,.2); color: var(--dim); }
 .ebadge.interrupted  { background: rgba(248,113,113,.14); color: #fca5a5; }
+.ebadge.usage        { background: rgba(139,145,160,.12); color: var(--dim); }
 /* 消息流布局 */
 .stream { display: flex; gap: 14px; min-height: 60vh; }
 .chat-list { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -200,6 +201,11 @@ label.danger, span.danger { color: var(--bad); }
             <div class="card">
               <div class="k">定时器</div>
               <div class="v" x-text="ov.timers_count < 0 ? '—' : ov.timers_count"></div>
+            </div>
+            <div class="card">
+              <div class="k">缓存命中率</div>
+              <div class="v" x-text="fmtHitRate(ov.usage)"></div>
+              <div class="muted" x-text="'请求 ' + (ov.usage?.requests ?? 0) + ' · 输出 ' + fmtTokens(ov.usage?.output_tokens) + ' tok'"></div>
             </div>
           </div>
         </div>
@@ -551,6 +557,17 @@ function app() {
       if (d > 0) return d + ' 天 ' + h + ' 小时';
       if (h > 0) return h + ' 小时 ' + m + ' 分';
       return m + ' 分 ' + Math.floor(sec % 60) + ' 秒';
+    },
+    // ---- LLM 用量 ----
+    fmtHitRate(u) {
+      if (!u || (u.cache_hit_tokens + u.cache_miss_tokens) === 0) return '—';
+      return Math.round(u.cache_hit_tokens / (u.cache_hit_tokens + u.cache_miss_tokens) * 100) + '%';
+    },
+    fmtTokens(n) {
+      if (n == null) return '—';
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+      return String(n);
     },
     // ---- W2 消息流 ----
     chatTitle(c) {

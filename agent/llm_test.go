@@ -58,6 +58,62 @@ const okResponseJSON = `{
   ]
 }`
 
+// usageResponseJSON DeepSeek 形态：usage 带缓存命中扩展字段。
+const usageResponseJSON = `{
+  "choices": [
+    {"index": 0, "message": {"role": "assistant", "content": "好"}}
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "prompt_cache_hit_tokens": 800,
+    "prompt_cache_miss_tokens": 200,
+    "completion_tokens": 50,
+    "total_tokens": 1050
+  }
+}`
+
+func TestChatParsesUsage(t *testing.T) {
+	srv, _ := fakeOpenAI(t, http.StatusOK, usageResponseJSON)
+	client := NewClient(srv.URL, "sk-test", 5*time.Second)
+
+	resp, err := client.Chat(context.Background(), ChatRequest{
+		Model:    "deepseek-flash",
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	u := resp.Usage
+	if u.PromptTokens != 1000 || u.PromptCacheHitTokens != 800 ||
+		u.PromptCacheMissTokens != 200 || u.CompletionTokens != 50 || u.TotalTokens != 1050 {
+		t.Errorf("usage 解析不符: %+v", u)
+	}
+}
+
+func TestUsageSnapshotAccumulates(t *testing.T) {
+	before := UsageTotals()
+	recordUsage(Usage{PromptCacheHitTokens: 800, PromptCacheMissTokens: 200, PromptTokens: 1000, CompletionTokens: 50})
+	recordUsage(Usage{PromptCacheHitTokens: 100, PromptCacheMissTokens: 300, PromptTokens: 400, CompletionTokens: 10})
+	s := UsageTotals()
+	got := UsageSnapshot{
+		Requests:     s.Requests - before.Requests,
+		CacheHit:     s.CacheHit - before.CacheHit,
+		CacheMiss:    s.CacheMiss - before.CacheMiss,
+		PromptTokens: s.PromptTokens - before.PromptTokens,
+		OutputTokens: s.OutputTokens - before.OutputTokens,
+	}
+	want := UsageSnapshot{Requests: 2, CacheHit: 900, CacheMiss: 500, PromptTokens: 1400, OutputTokens: 60}
+	if got != want {
+		t.Errorf("累计用量 = %+v, want %+v", got, want)
+	}
+	if r := got.HitRate(); r < 0.6426 || r > 0.6429 {
+		t.Errorf("HitRate = %v, want 900/1400 ≈ 0.6429", r)
+	}
+	if empty := (UsageSnapshot{}).HitRate(); empty != 0 {
+		t.Errorf("空快照 HitRate = %v, want 0", empty)
+	}
+}
+
 func TestChatSuccess(t *testing.T) {
 	srv, captured := fakeOpenAI(t, http.StatusOK, okResponseJSON)
 	client := NewClient(srv.URL, "sk-test", 5*time.Second)

@@ -1,68 +1,94 @@
+# ============================================================
+# Q-Mi 配置示例（复制为 Config.yaml 后填 key）
+# ============================================================
+
 bot:
   qq_number: 0            # 机器人自己的 QQ 号(agent 的 @检测与上下文都用它)
-  admin_number:
-    - 1234
-netsetting:
-  host: "172.25.240.1"    # WSL 宿主网卡地址(wsl -d Ubuntu -- hostname -I 看对端;每次 WSL 重启可能变化)
+  admin_number:           # 管理员 QQ 列表：
+    - 1234                #   · 危险工具/操作需要列表内的人发起
+                          #   · 审批请求私聊发给第一个，回复「同意 <id>」/「拒绝 <id>」执行
+
+netsetting:               # Q-Mi 监听侧：接收 NapCat/SnowLuma 的 HTTP 事件上报
+  host: "0.0.0.0"         # 监听地址；WSL 上报走 Windows 宿主则填宿主网卡（vEthernet (WSL) 的 IP）
   port: 9090
-  token: "填一个随机hex,需与 NapCat httpClients 的 token 一致"
-  pattern: "/Q-Mi"
-napcat:
-  ws:
+  pattern: "/Q-Mi"        # 上报路径（与协议端 httpClients 的 url 一致）
+  token: "填一个随机hex"   # 鉴权 token，需与协议端 httpClients 的 token 一致
+
+napcat:                   # Q-Mi → 协议端（NapCat / SnowLuma）的调用通道
+  ws:                     # WebSocket（当前未使用，可保持关闭）
     enable: false
     host: "127.0.0.1"
     port: 8080
-  http:
+    token: ""
+  http:                   # HTTP 调用通道（主用）
     enable: true
-    host: "172.25.x.x"    # WSL 内 NapCat 的地址(wsl 里 ip addr show eth0)
-    port: 8080
-    token: "填一个随机hex,需与 NapCat httpServers 的 token 一致"
-storage:
+    host: "172.25.x.x"    # 协议端地址：WSL 内用 wsl 里 ip addr show eth0 的地址
+    port: 3000            # SnowLuma onebot httpServer 缺省 3000
+    token: "填一个随机hex" # 与协议端 httpServers 的 accessToken 一致
+
+storage:                  # 消息记忆库（SQLite，WAL）
   enable: true
-  path: "Q-Mi.db"
+  path: "Q-Mi.db"         # 关闭后 agent 无历史/查询工具，仅凭当前消息对话
+
 agent:
   enable: false
-  base_url: "https://api.example.com/v1"   # OpenAI 兼容地址,含 /v1
+
+  # ---- 模型接入 ----
+  # 方式一（单模型）：顶层三件套，自动作为 chat 档
+  base_url: "https://api.deepseek.com"   # OpenAI 兼容地址,含 /v1
   api_key: "sk-..."
-  model: "deepseek-chat"
-  persona_file: "agent/persona.md"
-  guide_file: "agent/guide.md"   # agent 行为/格式约束(工具用法细节走 help 工具)
-  # image_dir: "agent/images"    # 图片内容寻址缓存目录(sha256 落盘,按消息锚定去重,超 2GB 自动清最旧)；缺省即该路径
-  # workspace_dir: "agent/workspace"  # 电脑操作工作区(文件读写/下载的围栏根目录)；缺省即该路径
-  # browser_executable: "C:/Program Files/Google/Chrome/Application/chrome.exe"  # 浏览器路径；缺省自动探测 Chrome/Edge
-  # models:                          # 分档模型（model profile）：按唤醒类型/内容选档；缺省用顶层 base_url/api_key/model 作 chat 档
-  #   chat:                          # 主对话（有人找它/它主动说话）
+  model: "deepseek-flash"                # deepseek-flash=DeepSeek 便宜的视觉档
+
+  # 方式二（分档模型，model profile）：按唤醒类型/内容选档，配置后覆盖顶层
+  # models:
+  #   chat:                              # 主对话（有人找它/它主动说话）
   #     base_url: "https://api.deepseek.com"
   #     api_key: "sk-..."
   #     model: "deepseek-flash"
-  #     capabilities: [tools, vision]
-  #   background:                    # 后台唤醒（轮询/通知/定时/任务回执）——便宜/免费档
+  #     capabilities: [tools, vision]    # 能力标签（tools/vision/video/thinking…）
+  #   background:                        # 后台唤醒（轮询/通知/定时/任务回执）——免费/便宜档
   #     base_url: "https://open.bigmodel.cn/api/paas/v4"
-  #     api_key: "..."
+  #     api_key: "sk-..."
   #     model: "glm-4.6v-flash"
   #     capabilities: [tools, vision]
-  #   video:                         # 含视频内容的 turn（视频传参需要 Files API 支持，见 roadmap）
+  #   video:                             # 含视频内容的 turn（视频送进模型需要 Files API 支持，尚未落地）
   #     base_url: "https://api.minimax.io/v1"
-  #     api_key: "..."
+  #     api_key: "sk-..."
   #     model: "MiniMax-M3.1-Flash"
   #     capabilities: [tools, vision, video]
-  # modules:                     # 工具板块启停(重启生效)：缺省键 = 启用，显式 false 不加载
-  #   qzone: true
-  #   admin: true
-  #   sticker: true
-  #   computer: true
-  #   browser: true
-  debounce: 3s
-  self_wake: "10m"       # 定时轮询：缺省 10 分钟一次，"off" 关闭；轮询只是唤醒 agent，发不发言由模型自己决定
+
+  # ---- 提示词与行为 ----
+  persona_file: "agent/persona.md"       # 人设（你的文件，AI 不动）
+  guide_file: "agent/guide.md"           # 行为/礼仪约束（工具用法在 system 的「工具使用说明」，自动生成）
   temperature: 0.8
+  debounce: 3s                           # 防抖窗口：窗口内消息合并成一个 turn
+  self_wake: "10m"                       # 定时轮询间隔，"off" 关闭；轮询只是唤醒，发不发言模型自决
+  max_tool_rounds: 180                   # 思考轮数上限（finish 提前终止）；长任务工作流保持大值
+  multimodal: true                       # 图片多模态直送模型；模型不支持图片输入设 false（维持纯文本+CQ 码）
+
+  # ---- 存储/缓存目录 ----
+  # image_dir: "agent/images"            # 图片内容寻址缓存（sha256 落盘+消息锚定去重，超 2GB 自动清最旧）
+  # workspace_dir: "agent/workspace"     # 电脑操作工作区（computer 板块的文件围栏根目录）
+  # browser_executable: "C:/Program Files/Google/Chrome/Application/chrome.exe"  # 浏览器路径；缺省自动探测 Chrome/Edge
+
+  # ---- 工具板块启停（重启生效；缺省键 = 启用，显式 false 不加载）----
+  # modules:
+  #   core: true        # 发消息/思考笔记/情绪/结束
+  #   memory: true      # 查聊天记录/搜历史/看消息图片
+  #   sticker: true     # 表情收藏
+  #   qzone: true       # QQ 空间
+  #   admin: true       # QQ 管理 + napcat 逃生舱
+  #   computer: true    # 电脑操作（文件/下载/命令行，工作区围栏+审批制）
+  #   browser: true     # 真实浏览器（chromedp 无头）
+  #   system: true      # 定时器/后台任务管理/行为回溯
+
   debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/
-  multimodal: true       # 模型支持图片输入时保持 true：消息里的图片以多模态内容直送模型；不支持图片的模型设 false（false 时维持纯文本+原始 CQ 码）
-  max_tool_rounds: 10    # 思考轮数上限(工具调用循环,finish 提前终止)
   history:
-    max: 40
-    trim: 20
-webui:
-  enable: false          # Web 控制台(agent 需同时启用)；要手机/局域网访问把 host 改 0.0.0.0
+    max: 40              # 上下文携带的最近消息条数（跨会话混合）
+    trim: 20             # 超出后按块裁剪（时间水印锚，保证缓存前缀稳定）
+
+webui:                   # Web 控制台（概览/消息流+思考链/agent 控制/QQ 管理）
+  enable: false          # agent 需同时启用；局域网/手机访问把 host 改 0.0.0.0
   host: "127.0.0.1"
   port: 6077
-  token: ""              # enable 时必填:Bearer 鉴权令牌,也是管理权限,不要泄露
+  token: ""              # enable 时必填：Bearer 鉴权令牌，也是管理权限，不要泄露

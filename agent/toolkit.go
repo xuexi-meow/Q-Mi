@@ -16,15 +16,20 @@ import (
 // ToolContext 一次 turn 的工具运行时依赖，模块按需取用。字段与 manager
 // 的运行时状态一一对应，模块闭包捕获本结构体的字段而非散参数。
 type ToolContext struct {
-	Store     *storage.Store // 可为 nil（记忆库未启用，查询类工具报错）
-	Turn      *Turn          // 当前会话上下文（chat/self/pendingImages；可为 nil）
-	Timer     *TimerStore    // 可为 nil（schedule/cancel_timer 报错）
-	Images    *imageStore    // 可为 nil（view_message_images/自动带图报错）
-	Tasks     *TaskManager   // 可为 nil（_async/任务管理工具报错）
-	Events    *EventLog      // 可为 nil（self_events 报错）
+	Store     *storage.Store   // 可为 nil（记忆库未启用，查询类工具报错）
+	Turn      *Turn            // 当前会话上下文（chat/self/pendingImages；可为 nil）
+	Timer     *TimerStore      // 可为 nil（schedule/cancel_timer 报错）
+	Images    *imageStore      // 可为 nil（view_message_images/自动带图报错）
+	Tasks     *TaskManager     // 可为 nil（_async/任务管理工具报错）
+	Approvals *ApprovalManager // 可为 nil（越界/危险操作直接报错）
+	Events    *EventLog        // 可为 nil（self_events 报错）
+	Workspace string           // 文件操作工作区根目录（空 = 默认 agent/workspace）
 	NotesPath string
 	StatePath string
 	Admin     bool // 本 turn 发送者是否管理员（危险操作门槛）
+	// Approved 当前调用来自已审批的执行（审批通过后重跑，工具据此放行
+	// 工作区外的路径），普通调用恒为 false。
+	Approved bool
 }
 
 // module ToolModule 的最小实现：静态元信息 + 工具构造闭包。
@@ -207,7 +212,10 @@ func defaultModules() []ToolModule {
 			tools: func(ctx *ToolContext) []Tool { return qzoneTools(ctx.Admin) }},
 		module{name: "admin", oneliner: "QQ 管理：群/好友/文件/请求处理 + napcat 逃生舱",
 			intro: "危险操作（踢人/退群/设管理员/改名资料类逃生舱动作）需要管理员身份，非管理员调用返回权限错误。",
-			tools: func(ctx *ToolContext) []Tool { return qqTools(ctx.Admin) }},
+			tools: func(ctx *ToolContext) []Tool { return qqTools(ctx) }},
+		module{name: "computer", oneliner: "电脑操作：文件读写/下载/命令行",
+			intro: "工作区（默认 agent/workspace）内的文件操作与非危险命令自动执行；工作区外路径或危险命令会向管理员发起审批（回复「同意 <id>」执行）。媒体进出：save_message_media 把消息里的图/视频存进工作区；send_message 的 image/video/file 段与 upload_group_file 可直接使用 download_file/save_message_media 返回的 napcat_path。",
+			tools: computerTools},
 		module{name: "system", oneliner: "定时器、后台任务管理、行为回溯",
 			tools: systemTools},
 	}

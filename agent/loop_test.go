@@ -248,7 +248,8 @@ func TestHandleTurnSegmentTypeErrorBackfilled(t *testing.T) {
 	msgs := f.reqs[1].Messages
 	last := msgs[len(msgs)-1]
 	if last.Role != "tool" || last.ToolCallID != "c1" ||
-		!strings.Contains(contentText(last), `"error"`) || !strings.Contains(contentText(last), "poke") {		t.Errorf("非法段类型应以 error 回填: %+v", last)
+		!strings.Contains(contentText(last), `"error"`) || !strings.Contains(contentText(last), "poke") {
+		t.Errorf("非法段类型应以 error 回填: %+v", last)
 	}
 	if napcat.count() != 0 {
 		t.Errorf("报错路径不应发消息, got %d", napcat.count())

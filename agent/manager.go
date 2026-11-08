@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"Q-Mi/app"
 	"Q-Mi/bot"
 	"Q-Mi/chain"
 	"Q-Mi/storage"
@@ -84,9 +85,11 @@ type Manager struct {
 	// 自建一份。
 	images *imageStore
 
-	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器。
-	registry *ToolRegistry
-	tasks    *TaskManager
+	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器；
+	// approvals 越界/危险操作审批管理器。
+	registry  *ToolRegistry
+	tasks     *TaskManager
+	approvals *ApprovalManager
 
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
@@ -120,6 +123,7 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	}
 	m.registry = NewRegistry(enabledModules(cfg)...)
 	m.tasks = NewTaskManager(m.deliverTaskResult)
+	m.approvals = NewApprovalManager(m.notifyApproval, m.deliverApprovalResult)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
 	return m
@@ -218,7 +222,7 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 }
 
 // deliverTaskResult 后台任务完成投递：格式化为合成消息入来源会话队列
-//（复用防抖/打断/排队语义：worker 空闲立即开新 turn，思考中排队接上）。
+// （复用防抖/打断/排队语义：worker 空闲立即开新 turn，思考中排队接上）。
 // 已取消的任务不经过此回调（TaskManager 保证）。
 func (m *Manager) deliverTaskResult(t BackgroundTask) {
 	var line string
@@ -238,6 +242,66 @@ func (m *Manager) deliverTaskResult(t BackgroundTask) {
 		SenderName: "后台任务",
 		Text:       truncateRunes(line, maxEventText),
 	})
+}
+
+// notifyApproval 审批请求送达管理员（私聊首位管理员 QQ）；未配置时只记日志。
+func (m *Manager) notifyApproval(text string) {
+	qq := m.primaryAdminQQ()
+	if qq == 0 {
+		slog.Warn("未配置管理员 QQ（bot.admin_number），审批请求无法送达", "text", text)
+		return
+	}
+	if err := bot.Reply(context.Background(), "private", qq, chain.New().Text(text)); err != nil {
+		slog.Warn("审批请求发送失败", "admin_qq", qq, "err", err)
+	}
+}
+
+// primaryAdminQQ 首位管理员 QQ（审批通知目标）；未配置返回 0。
+func (m *Manager) primaryAdminQQ() int64 {
+	if a := app.GetApp(); a != nil && a.Config != nil && a.Config.Bot != nil && len(a.Config.Bot.Admin_Number) > 0 {
+		return int64(a.Config.Bot.Admin_Number[0])
+	}
+	return 0
+}
+
+// deliverApprovalResult 审批结果投递回来源会话（复用会话队列语义）。
+func (m *Manager) deliverApprovalResult(a Approval, result string, runErr error) {
+	var line string
+	switch {
+	case a.Status == ApprovalRejected:
+		line = fmt.Sprintf("[审批 #%d] %s 被管理员拒绝", a.ID, a.Tool)
+	case runErr != nil:
+		line = fmt.Sprintf("[审批 #%d] %s 失败: %v", a.ID, a.Tool, runErr)
+	default:
+		line = fmt.Sprintf("[审批 #%d] %s 完成: %s", a.ID, a.Tool, result)
+	}
+	m.Enqueue(IncomingMessage{
+		ChatType:   a.ChatType,
+		ChatID:     a.ChatID,
+		SelfID:     a.SelfID,
+		SenderID:   a.SelfID,
+		SenderName: "审批",
+		Text:       truncateRunes(line, maxEventText),
+	})
+}
+
+// TryResolveApproval 拦截管理员的「同意/拒绝 <id>」回复：命中即裁决审批单
+// （消息不进思考循环），并向管理员回执处理结果。管理员身份由调用方校验。
+func (m *Manager) TryResolveApproval(text string) bool {
+	id, approve, ok := parseApprovalReply(text)
+	if !ok {
+		return false
+	}
+	action := "同意"
+	if !approve {
+		action = "拒绝"
+	}
+	if err := m.approvals.Resolve(id, approve); err != nil {
+		m.notifyApproval(fmt.Sprintf("%s 失败: %v", action, err))
+		return true
+	}
+	m.notifyApproval(fmt.Sprintf("已%s审批 #%d，执行结果将送达发起会话", action, id))
+	return true
 }
 
 // fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
@@ -321,7 +385,9 @@ func (m *Manager) handleTurn(turn *Turn) {
 		Timer:     m.timerStore,
 		Images:    m.images,
 		Tasks:     m.tasks,
+		Approvals: m.approvals,
 		Events:    m.events,
+		Workspace: m.cfg.WorkspaceDir,
 		NotesPath: m.notesPath,
 		StatePath: m.statePath,
 		Admin:     isAdmin,
@@ -480,7 +546,7 @@ func (m *Manager) replyText(turn *Turn, content string) {
 
 // execToolCall 执行一次工具调用：普通调用同步执行返回结果；Asyncable 工具
 // 带 {"_async":true,...} 时转入 TaskManager 后台执行，立即返回任务回执
-//（结果完成经 deliverTaskResult 唤醒投递，不阻塞本 turn，spec §2.5 方案 B）。
+// （结果完成经 deliverTaskResult 唤醒投递，不阻塞本 turn，spec §2.5 方案 B）。
 // 未知工具 / Run 缺失 / 执行失败返回 error，由调用方包装成 {"error": ...} 回填。
 func (m *Manager) execToolCall(ctx *ToolContext, tools []Tool, call ToolCall) (string, error) {
 	var tool *Tool
@@ -519,7 +585,41 @@ func (m *Manager) execToolCall(ctx *ToolContext, tools []Tool, call ToolCall) (s
 			"note":    "后台执行中，完成后自动送达结果；task_list/task_get 可随时查看，task_cancel 可停止",
 		})
 	}
-	return tool.Run(json.RawMessage(call.Function.Arguments))
+	result, toolErr := tool.Run(json.RawMessage(call.Function.Arguments))
+	var need approvalNeeded
+	if errors.As(toolErr, &need) {
+		// 越界/危险操作 → 管理员审批（spec 权限模型）：登记审批单、QQ 通知
+		// 管理员，当轮返回回执；管理员「同意 <id>」后以 Approved ctx 重跑并
+		// 投递结果，「拒绝」投递拒绝回执。不阻塞本 turn。
+		if ctx.Approvals == nil {
+			return "", fmt.Errorf("%s（审批通道不可用）", need.Error())
+		}
+		if ctx.Turn == nil {
+			return "", fmt.Errorf("无会话上下文，无法发起审批")
+		}
+		id, reqErr := ctx.Approvals.Request(Approval{
+			Tool:     tool.Name,
+			Args:     call.Function.Arguments,
+			Reason:   need.reason,
+			ChatType: ctx.Turn.ChatType,
+			ChatID:   ctx.Turn.ChatID,
+			SelfID:   ctx.Turn.SelfID,
+			run: func(bool) (string, error) {
+				c2 := *ctx
+				c2.Approved = true
+				return tool.Run(json.RawMessage(call.Function.Arguments))
+			},
+		})
+		if reqErr != nil {
+			return "", fmt.Errorf("发起审批失败: %w", reqErr)
+		}
+		return marshalCompact(map[string]any{
+			"approval_id": id,
+			"status":      "pending",
+			"note":        "已请求管理员确认，管理员回复「同意 <id>」后自动执行并送达结果；期间你可以继续其他工作",
+		})
+	}
+	return result, toolErr
 }
 
 // asyncRequested 参数顶层是否带 "_async": true（保留键，仅在顶层生效）。

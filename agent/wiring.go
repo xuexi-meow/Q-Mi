@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	apimsg "Q-Mi/api/message"
 	"Q-Mi/app"
 	"Q-Mi/bot"
-	apimsg "Q-Mi/api/message"
 	"Q-Mi/event"
 	evmsg "Q-Mi/event/message"
 	"Q-Mi/storage"
@@ -80,6 +80,10 @@ func init() {
 	event.RegisterTyped("message.private", func(e *event.PrivateMessageEvent) {
 		m := getManager()
 		if m == nil || e.Sender == nil {
+			return
+		}
+		// 管理员的「同意/拒绝 <id>」审批回复：拦截裁决，不进思考循环
+		if bot.IsAdmin(int64(e.UserID)) && m.TryResolveApproval(bot.Text(e.Message)) {
 			return
 		}
 		// 私聊一律响应

@@ -114,8 +114,8 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 			Enable: true, BaseURL: openaiSrv.URL, APIKey: "sk-test",
 			Model: "test-model", PersonaFile: "persona.md",
 			Debounce: 20 * time.Millisecond, Temperature: 0.8,
-			History: config.AgentHistory{Max: 40, Trim: 20},
-			ImageDir:   t.TempDir(),
+			History:  config.AgentHistory{Max: 40, Trim: 20},
+			ImageDir: t.TempDir(),
 		},
 	}
 	a.Store = st

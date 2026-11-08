@@ -887,7 +887,7 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 			PersonaFile: writePersonaFile(t, "你是QQ上的AI成员。"),
 			GuideFile:   writeGuideFile(t, agentGuideText),
 			History:     config.AgentHistory{Max: 40, Trim: 20},
-		ImageDir:    t.TempDir(),
+			ImageDir:    t.TempDir(),
 			Multimodal:  boolPtr(multimodal),
 		}
 		b := NewDefaultBuilder(s, cfg)

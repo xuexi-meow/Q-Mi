@@ -201,7 +201,7 @@ func memoryTools(ctx *ToolContext) []Tool {
 					}
 				}
 				type imgSeg struct {
-					idx      int
+					idx       int
 					url, file string
 				}
 				var imgs []imgSeg
@@ -331,7 +331,7 @@ func coreTools(ctx *ToolContext) []Tool {
 					segs = []*apimsg.Message{apimsg.Text(p.Text)}
 				case len(p.Segments) > 0:
 					var err error
-					if segs, err = buildSegments(store, p.Segments); err != nil {
+					if segs, err = buildSegments(store, ctx.Workspace, p.Segments); err != nil {
 						return "", err
 					}
 				default:
@@ -739,9 +739,9 @@ func systemTools(ctx *ToolContext) []Tool {
 					return "", errors.New("行为事件流不可用")
 				}
 				var p struct {
-					Kind    string `json:"kind"`
-					ChatID  int64  `json:"chat_id"`
-					Limit   int    `json:"limit"`
+					Kind   string `json:"kind"`
+					ChatID int64  `json:"chat_id"`
+					Limit  int    `json:"limit"`
 				}
 				if err := decodeArgs(args, &p); err != nil {
 					return "", err
@@ -878,10 +878,10 @@ type segmentParam struct {
 
 // buildSegments 把 segments 参数转成消息段数组（P2.6）。只接受白名单类型，
 // 白名单外报错；text 段内容累计超过 maxSendMessageTextRunes 报错；
-// image 的 file 原样透传（http/https/base64:// 由 NapCat 处理，
-// 本地路径不该出现，同样透传让 NapCat 报出明确错误）；
-// sticker 段查 storage 收藏表转换，需要 store 非 nil。
-func buildSegments(store *storage.Store, segs []segmentParam) ([]*apimsg.Message, error) {
+// image/video/file 段的 file 若为工作区相对路径自动映射为 NapCat(WSL) 侧
+// /mnt/<盘符>/... 路径（模型不需要知道 WSL 的存在），http/https/base64://
+// 原样透传；sticker 段查 storage 收藏表转换，需要 store 非 nil。
+func buildSegments(store *storage.Store, workspace string, segs []segmentParam) ([]*apimsg.Message, error) {
 	out := make([]*apimsg.Message, 0, len(segs))
 	textLen := 0
 	for i, s := range segs {
@@ -940,6 +940,9 @@ func buildSegments(store *storage.Store, segs []segmentParam) ([]*apimsg.Message
 			file, err := segString(s.Data, "file", at)
 			if err != nil {
 				return nil, err
+			}
+			if mapped, merr := napcatFilePath(workspace, file); merr == nil {
+				file = mapped
 			}
 			var summary *string
 			if raw, ok := s.Data["summary"]; ok {
@@ -1254,8 +1257,9 @@ func passthrough(data json.RawMessage, err error) (string, error) {
 }
 
 // qqTools admin 板块：QQ 能力工具（群/好友/文件/请求处理）与 napcat 逃生舱。
-// admin 决定危险工具是否放行。
-func qqTools(admin bool) []Tool {
+// ctx.Admin 决定危险工具是否放行；ctx.Workspace 用于本地文件路径映射。
+func qqTools(ctx *ToolContext) []Tool {
+	admin := ctx.Admin
 	// requireAdmin 危险工具的统一门槛。
 	requireAdmin := func() error {
 		if !admin {
@@ -1844,10 +1848,10 @@ func qqTools(admin bool) []Tool {
 			Name:        "get_msg_history",
 			Description: "拉取某个会话在 NapCat 侧的历史消息（不受本地记忆库上限约束），返回 messages 数组。",
 			Parameters: objectParams(map[string]any{
-				"chat_type":    strProp("会话类型：private / group"),
-				"chat_id":      intProp("群号；私聊 = 对方 QQ"),
-				"message_seq":  intProp("可选，起始消息序号（翻页用）"),
-				"count":        intProp("可选，条数，默认 20，最大 20"),
+				"chat_type":   strProp("会话类型：private / group"),
+				"chat_id":     intProp("群号；私聊 = 对方 QQ"),
+				"message_seq": intProp("可选，起始消息序号（翻页用）"),
+				"count":       intProp("可选，条数，默认 20，最大 20"),
 			}, []string{"chat_type", "chat_id"}),
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
@@ -1911,7 +1915,7 @@ func qqTools(admin bool) []Tool {
 				"file":     strProp("本地文件绝对路径"),
 				"name":     strProp("上传后显示的文件名"),
 			}, []string{"group_id", "file", "name"}),
-			Usage: "上传耗时与文件大小相关，大文件建议 `\"_async\": true` 后台执行：立即返回任务回执，完成后自动送达结果。\n错误形态：file 为 http/base64 链接 → 报错；群文件系统未开启 → NapCat 报错回填。",
+			Usage:     "上传耗时与文件大小相关，大文件建议 `\"_async\": true` 后台执行：立即返回任务回执，完成后自动送达结果。\n错误形态：file 为 http/base64 链接 → 报错；群文件系统未开启 → NapCat 报错回填。",
 			Asyncable: true,
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
@@ -1928,15 +1932,21 @@ func qqTools(admin bool) []Tool {
 				if p.Name == "" {
 					return "", fmt.Errorf("缺少必填参数 name")
 				}
+				if p.File == "" {
+					return "", fmt.Errorf("缺少必填参数 file")
+				}
 				low := strings.ToLower(p.File)
 				if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") || strings.HasPrefix(low, "base64://") {
 					return "", fmt.Errorf("upload_group_file 仅支持本地路径（NapCat 与文件须在同一台机器上），不支持 http/base64: %s", p.File)
 				}
-				if p.File == "" {
-					return "", fmt.Errorf("缺少必填参数 file")
+				// 工作区相对路径映射为 NapCat(WSL) 侧路径；绝对 Windows 路径
+				// 自动映射 /mnt/<盘符>/...，模型不需要知道 WSL 的存在
+				file, merr := napcatFilePath(ctx.Workspace, p.File)
+				if merr != nil {
+					return "", merr
 				}
 				return passthrough(callNapCat(&api.UploadGroupFile{
-					GroupID: p.GroupID, File: p.File, Name: p.Name, UploadFile: true,
+					GroupID: p.GroupID, File: file, Name: p.Name, UploadFile: true,
 				}))
 			},
 		},

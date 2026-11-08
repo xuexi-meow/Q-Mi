@@ -157,6 +157,9 @@ var wantToolNames = []string{
 	"upload_group_file", "get_group_files",
 	"napcat_api", "napcat_docs",
 	// system
+	// computer
+	"read_file", "write_file", "list_dir", "delete_file", "download_file", "run_command", "save_message_media",
+	// system
 	"schedule", "cancel_timer", "task_list", "task_get", "task_cancel", "self_events",
 }
 
@@ -482,7 +485,7 @@ func TestSendMessageSegmentsRich(t *testing.T) {
 		t.Errorf("image 段 data = %v, want file=url summary=看看", d)
 	}
 
-	// image：base64:// 与本地路径形态都原样透传
+	// image：base64:// 原样透传；Windows 本地路径自动映射 /mnt/<盘符>/...
 	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
 		`{"type":"image","data":{"file":"base64://AAAA"}}]}`)
 	runToolOK(t, tools, "send_message", `{"chat_type":"group","chat_id":888,"segments":[`+
@@ -492,8 +495,8 @@ func TestSendMessageSegmentsRich(t *testing.T) {
 		t.Errorf("base64:// 应原样透传, got %v", d)
 	}
 	segs = napcatSegments(t, napcat, 4)
-	if d, _ := segs[0]["data"].(map[string]any); d["file"] != "E:/pics/a.png" {
-		t.Errorf("本地路径应原样透传（AI 不该给本地路径, 交给 NapCat 报错）, got %v", d)
+	if d, _ := segs[0]["data"].(map[string]any); d["file"] != "/mnt/e/pics/a.png" {
+		t.Errorf("本地路径应映射为 NapCat(WSL) 侧路径, got %v", d)
 	}
 
 	// face / dice / rps / json 全白名单

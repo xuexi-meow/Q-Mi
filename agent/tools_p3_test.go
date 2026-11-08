@@ -683,8 +683,8 @@ func TestUploadGroupFileTool(t *testing.T) {
 		t.Errorf("path = %s", nap.path(0))
 	}
 	b := nap.body(0)
-	if num(t, b, "group_id") != 888 || str(t, b, "file") != "C:/data/a.txt" || str(t, b, "name") != "a.txt" {
-		t.Errorf("参数错误: %v", b)
+	if num(t, b, "group_id") != 888 || str(t, b, "file") != "/mnt/c/data/a.txt" || str(t, b, "name") != "a.txt" {
+		t.Errorf("参数错误（Windows 路径应映射 NapCat 侧）: %v", b)
 	}
 	if !boolv(t, b, "upload_file") {
 		t.Errorf("upload_file 应为 true: %v", b)

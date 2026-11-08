@@ -12,3 +12,4 @@ agent/state.json
 agent/timers.json
 Config.yaml
 agent/images/
+agent/workspace/

@@ -118,6 +118,8 @@ type AgentConfig struct {
 	GuideFile   string `yaml:"guide_file" mapstructure:"guide_file"`
 	// ImageDir 内容寻址图片缓存落盘目录；空串 = 默认 agent/images。
 	ImageDir string `yaml:"image_dir" mapstructure:"image_dir"`
+	// WorkspaceDir 文件操作工作区根目录（computer 板块围栏）；空串 = 默认 agent/workspace。
+	WorkspaceDir string `yaml:"workspace_dir" mapstructure:"workspace_dir"`
 	// Modules 工具板块启停（重启生效，无热插拔）：缺省键 = 启用；
 	// 显式 false 的板块不加载（工具与文档都不出现）。
 	Modules  map[string]bool `yaml:"modules" mapstructure:"modules"`

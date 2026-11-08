@@ -101,8 +101,8 @@ func TestPromptDocsDeterministic(t *testing.T) {
 // TestEnabledModulesFiltersByConfig 配置关闭的板块不加载，缺省键 = 启用。
 func TestEnabledModulesFiltersByConfig(t *testing.T) {
 	all := enabledModules(config.AgentConfig{})
-	if len(all) != 6 {
-		t.Fatalf("缺省板块数 = %d, want 6", len(all))
+	if len(all) != 7 {
+		t.Fatalf("缺省板块数 = %d, want 7", len(all))
 	}
 	filtered := enabledModules(config.AgentConfig{Modules: map[string]bool{
 		"qzone": false,
@@ -112,13 +112,13 @@ func TestEnabledModulesFiltersByConfig(t *testing.T) {
 	for _, m := range filtered {
 		names = append(names, m.Name())
 	}
-	want := []string{"core", "memory", "sticker", "system"}
+	want := []string{"core", "memory", "sticker", "computer", "system"}
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("过滤后板块 = %v, want %v", names, want)
 	}
 	// 显式 true 也保留
 	kept := enabledModules(config.AgentConfig{Modules: map[string]bool{"core": true, "qzone": false}})
-	if len(kept) != 5 {
+	if len(kept) != 6 {
 		t.Errorf("显式 true 应保留, got %d 板块", len(kept))
 	}
 }

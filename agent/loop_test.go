@@ -117,8 +117,11 @@ func TestThinkLoopFullSequence(t *testing.T) {
 	if msgs2[4].Role != "tool" || msgs2[4].ToolCallID != "c2" || msgs2[4].Content != "{}" {
 		t.Errorf("think 的 tool 消息 = %+v, want tool/c2/{}", msgs2[4])
 	}
-	if msgs2[5].Role != "tool" || msgs2[5].ToolCallID != "c3" || msgs2[5].Content != "[]" {
-		t.Errorf("get_recent 的 tool 消息 = %+v, want tool/c3/[]", msgs2[5])
+	if msgs2[5].Role != "tool" || msgs2[5].ToolCallID != "c3" {
+		t.Errorf("get_recent 的 tool 消息 = %+v, want role=tool tool_call_id=c3", msgs2[5])
+	}
+	if rows := messageRowsOf(t, contentText(msgs2[5])); len(rows) != 0 {
+		t.Errorf("空记忆库返回了消息: %#v", rows)
 	}
 
 	// 请求3: send_message 结果 {"message_id":1} 已回填
@@ -315,6 +318,35 @@ func TestHandleTurnLogsThinkingChain(t *testing.T) {
 	}
 	if ln := find("结束思考", "chat_type=group", "chat_id=888", "round=3"); ln == "" {
 		t.Errorf("finish 应产生「结束思考」日志行:\n%s", all)
+	}
+}
+
+func TestHandleTurnSenseNovaReasoningLoggedButNotReplayedOrSent(t *testing.T) {
+	logs := captureLogsSync(t)
+	cfg := testCfg(20 * time.Millisecond)
+	m, f, napcat := newLoopManager(t, cfg, &stubBuilder{}, nil, []string{
+		`{"choices":[{"index":0,"message":{"role":"assistant","reasoning":"probe-private-reasoning","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_recent_messages","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		toolCallResp("c2", "finish", "{}"),
+	})
+	turn := &Turn{ChatType: "group", ChatID: 888, SelfID: 999, Now: time.Now(),
+		NewMessages: []TurnMessage{{ChatType: "group", ChatID: 888, Text: "在吗"}}}
+	m.handleTurn(turn)
+	if all := logs.String(); !strings.Contains(all, "msg=思考") ||
+		!strings.Contains(all, "reasoning=probe-private-reasoning") {
+		t.Fatalf("SenseNova reasoning missing from thinking log:\n%s", all)
+	}
+	if napcat.count() != 0 {
+		t.Fatalf("reasoning must not be sent to QQ: %d requests", napcat.count())
+	}
+	if f.count() != 2 {
+		t.Fatalf("tool cycle did not continue: %d requests", f.count())
+	}
+	wire, err := json.Marshal(f.reqs[1].Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), "probe-private-reasoning") {
+		t.Fatal("provider reasoning leaked into replayed conversation")
 	}
 }
 
@@ -522,9 +554,8 @@ func TestScheduleToolFiresReminderIntoLoop(t *testing.T) {
 	}
 
 	// fakeLLM 收到提醒文本（经 builder 进入请求 user 消息）
-	first := f.reqs[2].Messages[0]
-	if first.Role != "user" || !strings.Contains(contentText(first), "[定时提醒]") {
-		t.Errorf("提醒文本应进入 LLM 请求: %+v", first)
+	if text := requestText(f.reqs[2]); !strings.Contains(text, "[定时提醒]") {
+		t.Errorf("提醒文本应进入连续上下文: %s", text)
 	}
 	// 触发后计时器清空
 	if got := m.timerStore.Active(); got != 0 {

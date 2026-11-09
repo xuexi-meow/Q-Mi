@@ -36,7 +36,7 @@ type FriendData struct {
 // SetFriendAddRequest 处理加好友请求 POST /set_friend_add_request
 type SetFriendAddRequest struct {
 	Flag    string `json:"flag"`
-	Approve bool   `json:"approve,omitempty"`
+	Approve bool   `json:"approve"`
 	Remark  string `json:"remark,omitempty"`
 }
 

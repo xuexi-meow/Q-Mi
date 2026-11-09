@@ -11,6 +11,7 @@ agent/notes.json
 agent/state.json
 agent/timers.json
 Config.yaml
+Config.webui.yaml
 agent/images/
 agent/workspace/
 agent/browser-profile/

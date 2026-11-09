@@ -330,6 +330,40 @@ func TestChatResponsePlainContent(t *testing.T) {
 	}
 }
 
+func TestChatParsesProviderReasoningWithoutChangingContent(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fields    string
+		reasoning string
+	}{
+		{"sensenova", `"reasoning":"先决定是否参与"`, "先决定是否参与"},
+		{"deepseek", `"reasoning_content":"先决定是否参与"`, "先决定是否参与"},
+		{"both", `"reasoning_content":"标准字段","reasoning":"兼容字段"`, "标准字段"},
+		{"fallback", `"reasoning_content":null,"reasoning":"兼容字段"`, "兼容字段"},
+		{"neither", `"reasoning_content":null,"reasoning":null`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"choices":[{"index":0,"message":{"role":"assistant","content":"给对方看的正文",` +
+				tc.fields + `,"tool_calls":[{"id":"c1","type":"function","function":{"name":"finish","arguments":"{}"}}]}}]}`
+			srv, _ := fakeOpenAI(t, http.StatusOK, body)
+			client := NewClient(srv.URL, "sk-test", time.Second)
+			resp, err := client.Chat(context.Background(), ChatRequest{Model: "test-model"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := resp.ReasoningContent(); got != tc.reasoning {
+				t.Fatalf("reasoning = %q, want %q", got, tc.reasoning)
+			}
+			if got := resp.TextContent(); got != "给对方看的正文" {
+				t.Fatalf("reasoning must not replace final content: %q", got)
+			}
+			if calls := resp.ToolCalls(); len(calls) != 1 || calls[0].Function.Name != "finish" {
+				t.Fatalf("reasoning parsing changed tool calls: %+v", calls)
+			}
+		})
+	}
+}
+
 func TestChatHTTPError(t *testing.T) {
 	srv, _ := fakeOpenAI(t, http.StatusInternalServerError, `{"error": {"message": "boom"}}`)
 	client := NewClient(srv.URL, "sk-test", 5*time.Second)

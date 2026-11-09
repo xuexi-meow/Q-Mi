@@ -65,6 +65,7 @@ type fakeLLM struct {
 	arrival []time.Time
 	script  []string
 	hook    func(idx int, r *http.Request)
+	respond func(ChatRequest) string
 }
 
 func newFakeLLM(t *testing.T, content string) (*fakeLLM, *httptest.Server) {
@@ -81,13 +82,16 @@ func newFakeLLM(t *testing.T, content string) (*fakeLLM, *httptest.Server) {
 		f.arrival = append(f.arrival, time.Now())
 		script := f.script
 		hook := f.hook
+		respond := f.respond
 		f.mu.Unlock()
 		if hook != nil {
 			hook(idx, r)
 		}
 		resp := map[string]any{}
 		var body []byte
-		if len(script) > 0 {
+		if respond != nil {
+			body = []byte(respond(req))
+		} else if len(script) > 0 {
 			body = []byte(script[idx%len(script)])
 		} else {
 			resp = map[string]any{

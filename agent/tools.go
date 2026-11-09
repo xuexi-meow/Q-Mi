@@ -6,7 +6,6 @@ package agent
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -96,12 +94,13 @@ func memoryTools(ctx *ToolContext) []Tool {
 	return []Tool{
 		{
 			Name:        "get_recent_messages",
-			Description: "查询最近的聊天记录（跨会话混合，按时间正序返回 JSON 数组）。",
+			Description: "查询最近聊天，可按会话取最近 N 条，旧到新返回限长 JSON。遵循 chat_dnd 勿扰；完整存档用 search_messages。",
 			Parameters: objectParams(map[string]any{
 				"chat_type": strProp("可选，按会话类型过滤：private / group"),
 				"chat_id":   intProp("可选，按会话 ID 过滤：群号；私聊 = 对方 QQ"),
 				"limit":     intProp("可选，返回条数，默认 50，最大 100"),
 			}, nil),
+			Usage: "某群最近 10 条：`{\"chat_type\":\"group\",\"chat_id\":888,\"limit\":10}`。返回格式与截断规则同 search_messages。",
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
 					ChatType string `json:"chat_type"`
@@ -119,48 +118,14 @@ func memoryTools(ctx *ToolContext) []Tool {
 					limit = 100
 				}
 				return queryMessageRows(store, images, turn, storage.MessageFilter{
-					ChatType: p.ChatType,
-					ChatID:   p.ChatID,
-					Limit:    limit,
+					ChatType:  p.ChatType,
+					ChatID:    p.ChatID,
+					Limit:     limit,
+					Attention: recentAttention(turn),
 				})
 			},
 		},
-		{
-			Name:        "search_messages",
-			Description: "按关键词全文搜索历史聊天记录（按时间正序返回 JSON 数组）。",
-			Parameters: objectParams(map[string]any{
-				"query":     strProp("搜索关键词"),
-				"chat_type": strProp("可选，按会话类型过滤：private / group"),
-				"chat_id":   intProp("可选，按会话 ID 过滤：群号；私聊 = 对方 QQ"),
-				"limit":     intProp("可选，返回条数，默认 20，最大 50"),
-			}, []string{"query"}),
-			Run: func(args json.RawMessage) (string, error) {
-				var p struct {
-					Query    string `json:"query"`
-					ChatType string `json:"chat_type"`
-					ChatID   int64  `json:"chat_id"`
-					Limit    int    `json:"limit"`
-				}
-				if err := decodeArgs(args, &p); err != nil {
-					return "", err
-				}
-				if p.Query == "" {
-					return "", fmt.Errorf("query 不能为空")
-				}
-				limit := p.Limit
-				if limit <= 0 {
-					limit = 20
-				}
-				if limit > 50 {
-					limit = 50
-				}
-				return queryMessageRows(store, images, turn, storage.MessageFilter{
-					ChatType: p.ChatType,
-					ChatID:   p.ChatID,
-					Limit:    limit,
-				}, p.Query)
-			},
-		},
+		searchMessagesTool(ctx),
 		{
 			Name:        "view_message_images",
 			Description: "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。查询工具的结果会自动附带最新几条消息的图片，单条消息的图或自动附带跳过的图用这个工具补看。",
@@ -277,6 +242,7 @@ func memoryTools(ctx *ToolContext) []Tool {
 				return marshalCompact(out)
 			},
 		},
+		chatDNDTool(ctx),
 	}
 }
 
@@ -286,7 +252,7 @@ func coreTools(ctx *ToolContext) []Tool {
 	return []Tool{
 		{
 			Name:        "send_message",
-			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/mface/sticker/dice/rps/json/image），两者二选一。一个思考轮里可多次调用实现分条发送；不调用则不回复。",
+			Description: "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/mface/sticker/dice/rps/json/image），两者二选一。正文只写给对方看的话，不要附上下文的时间/会话/发送者前缀或内部标签。通常合并为一条；不想发言就调用 finish。",
 			Parameters: objectParams(map[string]any{
 				"chat_type": strProp("会话类型：private / group"),
 				"chat_id":   intProp("会话 ID：群号；私聊 = 对方 QQ"),
@@ -346,7 +312,7 @@ func coreTools(ctx *ToolContext) []Tool {
 		},
 		{
 			Name:        "think",
-			Description: "记一条思考笔记，持久化后下一轮对话会注入上下文，用于跨轮次保持思路连贯。",
+			Description: "记一条思考笔记，持久化后下次模型请求前即注入最新状态快照，用于保持研究与活动连贯。",
 			Parameters: objectParams(map[string]any{
 				"note": strProp("笔记内容"),
 			}, []string{"note"}),
@@ -802,74 +768,6 @@ func marshalCompact(v any) (string, error) {
 	return string(data), nil
 }
 
-// maxAutoAttachImages 查询工具单次自动附图上限（多模态直送下一条消息）。
-const maxAutoAttachImages = 5
-
-// queryMessageRows 查询（可选 FTS 关键词）并把结果序列化为与上下文行
-// 同构的紧凑 JSON 数组（旧→新）：message_id/chat_type/chat_id/sender_name/
-// text/time，带图行额外有 images（图片张数）。最新消息的图片自动解析并附在
-// 下一条消息里（turn/images 非 nil 时），单次最多 maxAutoAttachImages 张，
-// 附上的行带 images_attached 标记——查到具体消息即看图，URL 失效的旧图自动
-// 跳过（可再调 view_message_images 走换链兜底）。
-func queryMessageRows(store *storage.Store, images *imageStore, turn *Turn, f storage.MessageFilter, keyword ...string) (string, error) {
-	if store == nil {
-		return "", fmt.Errorf("记忆库未启用，无法查询消息")
-	}
-	var (
-		records []*storage.MessageRecord
-		err     error
-	)
-	if len(keyword) > 0 {
-		records, err = store.SearchMessages(keyword[0], f)
-	} else {
-		records, err = store.QueryMessages(f)
-	}
-	if err != nil {
-		return "", fmt.Errorf("查询消息失败: %w", err)
-	}
-	rows := make([]map[string]any, 0, len(records))
-	for i := len(records) - 1; i >= 0; i-- { // 倒序 → 正序（旧→新）
-		r := records[i]
-		row := map[string]any{
-			"message_id":  r.MessageID,
-			"chat_type":   r.ChatType,
-			"chat_id":     r.ChatID,
-			"sender_name": r.SenderName,
-			"text":        r.RawMessage,
-			"time":        time.Unix(int64(r.Time), 0).Format(timeLayout),
-		}
-		if refs := extractImageRefs(r.Segments); len(refs) > 0 {
-			row["images"] = len(refs)
-		}
-		rows = append(rows, row)
-	}
-	// 自动附图：从最新记录往前解析（records 为时间倒序，最新在前）
-	if turn != nil && images != nil {
-		attached := 0
-		for i := 0; i < len(records) && attached < maxAutoAttachImages; i++ {
-			r := records[i]
-			refs := extractImageRefs(r.Segments)
-			if len(refs) == 0 {
-				continue
-			}
-			row := rows[len(records)-1-i] // 正序行数组里对应本条记录的下标
-			for _, ref := range refs {
-				if attached >= maxAutoAttachImages {
-					break
-				}
-				du := images.dataURLFor(r.MessageID, ref.Idx, ref.URL)
-				if !strings.HasPrefix(du, "data:") { // URL 失效等，跳过
-					continue
-				}
-				turn.AddPendingImage(du)
-				row["images_attached"] = true
-				attached++
-			}
-		}
-	}
-	return marshalCompact(rows)
-}
-
 // maxSendMessageTextRunes send_message 单次调用 text 内容的累计上限
 // （rune 计），纯 text 与 segments 里的 text 段共用该额度。
 const maxSendMessageTextRunes = 8000
@@ -1095,6 +993,17 @@ func segString(data map[string]any, key string, at int) (string, error) {
 // sendSegments 经 NapCat 发送消息段链并返回 {"message_id":N}
 // （NapCat 调用是短请求，用独立 Background ctx，打断逻辑在 P2 后续处理）。
 func sendSegments(chatType string, chatID int64, segs []*apimsg.Message) (string, error) {
+	var text strings.Builder
+	for _, seg := range segs {
+		if seg != nil && seg.Type == apimsg.TypeText {
+			if data, ok := seg.Data.(apimsg.MakeText); ok {
+				text.WriteString(data.Text)
+			}
+		}
+	}
+	if err := validateOutgoingText(text.String()); err != nil {
+		return "", err
+	}
 	ctx := context.Background()
 	var (
 		resp *api.Response[api.SendMsgData]
@@ -1157,17 +1066,6 @@ func writeState(path, mood string) error {
 // errAdminRequired 非管理员调用危险操作的错误文案（回填思维链，模型能看懂）。
 var errAdminRequired = errors.New("此操作需要管理员权限")
 
-// dangerousNapcatActions napcat_api 逃生舱中需要管理员权限的动作集合。
-var dangerousNapcatActions = map[string]bool{
-	"set_group_kick":   true,
-	"set_group_leave":  true,
-	"delete_friend":    true,
-	"set_qq_avatar":    true,
-	"set_qq_profile":   true,
-	"set_group_name":   true,
-	"delete_qzone_msg": true, // P4：删说说（工具级门槛见 delete_qzone）
-}
-
 // maxBanDuration 单次禁言时长上限：30 天（秒）。
 const maxBanDuration = 2592000
 
@@ -1204,6 +1102,9 @@ func truncateRunes(s string, max int) string {
 // callNapCat 用独立 ctx 调一次 NapCat API 并返回 data（RawMessage 原样透传）。
 // 出错时返回 request 层的错误（含 retcode/wording，模型可据此调整）。
 func callNapCat(req api.Request) (json.RawMessage, error) {
+	if err := validateNapcatOutgoing(req); err != nil {
+		return nil, err
+	}
 	resp, err := request.Call(context.Background(), req)
 	if err != nil {
 		return nil, err
@@ -1265,11 +1166,8 @@ func passthrough(data json.RawMessage, err error) (string, error) {
 func qqTools(ctx *ToolContext) []Tool {
 	admin := ctx.Admin
 	// requireAdmin 危险工具的统一门槛。
-	requireAdmin := func() error {
-		if !admin {
-			return errAdminRequired
-		}
-		return nil
+	requireAdmin := func(action string) error {
+		return authorizeNapcatAction(action, admin)
 	}
 
 	return []Tool{
@@ -1575,7 +1473,7 @@ func qqTools(ctx *ToolContext) []Tool {
 				"reject_add_request": map[string]any{"type": "boolean", "description": "是否拒绝此人再次加群，默认 false"},
 			}, []string{"group_id", "user_id"}),
 			Run: func(args json.RawMessage) (string, error) {
-				if err := requireAdmin(); err != nil {
+				if err := requireAdmin("set_group_kick"); err != nil {
 					return "", err
 				}
 				var p struct {
@@ -1603,7 +1501,7 @@ func qqTools(ctx *ToolContext) []Tool {
 				"enable":   map[string]any{"type": "boolean", "description": "true 设为管理员，false 取消"},
 			}, []string{"group_id", "user_id", "enable"}),
 			Run: func(args json.RawMessage) (string, error) {
-				if err := requireAdmin(); err != nil {
+				if err := requireAdmin("set_group_admin"); err != nil {
 					return "", err
 				}
 				var raw struct {
@@ -1625,12 +1523,15 @@ func qqTools(ctx *ToolContext) []Tool {
 		},
 		{
 			Name:        "set_group_name",
-			Description: "修改群名称。",
+			Description: "修改群名称，需要管理员权限。",
 			Parameters: objectParams(map[string]any{
 				"group_id": intProp("群号"),
 				"name":     strProp("新群名称"),
 			}, []string{"group_id", "name"}),
 			Run: func(args json.RawMessage) (string, error) {
+				if err := requireAdmin("set_group_name"); err != nil {
+					return "", err
+				}
 				var p struct {
 					GroupID int64  `json:"group_id"`
 					Name    string `json:"name"`
@@ -1654,7 +1555,7 @@ func qqTools(ctx *ToolContext) []Tool {
 				"group_id": intProp("要退出的群号"),
 			}, []string{"group_id"}),
 			Run: func(args json.RawMessage) (string, error) {
-				if err := requireAdmin(); err != nil {
+				if err := requireAdmin("set_group_leave"); err != nil {
 					return "", err
 				}
 				var p struct {
@@ -1671,13 +1572,16 @@ func qqTools(ctx *ToolContext) []Tool {
 		},
 		{
 			Name:        "send_group_notice",
-			Description: "在群里发布一条公告。content（文字）与 image（图片 URL/路径）至少提供一个。",
+			Description: "在群里发布一条公告，需要管理员权限。content（文字）与 image（图片 URL/路径）至少提供一个。",
 			Parameters: objectParams(map[string]any{
 				"group_id": intProp("群号"),
 				"content":  strProp("公告文字内容"),
 				"image":    strProp("可选，公告图片（路径或 URL）"),
 			}, []string{"group_id"}),
 			Run: func(args json.RawMessage) (string, error) {
+				if err := requireAdmin("_send_group_notice"); err != nil {
+					return "", err
+				}
 				var p struct {
 					GroupID int64  `json:"group_id"`
 					Content string `json:"content"`
@@ -1980,7 +1884,7 @@ func qqTools(ctx *ToolContext) []Tool {
 		},
 		{
 			Name:        "napcat_api",
-			Description: "万能逃生舱：调用任意 NapCat API 动作。action 为动作名（可带 / 前缀），params 为参数对象。先用 napcat_docs 查常用动作；未封装的动作参数细节见 apifox 文档。部分危险动作需要管理员权限。",
+			Description: "按需调用已开放的 SnowLuma/NapCat 动作。优先已有封装工具；先用 napcat_docs 搜索并查具体参数。权限、参数与发言校验不可绕过。",
 			Parameters: objectParams(map[string]any{
 				"action": strProp("NapCat 动作名，如 get_group_honor_info（可带 / 前缀）"),
 				"params": map[string]any{
@@ -1988,46 +1892,23 @@ func qqTools(ctx *ToolContext) []Tool {
 					"description": "动作参数对象，键为文档里的参数名；无参动作可省略",
 				},
 			}, []string{"action"}),
-			Usage: "示例——查群荣耀：\n`{\"action\":\"get_group_honor_info\",\"params\":{\"group_id\":928952016,\"type\":\"legend\"}}`\n未知动作会列出全部可用动作名；params 键名必须与文档一致（驼峰），解析失败报错回填。",
+			Usage: "先 `napcat_docs({\"query\":\"群荣誉\"})` 找动作，再 `napcat_docs({\"action\":\"get_group_honor_info\"})` 看结构和示例，最后调用。params 必须符合该动作的 input_schema，键名大小写严格一致；无参可省略。新增动作默认禁用，权限以程序返回为准。结果过长会标记 truncated，改用分页/更小查询或封装工具。",
 			Run: func(args json.RawMessage) (string, error) {
-				var p struct {
-					Action string          `json:"action"`
-					Params json.RawMessage `json:"params"`
-				}
-				if err := decodeArgs(args, &p); err != nil {
-					return "", err
-				}
-				name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(p.Action), "/"))
-				if name == "" {
-					return "", fmt.Errorf("缺少必填参数 action")
-				}
-				typ, ok := actionRegistry[name]
-				if !ok {
-					names := make([]string, 0, len(actionRegistry))
-					for n := range actionRegistry {
-						names = append(names, n)
-					}
-					sort.Strings(names)
-					return "", fmt.Errorf("未知动作 %q，可用动作：%s", p.Action, strings.Join(names, ", "))
-				}
-				if !admin && dangerousNapcatActions[name] {
-					return "", errAdminRequired
-				}
-				reqVal := reflect.New(typ) // *T，T 为该动作的请求结构体
-				if len(p.Params) > 0 {
-					if err := json.Unmarshal(p.Params, reqVal.Interface()); err != nil {
-						return "", fmt.Errorf("params 解析失败（应为参数对象）: %w", err)
-					}
-				}
-				return passthrough(callNapCat(reqVal.Interface().(api.Request)))
+				return runNapcatAPI(ctx, args)
 			},
 		},
 		{
 			Name:        "napcat_docs",
-			Description: "返回常用 NapCat 动作速查（动作名 + 用途 + 关键参数）。配合 napcat_api 使用；全部动作见 apifox 文档。",
-			Parameters:  objectParams(nil, nil),
-			Run: func(json.RawMessage) (string, error) {
-				return strings.TrimSpace(napcatActionsJSON), nil
+			Description: "按需查完整 SnowLuma API 目录：query 搜索，category 分类，action 查参数/返回结构/示例/本地权限。空参返回分类和首屏，列表分页。",
+			Parameters: objectParams(map[string]any{
+				"query":    strProp("可选，中英文动作名或用途关键词，如 qzone、群荣誉、表情"),
+				"category": strProp("可选，空参返回的分类名，如 空间、群管理、消息、群文件"),
+				"action":   strProp("可选，精确动作名；返回详情而非列表，可带 / 前缀"),
+				"offset":   intProp("可选，列表偏移量，默认 0；接上页 next_offset"),
+				"limit":    intProp("可选，每页条数，默认 12，上限 25"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				return napcatDocs(args, admin)
 			},
 		},
 	}
@@ -2035,13 +1916,7 @@ func qqTools(ctx *ToolContext) []Tool {
 
 // qzoneTools QQ 空间板块（全部走 SnowLuma 形态：tid/target_uin，
 // 不用 feed_ref，两种定位方式不能混用）。
-func qzoneTools(admin bool) []Tool {
-	requireAdmin := func() error {
-		if !admin {
-			return errAdminRequired
-		}
-		return nil
-	}
+func qzoneTools(ctx *ToolContext) []Tool {
 	return []Tool{
 		{
 			Name:        "post_qzone",
@@ -2066,7 +1941,7 @@ func qzoneTools(admin bool) []Tool {
 		},
 		{
 			Name:        "browse_qzone_feeds",
-			Description: "刷好友空间动态（每页最多 10 条：uin/author/time/summary/image_count/tid，has_more 表示可翻页）。想细看或互动某条时，拿它的 tid 走 read_qzone_post / qzone_like / comment_qzone。",
+			Description: "刷好友空间动态（每页最多 10 条：uin/author/time/summary/images/image_count/tid，has_more 表示可翻页）。只返回图片链接，不自动看图；选 images 中感兴趣的链接用 view_qzone_images。细看文字或互动用 read_qzone_post / qzone_like / comment_qzone。",
 			Parameters: objectParams(map[string]any{
 				"page_num": intProp("可选，页码，默认 1"),
 			}, nil),
@@ -2087,12 +1962,12 @@ func qzoneTools(admin bool) []Tool {
 				}
 				var resp struct {
 					Feeds []struct {
-						Uin      int64   `json:"uin"`
-						Nickname string  `json:"nickname"`
-						Time     int64   `json:"time"`
-						TID      *string `json:"tid"`
-						Content  *string `json:"content"`
-						Images   []any   `json:"images"`
+						Uin      int64    `json:"uin"`
+						Nickname string   `json:"nickname"`
+						Time     int64    `json:"time"`
+						TID      *string  `json:"tid"`
+						Content  *string  `json:"content"`
+						Images   []string `json:"images"`
 					} `json:"feeds"`
 					HasMore bool `json:"has_more"`
 				}
@@ -2111,12 +1986,17 @@ func qzoneTools(admin bool) []Tool {
 					if f.Content != nil {
 						content = *f.Content
 					}
+					var imageCount any
+					if f.Images != nil {
+						imageCount = len(f.Images)
+					}
 					rows = append(rows, map[string]any{
 						"uin":         f.Uin,
 						"author":      f.Nickname,
 						"time":        time.Unix(f.Time, 0).Format(timeLayout),
 						"summary":     truncateRunes(content, maxQzoneSummaryRunes),
-						"image_count": len(f.Images),
+						"images":      f.Images,
+						"image_count": imageCount,
 						"tid":         tid,
 					})
 				}
@@ -2125,7 +2005,7 @@ func qzoneTools(admin bool) []Tool {
 		},
 		{
 			Name:        "read_qzone_post",
-			Description: "读一条空间说说的完整内容与首批评论（正文限 200 字、评论限 10 条、单条限 100 字）。tid 来自 browse_qzone_feeds；target_uin 是说说作者的 QQ 号，默认自己的空间。",
+			Description: "读空间说说正文与首批评论（正文限 200 字、评论限 10 条、单条限 100 字）。tid 来自 browse_qzone_feeds；target_uin 是作者 QQ，默认自己。接口若提供 images 则保留链接；为 null 时不代表无图，可用浏览列表中的链接调用 view_qzone_images。",
 			Parameters: objectParams(map[string]any{
 				"tid":        strProp("说说 tid"),
 				"target_uin": intProp("可选，说说作者的 QQ 号，默认自己的空间"),
@@ -2146,8 +2026,9 @@ func qzoneTools(admin bool) []Tool {
 					return "", err
 				}
 				var resp struct {
-					Content    *string `json:"content"`
-					CommentNum int64   `json:"comment_num"`
+					Content    *string  `json:"content"`
+					Images     []string `json:"images"`
+					CommentNum int64    `json:"comment_num"`
 					Comments   []struct {
 						Name    string  `json:"name"`
 						Time    int64   `json:"time"`
@@ -2194,14 +2075,21 @@ func qzoneTools(admin bool) []Tool {
 						"replies": replies,
 					})
 				}
+				var imageCount any
+				if resp.Images != nil {
+					imageCount = len(resp.Images)
+				}
 				return marshalCompact(map[string]any{
 					"tid":         p.TID,
 					"content":     truncateRunes(content, maxQzonePostContentRunes),
+					"images":      resp.Images,
+					"image_count": imageCount,
 					"comment_num": resp.CommentNum,
 					"comments":    comments,
 				})
 			},
 		},
+		viewQzoneImagesTool(ctx),
 		{
 			Name:        "qzone_like",
 			Description: "给一条空间说说点赞 / 取消点赞（enable 默认 true 点赞，false 取消）。tid 来自 browse_qzone_feeds；target_uin 是说说作者的 QQ 号，默认自己的空间。点赞要自然：真有感触才点，别批量刷。",
@@ -2274,7 +2162,7 @@ func qzoneTools(admin bool) []Tool {
 				"tid": strProp("要删除的说说 tid"),
 			}, []string{"tid"}),
 			Run: func(args json.RawMessage) (string, error) {
-				if err := requireAdmin(); err != nil {
+				if err := authorizeNapcatAction("delete_qzone_msg", ctx.Admin); err != nil {
 					return "", err
 				}
 				var p struct {
@@ -2297,7 +2185,7 @@ func qzoneTools(admin bool) []Tool {
 type groupAddRequestReq struct {
 	Flag    string `json:"flag"`
 	SubType string `json:"sub_type"`
-	Approve bool   `json:"approve,omitempty"`
+	Approve bool   `json:"approve"`
 	Reason  string `json:"reason,omitempty"`
 }
 
@@ -2414,8 +2302,8 @@ func actionTypes() []api.Request {
 	}
 }
 
-// actionRegistry 动作名（无 / 前缀）→ 请求结构体类型。napcat_api 逃生舱
-// 用 reflect.New 现场构造零值请求后反序列化 params。init 期构建一次。
+// actionRegistry 保留旧 api 包的类型登记，用于覆盖性检查。
+// 逃生舱使用官方目录与原始 JSON，不再经反射结构体丢弃参数。
 var actionRegistry = buildActionRegistry(actionTypes())
 
 // buildActionRegistry 由动作实例列表构建名称 → 类型映射。
@@ -2430,8 +2318,3 @@ func buildActionRegistry(list []api.Request) map[string]reflect.Type {
 	}
 	return m
 }
-
-// napcatActionsJSON 常用动作速查资源（napcat_docs 工具输出）。
-//
-//go:embed napcat_actions.json
-var napcatActionsJSON string

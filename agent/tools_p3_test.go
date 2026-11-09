@@ -513,7 +513,7 @@ func TestSetGroupAdminTool(t *testing.T) {
 
 func TestSetGroupNameTool(t *testing.T) {
 	nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
-	tools, _, _ := testToolSet(t, nil)
+	tools := testToolSetAdmin(t)
 
 	runToolOK(t, tools, "set_group_name", `{"group_id":888,"name":"新群名"}`)
 	if nap.path(0) != "/set_group_name" {
@@ -540,7 +540,7 @@ func TestLeaveGroupTool(t *testing.T) {
 
 func TestSendGroupNoticeTool(t *testing.T) {
 	nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
-	tools, _, _ := testToolSet(t, nil)
+	tools := testToolSetAdmin(t)
 
 	out := runToolOK(t, tools, "send_group_notice", `{"group_id":888,"content":"本周六聚餐"}`)
 	if out != "{}" {
@@ -750,10 +750,10 @@ func TestNapcatAPITool(t *testing.T) {
 		t.Errorf("params 未透传: %v", b)
 	}
 
-	// 未知动作：报错并列出可用动作
+	// 未知动作：短提示导向可搜索目录，避免一次灌入完整动作列表。
 	err := runToolErr(t, tools, "napcat_api", `{"action":"no_such_action"}`)
-	if !strings.Contains(err.Error(), "no_such_action") || !strings.Contains(err.Error(), "get_login_info") {
-		t.Errorf("未知动作报错应含动作名与可用动作列表: %v", err)
+	if !strings.Contains(err.Error(), "no_such_action") || !strings.Contains(err.Error(), "napcat_docs") {
+		t.Errorf("未知动作报错应含动作名与目录提示: %v", err)
 	}
 
 	// params 非对象：报错
@@ -782,14 +782,16 @@ func TestNapcatDocsTool(t *testing.T) {
 	out := runToolOK(t, tools, "napcat_docs", "")
 
 	var docs struct {
-		Actions []map[string]any `json:"actions"`
-		Note    string           `json:"note"`
+		Actions    []map[string]any `json:"actions"`
+		Note       string           `json:"note"`
+		Categories map[string]int   `json:"categories"`
+		Total      int              `json:"total"`
 	}
 	if err := json.Unmarshal([]byte(out), &docs); err != nil {
 		t.Fatalf("napcat_docs 输出不是合法 JSON: %v (%s)", err, out)
 	}
-	if len(docs.Actions) < 50 {
-		t.Errorf("应覆盖约 50 个常用动作, got %d", len(docs.Actions))
+	if len(docs.Actions) == 0 || len(docs.Actions) > 25 || docs.Total <= len(docs.Actions) {
+		t.Errorf("默认应只返回有界首屏: %d / %d", len(docs.Actions), docs.Total)
 	}
 	for _, a := range docs.Actions {
 		name, _ := a["action"].(string)
@@ -799,16 +801,16 @@ func TestNapcatDocsTool(t *testing.T) {
 		}
 	}
 	if docs.Note == "" {
-		t.Error("应附其余动作见 apifox 文档的说明")
+		t.Error("应附按需查询说明")
 	}
-	// 覆盖几个代表性动作
-	seen := map[string]bool{}
-	for _, a := range docs.Actions {
-		seen[a["action"].(string)] = true
+	if docs.Categories["空间"] == 0 || docs.Categories["群文件"] == 0 {
+		t.Errorf("默认应提供分类导航: %#v", docs.Categories)
 	}
+	// 代表性动作通过按需详情查询，不要求常驻首屏。
 	for _, want := range []string{"get_login_info", "set_group_ban", "upload_group_file", "get_forward_msg"} {
-		if !seen[want] {
-			t.Errorf("napcat_docs 缺常用动作 %q", want)
+		out := runToolOK(t, tools, "napcat_docs", `{"action":"`+want+`"}`)
+		if objOf(t, out)["action"] != want {
+			t.Errorf("napcat_docs 找不到动作 %q", want)
 		}
 	}
 }

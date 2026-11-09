@@ -156,6 +156,7 @@ type MessageFilter struct {
 	Since, Until    time.Time
 	IncludeRecalled bool
 	Limit           int
+	Attention       *AttentionFilter // 非 nil 时按勿扰规则筛选最近上下文，先过滤再 LIMIT
 }
 
 func (s *Store) QueryMessages(f MessageFilter) ([]*MessageRecord, error) {
@@ -194,6 +195,11 @@ func (s *Store) queryMessages(f MessageFilter, query string) ([]*MessageRecord, 
 	}
 	if !f.IncludeRecalled {
 		where = append(where, "recalled = 0")
+	}
+	if f.Attention != nil {
+		clause, values := attentionWhere(f.Attention)
+		where = append(where, clause)
+		args = append(args, values...)
 	}
 	args = append(args, f.Limit)
 

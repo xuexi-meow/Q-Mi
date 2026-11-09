@@ -1,13 +1,12 @@
 // browser.go 浏览器板块：chromedp（CDP）驱动本机真实 Chrome/Edge。
 // 交互模型为"读页面拿元素索引 → 按索引点击/输入"（browser-use 风格），
 // 模型不需要写 CSS 选择器；截图走 pendingImages 多模态管线让模型亲眼看
-// 页面。浏览器进程懒启动、全局单实例、单标签页串行操作；持久化 profile
+// 页面。浏览器进程懒启动、全局单实例、多标签页串行操作；持久化 profile
 // （agent/browser-profile，可留存网页登录态）。
 package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/browser"
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
 
@@ -43,6 +44,10 @@ type browserManager struct {
 	tabCtx      context.Context
 	started     bool
 	startErr    error
+	rootCtx     context.Context
+	tabs        map[string]*browserTab
+	active      string
+	shotSeq     uint64
 }
 
 // findBrowserExecutable 按配置 → Chrome 常见路径 → Edge 常见路径探测。
@@ -106,7 +111,8 @@ func (b *browserManager) ensure() error {
 		chromedp.UserDataDir(b.profile),
 	}
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
+	tab := &browserTab{}
+	tabCtx, tabCancel := chromedp.NewContext(allocCtx, chromedp.WithListener(tab.onEvent))
 	// 预热：真正拉起浏览器进程
 	if _, err := chromedp.Run(tabCtx, chromedp.Location()); err != nil {
 		allocCancel()
@@ -117,70 +123,35 @@ func (b *browserManager) ensure() error {
 	b.allocCancel = allocCancel
 	b.tabCtx = tabCtx
 	b.tabCancel = tabCancel
+	b.rootCtx = tabCtx
+	tab.ctx = tabCtx
+	tab.id = string(chromedp.FromContext(tabCtx).Target.TargetID)
+	b.tabs = map[string]*browserTab{tab.id: tab}
+	b.active = tab.id
+	denyCtx, cancel := context.WithTimeout(tabCtx, browserActionTimeout)
+	defer cancel()
+	if _, err := cdp.Call(denyCtx, chromedp.FromContext(tabCtx).Browser, browser.SetDownloadBehavior,
+		browser.SetDownloadBehaviorParams{Behavior: browser.SetDownloadBehaviorBehaviorDeny}); err != nil {
+		tabCancel()
+		allocCancel()
+		b.startErr = fmt.Errorf("无法禁用浏览器直接下载: %w", err)
+		return b.startErr
+	}
 	return nil
 }
 
 // action 串行执行一次浏览器操作（带超时）。
 func (b *browserManager) action(fn func(ctx context.Context) error) error {
-	if err := b.ensure(); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	ctx, cancel := context.WithTimeout(b.tabCtx, browserActionTimeout)
-	defer cancel()
-	return fn(ctx)
+	return b.withTab(false, func(c context.Context, _ *browserTab) error { return fn(c) })
 }
 
 // browserTools browser 板块。ctx.Browser 为 nil 时工具报错。
 func browserTools(ctx *ToolContext) []Tool {
 	return []Tool{
-		{
-			Name:        "browser_navigate",
-			Description: "打开浏览器访问一个网页（真实 Chrome/Edge，等待页面就绪），返回页面标题与 URL。已有页面会被替换。",
-			Parameters: objectParams(map[string]any{
-				"url": strProp("完整 URL（含 http/https）"),
-			}, []string{"url"}),
-			Usage: "打开后用 browser_read_page 读内容，browser_screenshot 亲眼看页面。",
-			Run: func(args json.RawMessage) (string, error) {
-				var p struct {
-					URL string `json:"url"`
-				}
-				if err := decodeArgs(args, &p); err != nil {
-					return "", err
-				}
-				if !strings.HasPrefix(p.URL, "http://") && !strings.HasPrefix(p.URL, "https://") && !strings.HasPrefix(p.URL, "file://") {
-					return "", fmt.Errorf("url 必须以 http/https/file 开头, got %q", p.URL)
-				}
-				if ctx.Browser == nil {
-					return "", errors.New("浏览器不可用")
-				}
-				var title, location string
-				err := ctx.Browser.action(func(c context.Context) error {
-					if _, nerr := chromedp.Run(c, chromedp.Steps(
-						chromedp.Navigate(p.URL),
-						chromedp.WaitReady("body"),
-						chromedp.Sleep(500*time.Millisecond), // 等动态渲染
-					)); nerr != nil {
-						return nerr
-					}
-					var terr error
-					title, terr = chromedp.Run(c, chromedp.Title())
-					if terr != nil {
-						return terr
-					}
-					location, terr = chromedp.Run(c, chromedp.Location())
-					return terr
-				})
-				if err != nil {
-					return "", err
-				}
-				return marshalCompact(map[string]any{"title": title, "url": location})
-			},
-		},
+		browserNavigateTool(ctx),
 		{
 			Name:        "browser_read_page",
-			Description: "读当前页面的可见文本（上限 8KB）与可交互元素清单（链接/按钮/输入框，带索引 idx）——后续 browser_click/browser_type 用 idx 指定目标。",
+			Description: "读当前页正文（最多 8KB）及控件 idx，供 click/type 使用。",
 			Parameters:  objectParams(nil, nil),
 			Run: func(json.RawMessage) (string, error) {
 				if ctx.Browser == nil {
@@ -200,16 +171,16 @@ func browserTools(ctx *ToolContext) []Tool {
 					return "", err
 				}
 				if len(text) > browserPageTextLimit {
-					text = text[:browserPageTextLimit] + "\n…(截断)"
+					text = strings.ToValidUTF8(text[:browserPageTextLimit], "") + "\n…(截断)"
 				}
 				return marshalCompact(map[string]any{"text": text, "elements": els})
 			},
 		},
 		{
 			Name:        "browser_click",
-			Description: "点击页面上第 idx 个可交互元素（idx 来自 browser_read_page 的 elements）。",
+			Description: "点击 read_page 返回的控件 idx。",
 			Parameters: objectParams(map[string]any{
-				"idx": intProp("browser_read_page 返回的元素索引"),
+				"idx": intProp("控件 idx"),
 			}, []string{"idx"}),
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
@@ -221,31 +192,35 @@ func browserTools(ctx *ToolContext) []Tool {
 				if ctx.Browser == nil {
 					return "", errors.New("浏览器不可用")
 				}
-				var clicked bool
-				err := ctx.Browser.action(func(c context.Context) (aerr error) {
-					clicked, aerr = chromedp.Run(c, chromedp.Evaluate[bool](fmt.Sprintf(jsClick(), p.Idx)))
-					if aerr != nil {
-						return aerr
+				err := ctx.Browser.withTab(false, func(c context.Context, tab *browserTab) error {
+					tab.invalidate()
+					point, err := chromedp.Run(c, chromedp.Evaluate[map[string]float64](fmt.Sprintf(jsClick(), p.Idx)))
+					if err != nil {
+						return err
 					}
-					_, aerr = chromedp.Run(c, chromedp.Sleep(300*time.Millisecond))
-					return aerr
+					if point == nil {
+						return fmt.Errorf("元素 %d 不存在、被遮挡或不可点击，请重新 read_page/截图", p.Idx)
+					}
+					x, y := point["x"], point["y"]
+					if err := dispatchBrowserMouse(c, tab, browserMouseArgs{Action: "click", X: &x, Y: &y}); err != nil {
+						return err
+					}
+					_, err = chromedp.Run(c, chromedp.Sleep(300*time.Millisecond))
+					return err
 				})
 				if err != nil {
 					return "", err
-				}
-				if !clicked {
-					return "", fmt.Errorf("元素 %d 不存在或不可点击（页面可能已变化，重新 read_page）", p.Idx)
 				}
 				return marshalCompact(map[string]any{"clicked": p.Idx})
 			},
 		},
 		{
 			Name:        "browser_type",
-			Description: "向第 idx 个输入框输入文本（idx 来自 browser_read_page）；submit=true 时输入后回车提交。",
+			Description: "填写控件 idx；submit=true 提交。",
 			Parameters: objectParams(map[string]any{
-				"idx":    intProp("browser_read_page 返回的元素索引"),
-				"text":   strProp("要输入的文本"),
-				"submit": boolProp("可选，输入后回车提交"),
+				"idx":    intProp("控件 idx"),
+				"text":   strProp("文本"),
+				"submit": boolProp("输入后提交"),
 			}, []string{"idx", "text"}),
 			Run: func(args json.RawMessage) (string, error) {
 				var p struct {
@@ -260,7 +235,7 @@ func browserTools(ctx *ToolContext) []Tool {
 					return "", errors.New("浏览器不可用")
 				}
 				var ok bool
-				err := ctx.Browser.action(func(c context.Context) (aerr error) {
+				err := ctx.Browser.mutate(func(c context.Context) (aerr error) {
 					ok, aerr = chromedp.Run(c, chromedp.Evaluate[bool](fmt.Sprintf(jsType(), p.Idx, jsQuote(p.Text), p.Submit)))
 					if aerr != nil {
 						return aerr
@@ -279,7 +254,7 @@ func browserTools(ctx *ToolContext) []Tool {
 		},
 		{
 			Name:        "browser_scroll",
-			Description: "滚动当前页面：pixels 正数向下、负数向上（如 800 / -800）。",
+			Description: "滚动顶层页面；正数向下，负数向上。",
 			Parameters: objectParams(map[string]any{
 				"pixels": intProp("滚动像素，正下负上"),
 			}, []string{"pixels"}),
@@ -293,7 +268,10 @@ func browserTools(ctx *ToolContext) []Tool {
 				if ctx.Browser == nil {
 					return "", errors.New("浏览器不可用")
 				}
-				err := ctx.Browser.action(func(c context.Context) (aerr error) {
+				if p.Pixels < -10000 || p.Pixels > 10000 {
+					return "", errors.New("pixels 范围为 -10000..10000")
+				}
+				err := ctx.Browser.mutate(func(c context.Context) (aerr error) {
 					_, aerr = chromedp.Run(c, chromedp.Evaluate[any](fmt.Sprintf("window.scrollBy(0, %d)", p.Pixels)))
 					if aerr != nil {
 						return aerr
@@ -307,44 +285,11 @@ func browserTools(ctx *ToolContext) []Tool {
 				return "{}", nil
 			},
 		},
-		{
-			Name:        "browser_screenshot",
-			Description: "截取当前页面画面（视口），图片直接附在你的下一条消息里——用眼睛确认页面状态、看视频页面、验证点击结果。",
-			Parameters: objectParams(map[string]any{
-				"full_page": boolProp("可选，整页截图（默认只截视口 1280x800）"),
-			}, nil),
-			Run: func(args json.RawMessage) (string, error) {
-				var p struct {
-					FullPage bool `json:"full_page"`
-				}
-				_ = decodeArgs(args, &p)
-				if ctx.Browser == nil {
-					return "", errors.New("浏览器不可用")
-				}
-				if ctx.Turn == nil {
-					return "", errors.New("无会话上下文，截图无处附加")
-				}
-				var buf []byte
-				err := ctx.Browser.action(func(c context.Context) (aerr error) {
-					if p.FullPage {
-						buf, aerr = chromedp.Run(c, chromedp.FullScreenshot(70))
-						return aerr
-					}
-					buf, aerr = chromedp.Run(c, chromedp.CaptureScreenshot())
-					return aerr
-				})
-				if err != nil {
-					return "", err
-				}
-				du := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf)
-				ctx.Turn.AddPendingImage(du)
-				return marshalCompact(map[string]any{
-					"attached": true,
-					"bytes":    len(buf),
-					"note":     "截图已附在下一条消息",
-				})
-			},
-		},
+		browserScreenshotTool(ctx),
+		browserMouseTool(ctx),
+		browserKeyboardTool(ctx),
+		browserTabsTool(ctx),
+		browserDialogTool(ctx),
 	}
 }
 
@@ -396,15 +341,21 @@ func jsInteractiveElements(limit int) string {
 	})()`, interactiveSelector, limit)
 }
 
-// jsClick 按索引点击。
+// jsClick resolves a visible point; the actual click uses trusted pointer input.
 func jsClick() string {
 	return fmt.Sprintf(`(() => {
 		const els = [...document.querySelectorAll(%s)];
 		const el = els[%%d];
-		if (!el) return false;
+		if (!el || el.disabled) return null;
 		el.scrollIntoView({block: 'center'});
-		el.click();
-		return true;
+		const r = el.getBoundingClientRect();
+		const left=Math.max(0,r.left), right=Math.min(innerWidth,r.right);
+		const top=Math.max(0,r.top), bottom=Math.min(innerHeight,r.bottom);
+		if (right<=left || bottom<=top) return null;
+		const x=(left+right)/2, y=(top+bottom)/2;
+		const hit=document.elementFromPoint(x,y);
+		if (!hit || (hit!==el && !el.contains(hit))) return null;
+		return {x,y};
 	})()`, interactiveSelector)
 }
 
@@ -439,6 +390,13 @@ func newBrowserManager(exe, profile string) *browserManager {
 func (b *browserManager) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	for _, tab := range b.tabs {
+		if tab.cancel != nil {
+			tab.cancel()
+		}
+	}
+	b.tabs = nil
+	b.startErr = errors.New("浏览器已关闭")
 	if b.tabCancel != nil {
 		b.tabCancel()
 		b.tabCancel = nil

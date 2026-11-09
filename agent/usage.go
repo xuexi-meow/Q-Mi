@@ -23,6 +23,52 @@ func recordUsage(u Usage) {
 	atomic.AddInt64(&llmUsage.output, int64(u.CompletionTokens))
 }
 
+func (m *Manager) recordUsage(u Usage) {
+	recordUsage(u)
+	m.usage.Requests++
+	m.usage.CacheHit += int64(u.PromptCacheHitTokens)
+	m.usage.CacheMiss += int64(u.PromptCacheMissTokens)
+	m.usage.PromptTokens += int64(u.PromptTokens)
+	m.usage.OutputTokens += int64(u.CompletionTokens)
+}
+
+// recordUsageFor 在累计用量的基础上，按候选名再记一份（哪个模型花了多少）。
+func (m *Manager) recordUsageFor(candidate string, u Usage) {
+	m.recordUsage(u)
+	if candidate == "" {
+		return
+	}
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.usageByModel == nil {
+		m.usageByModel = make(map[string]*UsageSnapshot)
+	}
+	snap := m.usageByModel[candidate]
+	if snap == nil {
+		snap = &UsageSnapshot{}
+		m.usageByModel[candidate] = snap
+	}
+	snap.Requests++
+	snap.CacheHit += int64(u.PromptCacheHitTokens)
+	snap.CacheMiss += int64(u.PromptCacheMissTokens)
+	snap.PromptTokens += int64(u.PromptTokens)
+	snap.OutputTokens += int64(u.CompletionTokens)
+}
+
+// UsageByModel 按候选名返回累计用量快照（webui 按模型统计用）。
+func (m *Manager) UsageByModel() map[string]UsageSnapshot {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	out := make(map[string]UsageSnapshot, len(m.usageByModel))
+	for name, snap := range m.usageByModel {
+		if snap == nil {
+			continue
+		}
+		out[name] = *snap
+	}
+	return out
+}
+
 // UsageSnapshot 用量累计快照。
 type UsageSnapshot struct {
 	Requests     int64 `json:"requests"`

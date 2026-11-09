@@ -306,8 +306,11 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 	if evs[0].Text != "测试用户: 在吗" {
 		t.Errorf("turn_start 摘要 = %q, want 「测试用户: 在吗」", evs[0].Text)
 	}
-	if evs[1].Kind != KindUsage || evs[1].Text != "hit=0 miss=0 out=0" {
-		t.Errorf("usage 事件 = %q, want hit=0 miss=0 out=0", evs[1].Text)
+	if evs[1].Kind != KindUsage || !strings.HasPrefix(evs[1].Text, "hit=0 miss=0 out=0") {
+		t.Errorf("usage 事件 = %q, want hit=0 miss=0 out=0 前缀", evs[1].Text)
+	}
+	if !strings.Contains(evs[1].Text, "candidate=") {
+		t.Errorf("usage 事件应带候选名: %q", evs[1].Text)
 	}
 	if evs[2].Text != "先查查记录" {
 		t.Errorf("reasoning 事件文本 = %q, want 全文", evs[2].Text)
@@ -381,9 +384,8 @@ func TestHandleTurnRecordsReplyAndErrorEvents(t *testing.T) {
 	})
 }
 
-// TestHandleTurnRecordsMaxRoundsAndInterrupted 轮数上限 → error「轮数上限」；
-// 紧急消息打断 → interrupted 事件。
-func TestHandleTurnRecordsMaxRoundsAndInterrupted(t *testing.T) {
+// 轮数上限仍记录错误；新消息只追加，不产生 interrupted 事件。
+func TestHandleTurnRecordsMaxRoundsAndInsertion(t *testing.T) {
 	t.Run("max rounds", func(t *testing.T) {
 		b := &stubBuilder{}
 		cfg := testCfg(20 * time.Millisecond)
@@ -399,10 +401,12 @@ func TestHandleTurnRecordsMaxRoundsAndInterrupted(t *testing.T) {
 		}
 	})
 
-	t.Run("interrupted", func(t *testing.T) {
+	t.Run("inserted", func(t *testing.T) {
 		b := &stubBuilder{}
 		cfg := testCfg(60 * time.Millisecond)
-		m, f, _ := newLoopManager(t, cfg, b, nil, []string{toolCallResp("c1", "think", `{"note":"x"}`)})
+		m, f, _ := newLoopManager(t, cfg, b, nil, []string{
+			toolCallResp("c1", "get_recent_messages", "{}"), toolCallResp("c2", "finish", "{}"),
+		})
 		started := make(chan struct{})
 		released := make(chan struct{})
 		f.mu.Lock()
@@ -416,20 +420,16 @@ func TestHandleTurnRecordsMaxRoundsAndInterrupted(t *testing.T) {
 
 		m.Enqueue(msg("group", 888, "慢慢想"))
 		<-started
-		// 紧急消息打断（spec §5）
+		// 紧急消息也只插入。
 		urgent := msg("group", 888, "插话")
 		urgent.Urgent = true
 		m.Enqueue(urgent)
-		waitFor(t, 5*time.Second, func() bool { return b.callCount() == 2 }, "打断后应重开新 turn")
 		close(released)
-
-		waitFor(t, 5*time.Second, func() bool {
-			for _, e := range m.events.After(0) {
-				if e.Kind == KindInterrupted {
-					return true
-				}
+		waitFor(t, 5*time.Second, func() bool { return f.count() == 2 }, "新消息应进入后续请求")
+		for _, e := range m.events.After(0) {
+			if e.Kind == KindInterrupted {
+				t.Fatal("追加新消息不应产生 interrupted 事件")
 			}
-			return false
-		}, "打断路径应产生 interrupted 事件")
+		}
 	})
 }

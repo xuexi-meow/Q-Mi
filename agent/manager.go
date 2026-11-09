@@ -1,8 +1,4 @@
-// manager.go 实现会话队列与防抖（spec 第 6/9/10 节）：
-// 以 (chat_type, chat_id) 为键，每会话一个懒创建的串行 worker；
-// 消息先进 pending 缓冲，debounce 定时器到期后合并成一个 Turn 投递；
-// worker 忙则排队，紧急消息（私聊/群@）可打断正在思考的 turn 立即重开（spec §5），
-// panic 自兜底存活。handleTurn 为 P2 思考循环（spec §4）：LLM + 工具调用，finish/轮数上限终止。
+// manager.go 实现账号级串行活动循环；新消息在请求边界追加，finish 暂停活动。
 package agent
 
 import (
@@ -13,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +34,8 @@ type IncomingMessage struct {
 	Text       string
 	Images     []imageRef // 消息里的图片段（P2.7 多模态，wiring 提取）
 	Time       time.Time
-	Urgent     bool // 紧急（私聊/群@，wiring 判定）：思考中收到则打断当前 turn（spec §5）
+	Urgent     bool // 私聊/群@标记；不再取消正在进行的请求
+	Mentioned  bool // 真实 @自己/@全体消息段，勿扰例外
 }
 
 // defaultDebounce 防抖窗口默认值（cfg.Debounce 非正时兜底）。
@@ -53,19 +51,6 @@ const (
 	defaultTimersPath = "agent/timers.json" // P3.5 定时器记录
 	defaultImagesDir  = "agent/images"      // 内容寻址图片落盘目录
 )
-
-// turnQueueCap 每个 worker 的 turn 队列缓冲；满了之后投递方阻塞等待。
-const turnQueueCap = 64
-
-// session 一个会话的队列状态：pending 缓冲 + 防抖 timer + 串行 worker 的 channel。
-type session struct {
-	ch      chan *Turn
-	pending []TurnMessage
-	timer   *time.Timer
-	// currentCancel 正在思考的 turn 的取消函数（spec §5 插话打断）；
-	// nil = worker 空闲。仅该会话的串行 worker 写入，Enqueue(urgent) 读取并调用。
-	currentCancel context.CancelFunc
-}
 
 // Manager 会话队列：防抖合并、串行处理、思考循环（工具调用）、回复、debug 落盘。
 type Manager struct {
@@ -86,19 +71,31 @@ type Manager struct {
 	// 自建一份。
 	images *imageStore
 
-	// registry 工具注册表（构造期固定板块，无热插拔）；tasks 后台任务管理器；
+	// registry 工具注册表（模块启停会整体重建）；tasks 后台任务管理器；
 	// approvals 越界/危险操作审批管理器；browser 浏览器单实例（懒启动）；
-	// clients 模型档位池（chat 必有；background/video 按配置）。
-	registry  *ToolRegistry
-	tasks     *TaskManager
-	approvals *ApprovalManager
-	browser   *browserManager
-	clients   map[string]*Client
+	// pool 模型候选池（chat 必有；background/video 按配置）。
+	registry     *ToolRegistry
+	tasks        *TaskManager
+	approvals    *ApprovalManager
+	browser      *browserManager
+	legacyClient *Client
 
 	events *EventLog // W1 WebUI 思考链事件环形缓冲（spec §3.1）
 
-	mu       sync.Mutex // 保护 sessions 及其中 pending/timer
-	sessions map[string]*session
+	cfgMu        sync.RWMutex // 保护 cfg（热重载整体替换）
+	registryMu   sync.RWMutex // 保护 registry（模块启停重建）
+	poolMu       sync.RWMutex // 保护 pool（候选选择/failover）
+	pool         *modelPool
+	usageMu      sync.Mutex // 保护按候选用量统计
+	usageByModel map[string]*UsageSnapshot
+
+	mu           sync.Mutex // 保护账号收件箱
+	inbox        *accountInbox
+	runMu        sync.Mutex // 串行化活动与工作上下文
+	wakeMu       sync.Mutex // 保护轮询 goroutine（热重载换间隔时重启）
+	wakeStop     chan struct{}
+	conversation workingConversation
+	usage        UsageSnapshot
 }
 
 // NewManager 构造 Manager。store 可为 nil（无历史/查询工具报错）。
@@ -107,16 +104,15 @@ type Manager struct {
 // 再造 store，避免循环依赖），随即恢复上次进程未触发的计时。
 func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, store *storage.Store, selfID int64) *Manager {
 	m := &Manager{
-		builder:   builder,
-		client:    client,
-		cfg:       cfg,
-		store:     store,
-		selfID:    selfID,
-		debugDir:  "agent/debug",
-		notesPath: defaultNotesPath,
-		statePath: defaultStatePath,
-		sessions:  make(map[string]*session),
-		events:    NewEventLog(),
+		builder:      builder,
+		legacyClient: client,
+		cfg:          cfg,
+		store:        store,
+		selfID:       selfID,
+		debugDir:     "agent/debug",
+		notesPath:    defaultNotesPath,
+		statePath:    defaultStatePath,
+		events:       NewEventLog(),
 	}
 	// 图片缓存：优先复用 DefaultBuilder 自带的（历史多模态与工具共享
 	// 正/负缓存）；其他 builder（测试桩）没有缓存，manager 自建一份。
@@ -129,14 +125,98 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 	m.tasks = NewTaskManager(m.deliverTaskResult)
 	m.approvals = NewApprovalManager(m.notifyApproval, m.deliverApprovalResult)
 	m.browser = newBrowserManager(cfg.BrowserExec, defaultBrowserProfileDir)
-	m.clients = buildClients(cfg, client)
+	m.pool = buildPool(cfg, client)
 	m.timerStore = NewTimerStore(defaultTimersPath, m.fireTimer)
 	m.timerStore.LoadPending() // 重启恢复：文件缺失/损坏时静默返回 0
 	return m
 }
 
+// config 返回当前配置快照（热重载后为最新值）。返回值只读，不得修改。
+func (m *Manager) config() config.AgentConfig {
+	if m == nil {
+		return config.AgentConfig{}
+	}
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+	return m.cfg
+}
+
+// toolRegistry 返回当前工具注册表（模块热重载可能整体替换）。
+func (m *Manager) toolRegistry() *ToolRegistry {
+	if m == nil {
+		return nil
+	}
+	m.registryMu.RLock()
+	defer m.registryMu.RUnlock()
+	return m.registry
+}
+
+// ApplyConfig 应用一份新配置：先整体替换快照，再按变更类型做副作用
+// （模型池重建、工具注册表重建、builder 参数更新、轮询重启）。
+// 需重启才能生效的字段不在此处理，由调用方比对 Diff 后提示。
+func (m *Manager) ApplyConfig(next config.AgentConfig) {
+	m.cfgMu.Lock()
+	old := m.cfg
+	m.cfg = next
+	m.cfgMu.Unlock()
+
+	// 工具板块变更：重建注册表并重新生成工具文档（system 静态区一次 miss）。
+	if !reflect.DeepEqual(old.Modules, next.Modules) {
+		registry := NewRegistry(enabledModules(next)...)
+		m.registryMu.Lock()
+		m.registry = registry
+		m.registryMu.Unlock()
+		if b, ok := m.builder.(*DefaultBuilder); ok {
+			b.SetToolDocs(registry.PromptDocs())
+		}
+	}
+
+	// 模型接入变更：重建候选池；顶层三件套变了就换 legacy 客户端。
+	endpointChanged := old.BaseURL != next.BaseURL || old.APIKey != next.APIKey
+	if endpointChanged || !reflect.DeepEqual(old.Models, next.Models) {
+		m.poolMu.Lock()
+		if endpointChanged && next.BaseURL != "" {
+			m.legacyClient = NewClient(next.BaseURL, next.APIKey, llmRequestTimeout)
+		}
+		m.pool = buildPool(next, m.legacyClient)
+		m.poolMu.Unlock()
+	}
+
+	// 提示词路径、历史窗口、多模态等交给 builder 更新（正文仍每请求热读）。
+	if b, ok := m.builder.(interface{ Apply(config.AgentConfig) }); ok {
+		b.Apply(next)
+	}
+
+	// 轮询间隔变更：停旧 ticker 起新的（幂等）。
+	if old.SelfWake != next.SelfWake {
+		m.StartSelfWake(selfWakeInterval(next))
+	}
+}
+
+// AttachConfigStore 订阅配置热重载：热字段立即应用，需重启字段只告警。
+func (m *Manager) AttachConfigStore(store *config.Store) {
+	if store == nil {
+		return
+	}
+	store.Subscribe(func(old, next *config.Config) {
+		if next == nil || next.Agent == nil {
+			return
+		}
+		report := config.Diff(old, next)
+		if !report.Changed() {
+			return
+		}
+		for _, field := range report.Fields(config.LevelRestart) {
+			slog.Warn("配置项已变更，需重启生效", "field", field)
+		}
+		m.ApplyConfig(*next.Agent)
+		m.events.Record("", 0, KindConfig, report.Summary())
+		slog.Info("agent 配置已热更新", "changes", report.Summary())
+	})
+}
+
 // wakeFor 防抖窗口的唤醒类型合并：任一消息是 chat（或紧急）即整轮 chat
-//（聊天质量优先），纯后台唤醒才降级到 background 档。
+// （聊天质量优先），纯后台唤醒才降级到 background 档。
 func wakeFor(pending []TurnMessage) string {
 	for _, m := range pending {
 		if m.Wake == WakeChat || m.Wake == "" {
@@ -146,106 +226,8 @@ func wakeFor(pending []TurnMessage) string {
 	return WakeBackground
 }
 
-// sessionKey 会话键。
-func sessionKey(chatType string, chatID int64) string {
-	return chatType + ":" + strconv.FormatInt(chatID, 10)
-}
-
-// Enqueue 追加一条消息进所属会话的 pending 缓冲，并重置防抖 timer。
-// timer 到期后把 pending 快照合并成一个 Turn 投给该会话的串行 worker。
-// 紧急消息（私聊/群@，spec §5）且该会话 worker 正在思考时打断：
-// 取消当前 turn 的 LLM 请求，把 pending 全部内容立即合并成一个新 Turn 投递；
-// worker 空闲时紧急消息仍走正常防抖（合并语义不变）。
-func (m *Manager) Enqueue(msg IncomingMessage) {
-	debounce := m.cfg.Debounce
-	if debounce <= 0 {
-		debounce = defaultDebounce
-	}
-
-	key := sessionKey(msg.ChatType, msg.ChatID)
-	var flushTurn *Turn
-
-	m.mu.Lock()
-	s, ok := m.sessions[key]
-	if !ok {
-		s = &session{ch: make(chan *Turn, turnQueueCap)}
-		m.sessions[key] = s
-		go m.workerLoop(key, s.ch)
-	}
-	wake := msg.Wake
-	if wake == "" {
-		wake = WakeChat
-	}
-	s.pending = append(s.pending, TurnMessage{
-		MessageID:  msg.MessageID,
-		Wake:       wake,
-		SenderID:   msg.SenderID,
-		SenderName: msg.SenderName,
-		Text:       msg.Text,
-		Images:     msg.Images,
-		Time:       msg.Time,
-	})
-
-	if msg.Urgent && s.currentCancel != nil {
-		// 插话打断：取消正在思考的 turn，pending 全部内容立即重开（spec §5）
-		s.currentCancel()
-		if s.timer != nil {
-			s.timer.Stop()
-		}
-		for i := range s.pending {
-			s.pending[i].ChatType = msg.ChatType
-			s.pending[i].ChatID = msg.ChatID
-		}
-		flushTurn = &Turn{
-			ChatType:    msg.ChatType,
-			ChatID:      msg.ChatID,
-			SelfID:      msg.SelfID,
-			Now:         time.Now(),
-			NewMessages: s.pending,
-		}
-		s.pending = nil
-		s.timer = nil
-	} else {
-		if s.timer != nil {
-			s.timer.Stop()
-		}
-		chatType, chatID, selfID := msg.ChatType, msg.ChatID, msg.SelfID
-		s.timer = time.AfterFunc(debounce, func() {
-			m.mu.Lock()
-			if len(s.pending) == 0 {
-				// pending 已被紧急 flush 提前取走（timer 来不及 Stop），本次触发作废
-				s.timer = nil
-				m.mu.Unlock()
-				return
-			}
-			// 每条 TurnMessage 自带所属会话（session 键即会话，二者恒一致）
-			for i := range s.pending {
-				s.pending[i].ChatType = chatType
-				s.pending[i].ChatID = chatID
-			}
-			turn := &Turn{
-				ChatType:    chatType,
-				ChatID:      chatID,
-				Wake:        wakeFor(s.pending),
-				SelfID:      selfID,
-				Now:         time.Now(),
-				NewMessages: s.pending,
-			}
-			s.pending = nil
-			s.timer = nil
-			m.mu.Unlock()
-			s.ch <- turn // 有缓冲;worker 忙则排队,不打断正在进行的生成
-		})
-	}
-	m.mu.Unlock()
-
-	if flushTurn != nil {
-		s.ch <- flushTurn // 有缓冲;被打断的 turn 收尾后 worker 立即接手
-	}
-}
-
 // deliverTaskResult 后台任务完成投递：格式化为合成消息入来源会话队列
-// （复用防抖/打断/排队语义：worker 空闲立即开新 turn，思考中排队接上）。
+// （空闲时防抖唤醒，忙时追加到下一次请求）。
 // 已取消的任务不经过此回调（TaskManager 保证）。
 func (m *Manager) deliverTaskResult(t BackgroundTask) {
 	var line string
@@ -282,8 +264,10 @@ func (m *Manager) notifyApproval(text string) {
 
 // primaryAdminQQ 首位管理员 QQ（审批通知目标）；未配置返回 0。
 func (m *Manager) primaryAdminQQ() int64 {
-	if a := app.GetApp(); a != nil && a.Config != nil && a.Config.Bot != nil && len(a.Config.Bot.Admin_Number) > 0 {
-		return int64(a.Config.Bot.Admin_Number[0])
+	if a := app.GetApp(); a != nil {
+		if cfg := a.Current(); cfg != nil && cfg.Bot != nil && len(cfg.Bot.Admin_Number) > 0 {
+			return int64(cfg.Bot.Admin_Number[0])
+		}
 	}
 	return 0
 }
@@ -329,33 +313,68 @@ func (m *Manager) TryResolveApproval(text string) bool {
 	return true
 }
 
-// buildClients 构造模型档位池。legacyClient 为顶层 base_url/api_key/model
-// 构造的默认客户端，恒作 chat 档；配置了 agent.models 时各档建独立客户端，
-// 显式的 chat 档覆盖 legacy。未配置 models = 只有 legacy chat 一档。
-func buildClients(cfg config.AgentConfig, legacyClient *Client) map[string]*Client {
-	clients := map[string]*Client{WakeChat: legacyClient}
-	for name, tier := range cfg.Models {
-		if tier.BaseURL == "" || tier.APIKey == "" {
-			clients[name] = legacyClient
-			continue
-		}
-		clients[name] = NewClient(tier.BaseURL, tier.APIKey, llmRequestTimeout)
+// modelPool 返回当前候选池（热重载会整体替换）。
+func (m *Manager) modelPool() *modelPool {
+	if m == nil {
+		return nil
 	}
-	return clients
+	m.poolMu.RLock()
+	defer m.poolMu.RUnlock()
+	return m.pool
 }
 
-// clientFor 按唤醒类型选模型档位：chat 档必选；background 类唤醒在配置了
-// background 档时降档。返回 (档位名, 客户端)；chat 档缺失时返回 nil 由
-// 调用方报错。
-func (m *Manager) clientFor(turn *Turn) (*Client, string) {
-	name := turn.Wake
-	if name == "" {
-		name = WakeChat
+// chat 按能力选候选并发请求；可重试错误（网络/超时/429/5xx）自动换下一个
+// 候选，最多 attempts 次。返回实际使用的候选与档位（日志/统计用）。
+func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need modelNeed, attempts int) (*ChatResponse, *modelSlot, string, error) {
+	pool := m.modelPool()
+	if pool == nil {
+		return nil, nil, "", errNoModel
 	}
-	if c, ok := m.clients[name]; ok {
-		return c, name
+	if attempts <= 0 {
+		attempts = defaultMaxAttempts
 	}
-	return m.clients[WakeChat], WakeChat
+	wake := ""
+	if turn != nil {
+		wake = turn.Wake
+	}
+	var lastErr error
+	tierName := wake
+	tried := make(map[string]bool, attempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		slot, tier, err := pool.pick(wake, need, tried)
+		if err != nil && need.Vision {
+			// 没有支持视觉的候选：降级为纯文本（图片替换成标注），不报错。
+			fallback := need
+			fallback.Vision = false
+			slot, tier, err = pool.pick(wake, fallback, tried)
+		}
+		if err != nil {
+			if lastErr != nil {
+				return nil, nil, tier, lastErr
+			}
+			return nil, nil, tier, err
+		}
+		tierName = tier
+		tried[slot.key()] = true
+		req.Model = slot.model
+		if need.Vision && !slot.supports("vision") {
+			// 候选不支持视觉：图片降级为文字标注（不修改会话里的原消息）。
+			req.Messages = stripImageParts(req.Messages)
+		}
+		resp, chatErr := slot.client.Chat(ctx, req)
+		if chatErr == nil {
+			slot.markSuccess()
+			return resp, slot, tier, nil
+		}
+		lastErr = chatErr
+		if !retryableError(chatErr) {
+			return nil, slot, tier, chatErr
+		}
+		slot.markFailure(time.Now())
+		slog.Warn("模型候选失败，切换下一个",
+			"candidate", slot.name, "tier", tier, "attempt", attempt+1, "err", chatErr)
+	}
+	return nil, nil, tierName, lastErr
 }
 
 // fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
@@ -375,23 +394,6 @@ func (m *Manager) fireTimer(st ScheduledTimer) {
 	})
 }
 
-// workerLoop 长驻消费循环：逐个处理 turn，panic 自兜底继续（不依赖外层 recover）。
-func (m *Manager) workerLoop(key string, ch <-chan *Turn) {
-	for turn := range ch {
-		m.handleTurn(turn)
-	}
-}
-
-// setCurrentCancel 记录/清除会话当前 turn 的取消函数（spec §5 插话打断）。
-// 只有该会话的串行 worker（handleTurn）写入；Enqueue(urgent) 读取并调用。
-func (m *Manager) setCurrentCancel(key string, cancel context.CancelFunc) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.sessions[key]; ok {
-		s.currentCancel = cancel
-	}
-}
-
 // handleTurn 处理一个 turn（spec §4 思考循环）：
 // 加载笔记/情绪 → 组装上下文 → 循环调 LLM：
 //   - 响应含 tool_calls：逐个执行（finish 只标记不执行，同批其他工具先执行），
@@ -399,98 +401,111 @@ func (m *Manager) setCurrentCancel(key string, cancel context.CancelFunc) {
 //   - 纯文本响应：视为直接回复发出（兼容不会用工具的模型），结束
 //   - finish：结束
 //   - 轮数耗尽 / LLM 错误：强制结束，记日志
-//   - ctx 被取消（spec §5 插话打断）：本轮不补处理、不回复，pending 已合并成新 turn
 func (m *Manager) handleTurn(turn *Turn) {
-	key := sessionKey(turn.ChatType, turn.ChatID)
-	ctx, cancel := context.WithCancel(context.Background())
-	m.setCurrentCancel(key, cancel)
+	m.runMu.Lock()
+	defer m.runMu.Unlock()
+	ctx := context.Background()
+	beforeUsage := m.usage
 	defer func() {
-		m.setCurrentCancel(key, nil)
-		cancel()
+		slog.Info("本次活动用量", "requests", m.usage.Requests-beforeUsage.Requests,
+			"prompt", m.usage.PromptTokens-beforeUsage.PromptTokens,
+			"output", m.usage.OutputTokens-beforeUsage.OutputTokens,
+			"cache_hit", m.usage.CacheHit-beforeUsage.CacheHit,
+			"cache_miss", m.usage.CacheMiss-beforeUsage.CacheMiss)
+	}()
+	defer func() {
 		if r := recover(); r != nil {
+			m.conversation = workingConversation{}
 			slog.Error("agent worker panic，已恢复继续服务",
 				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "panic", r)
 		}
 	}()
 
-	notes, err := LoadNotes(m.notesPath)
-	if err != nil {
-		slog.Warn("读取思考笔记失败，本轮不带笔记", "path", m.notesPath, "err", err)
-		notes = nil
-	}
-	turn.Notes = notes
-	turn.Mood = m.loadMood()
-
-	// W1 WebUI 事件埋点：进入 turn（spec §3.1）
-	m.events.Record(turn.ChatType, turn.ChatID, KindTurnStart, turnSummary(turn.NewMessages))
-
-	msgs := m.builder.Build(turn)
-	// P3-2 管理员门槛：本轮任一消息发送者是配置的管理员即视为管理员 turn，
-	// 决定危险工具（踢人/退群/设管理员/逃生舱危险动作）是否放行。
-	isAdmin := false
-	for _, tm := range turn.NewMessages {
-		if bot.IsAdmin(tm.SenderID) {
-			isAdmin = true
-			break
+	m.loadTurnState(turn)
+	// Inputs stay pinned for this entire activity, including inserted arrivals.
+	// Older wakes become eligible only after a new handleTurn starts.
+	m.conversation.messages = append([]ChatMessage(nil), m.conversation.messages...)
+	for i := range m.conversation.messages {
+		if m.conversation.messages[i].kind == contextActiveInput {
+			m.conversation.messages[i].kind = contextWork
 		}
 	}
-	toolCtx := &ToolContext{
-		Store:     m.store,
-		Turn:      turn,
-		Timer:     m.timerStore,
-		Images:    m.images,
-		Tasks:     m.tasks,
-		Approvals: m.approvals,
-		Browser:   m.browser,
-		Events:    m.events,
-		Workspace: m.cfg.WorkspaceDir,
-		NotesPath: m.notesPath,
-		StatePath: m.statePath,
-		Admin:     isAdmin,
-	}
-	tools := m.registry.Build(toolCtx)
-	defs := toolDefs(tools)
-	maxRounds := m.cfg.MaxToolRounds
+	msgs := m.beginTurn(turn)
+	counted := meaningfulTurn(turn)
+	cfg := m.config()
+	maxRounds := cfg.MaxToolRounds
 	if maxRounds <= 0 {
 		maxRounds = defaultMaxToolRounds
 	}
+	attempts := cfg.MaxAttempts
+	if attempts <= 0 {
+		attempts = defaultMaxAttempts
+	}
 
 	for round := 1; round <= maxRounds; round++ {
-		req := ChatRequest{
-			Model:       m.cfg.Model,
-			Messages:    msgs,
-			Temperature: m.cfg.Temperature,
-			Tools:       defs,
-		}
-		// 按唤醒类型选模型档位（chat/background/video…，分档路由）
-		client, tier := m.clientFor(turn)
-		resp, chatErr := client.Chat(ctx, req)
-		if chatErr != nil {
-			interrupted := errors.Is(chatErr, context.Canceled)
-			if m.cfg.Debug {
-				m.dumpDebug(turn, req, round, nil, nil, chatErr, interrupted)
+		var toolCtx *ToolContext
+		var tools []Tool
+		var defs []ToolDef
+		for {
+			turn = m.refreshLiveContext(turn)
+			toolCtx = &ToolContext{
+				Store: m.store, Turn: turn, Timer: m.timerStore, Images: m.images,
+				Tasks: m.tasks, Approvals: m.approvals, Browser: m.browser,
+				Events: m.events, Workspace: cfg.WorkspaceDir,
+				NotesPath: m.notesPath, StatePath: m.statePath, Admin: batchIsAdmin(turn),
 			}
-			if interrupted {
-				// 插话打断（spec §5）：不按普通错误刷屏，不补处理、不回复；
-				// 消息都在 storage，新 turn 上下文自然包含
-				m.events.Record(turn.ChatType, turn.ChatID, KindInterrupted, "本轮思考被紧急消息打断")
-				slog.Info("本轮思考被紧急消息打断，等待新 turn 重开",
-					"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
+			tools = m.toolRegistry().Build(toolCtx)
+			defs = toolDefs(tools)
+			revision := m.conversation.compactions
+			if err := m.prepareContext(ctx, turn, defs); err != nil {
+				m.events.Record(turn.ChatType, turn.ChatID, KindError, err.Error())
+				slog.Warn("上下文预算不足，暂停活动", "err", err)
 				return
 			}
+			if next := m.takePending(); next != nil {
+				turn = next
+				m.loadTurnState(turn)
+				m.beginTurn(turn)
+				counted = meaningfulTurn(turn)
+				continue
+			}
+			// A summary request may have taken time: refresh files and arrivals
+			// again before issuing the next action request.
+			if revision == m.conversation.compactions {
+				break
+			}
+		}
+		msgs = m.conversation.messages
+		req := ChatRequest{
+			Model:       cfg.Model,
+			Messages:    msgs,
+			Temperature: cfg.Temperature,
+			Tools:       defs,
+		}
+		need := needForMessages(msgs)
+		resp, slot, tier, chatErr := m.chat(ctx, turn, req, need, attempts)
+		if chatErr != nil {
+			if cfg.Debug {
+				m.dumpDebug(turn, req, round, nil, nil, chatErr, false)
+			}
 			m.events.Record(turn.ChatType, turn.ChatID, KindError, chatErr.Error())
-			slog.Warn("LLM 请求失败，本轮思考结束，不重试",
-				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "err", chatErr)
+			slog.Warn("LLM 请求失败，本轮思考结束",
+				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "tier", tier, "err", chatErr)
 			return
 		}
-
 		// 用量打点：缓存命中率掉坑 = 前缀被打断的信号（webui 概览有累计视图）。
 		u := resp.Usage
-		recordUsage(u)
+		candidate := ""
+		if slot != nil {
+			candidate = slot.name
+		}
+		m.recordUsageFor(candidate, u)
+		m.conversation.unreadStart = len(msgs)
 		m.events.Record(turn.ChatType, turn.ChatID, KindUsage,
-			fmt.Sprintf("hit=%d miss=%d out=%d", u.PromptCacheHitTokens, u.PromptCacheMissTokens, u.CompletionTokens))
+			fmt.Sprintf("hit=%d miss=%d out=%d candidate=%s tier=%s",
+				u.PromptCacheHitTokens, u.PromptCacheMissTokens, u.CompletionTokens, candidate, tier))
 		slog.Info("用量", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "tier", tier,
-			"cache_hit", u.PromptCacheHitTokens, "cache_miss", u.PromptCacheMissTokens,
+			"candidate", candidate, "cache_hit", u.PromptCacheHitTokens, "cache_miss", u.PromptCacheMissTokens,
 			"prompt", u.PromptTokens, "output", u.CompletionTokens)
 
 		// P2.5 思考链控制台输出：reasoning/content/工具调用/结束全打 Info，
@@ -508,14 +523,36 @@ func (m *Manager) handleTurn(turn *Turn) {
 		if len(calls) == 0 {
 			// 兼容路径：纯文本直接回复
 			content := strings.TrimSpace(resp.TextContent())
-			if m.cfg.Debug {
+			if content != "" && !counted {
+				m.conversation.wakes++
+			}
+			if cfg.Debug {
 				m.dumpDebug(turn, req, round, resp, nil, nil, false)
 			}
+			msgs = append(msgs, ChatMessage{
+				Role: "assistant", Content: content,
+				ReasoningContent: resp.ReplayReasoning(),
+			})
+			m.conversation.messages = msgs
+			m.conversation.unreadStart = len(msgs)
 			m.replyText(turn, content)
 			return
 		}
+		if !counted {
+			for _, call := range calls {
+				if call.Function.Name != "finish" {
+					m.conversation.wakes++
+					counted = true
+					break
+				}
+			}
+		}
 
-		msgs = append(msgs, ChatMessage{Role: "assistant", Content: resp.TextContent(), ToolCalls: calls})
+		msgs = append(msgs, ChatMessage{
+			Role: "assistant", Content: resp.TextContent(), ToolCalls: calls,
+			// 思考模式 + tools：该字段必须随消息回传，否则下一次请求 400。
+			ReasoningContent: resp.ReplayReasoning(),
+		})
 		finished := false
 		type toolOutcome struct {
 			executed bool
@@ -527,7 +564,8 @@ func (m *Manager) handleTurn(turn *Turn) {
 		var wg sync.WaitGroup
 		for i, call := range calls {
 			if call.Function.Name == "finish" {
-				finished = true // 只标记，不执行；同批其他工具先执行
+				finished = true
+				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: "{}"}
 				continue
 			}
 			wg.Add(1)
@@ -544,23 +582,21 @@ func (m *Manager) handleTurn(turn *Turn) {
 						fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
 					result = toolErrorJSON(toolErr)
 				}
-				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: result}
+				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: truncateContent(result)}
 			}(i, call)
 		}
 		wg.Wait()
 		var results []string
 		for _, oc := range outcomes {
 			if !oc.executed {
-				continue // finish 槽位
+				continue
 			}
 			results = append(results, oc.result)
 			msgs = append(msgs, ChatMessage{Role: "tool", Content: oc.result, ToolCallID: oc.id})
 		}
 		// P3-4 图片按需上传：本轮工具（view_message_images）申请查看的图片，
 		// 在工具执行完当轮追加为一条 user 多模态消息（下一轮 LLM 请求即可见），
-		// 随后清空。pendingImages 只在本会话的串行 worker（handleTurn）内
-		// 读写——Enqueue 只写 TurnMessage、其他会话各有 worker，顺序执行
-		// 无并发问题。
+		// 随后清空；同轮工具均已完成，后续由账号级 worker 串行读取。
 		if len(turn.pendingImages) > 0 {
 			parts := make([]ContentPart, 0, len(turn.pendingImages)+1)
 			parts = append(parts, ContentPart{Type: "text", Text: "以下图片来自上一轮工具结果（查询自动附带或你主动查看）"})
@@ -570,9 +606,10 @@ func (m *Manager) handleTurn(turn *Turn) {
 			msgs = append(msgs, ChatMessage{Role: "user", Content: parts})
 			turn.pendingImages = nil
 		}
-		if m.cfg.Debug {
+		if cfg.Debug {
 			m.dumpDebug(turn, req, round, resp, results, nil, false)
 		}
+		m.conversation.messages = msgs
 		if finished {
 			m.events.Record(turn.ChatType, turn.ChatID, KindFinish, "结束思考")
 			slog.Info("结束思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
@@ -591,6 +628,16 @@ func (m *Manager) replyText(turn *Turn, content string) {
 		m.events.Record(turn.ChatType, turn.ChatID, KindError, "LLM 返回空回复，不发送")
 		slog.Warn("LLM 返回空回复，不发送",
 			"chat_type", turn.ChatType, "chat_id", turn.ChatID)
+		return
+	}
+	if (turn.ChatType != "group" && turn.ChatType != "private") || turn.ChatID <= 0 {
+		m.events.Record(turn.ChatType, turn.ChatID, KindError, "混合来源没有默认回复目标，请使用 send_message 明确指定会话")
+		return
+	}
+	if err := validateOutgoingText(content); err != nil {
+		m.events.Record(turn.ChatType, turn.ChatID, KindError, err.Error())
+		slog.Warn("回复正文格式错误，不发送",
+			"chat_type", turn.ChatType, "chat_id", turn.ChatID, "err", err)
 		return
 	}
 	if err := bot.Reply(context.Background(), turn.ChatType, turn.ChatID, chain.New().Text(content)); err != nil {
@@ -728,7 +775,7 @@ func (m *Manager) loadMood() string {
 }
 
 // debugRecord 落盘的单轮记录：完整请求 JSON + 响应内容 + 工具调用与结果摘要，
-// 直接可回放对比。Interrupted 为 P2 插话打断预留字段。
+// 直接可回放对比。Interrupted 保留以兼容旧 debug 文件，新消息不再触发它。
 type debugRecord struct {
 	Time        int64           `json:"time"`
 	ChatType    string          `json:"chat_type"`

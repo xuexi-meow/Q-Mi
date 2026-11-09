@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time DESC);
 
+CREATE TABLE IF NOT EXISTS chat_dnd (
+    chat_type TEXT NOT NULL CHECK (chat_type IN ('private', 'group')),
+    chat_id   INTEGER NOT NULL CHECK (chat_id > 0),
+    PRIMARY KEY (chat_type, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS message_recalls (
     message_id INTEGER PRIMARY KEY
 );

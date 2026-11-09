@@ -138,6 +138,40 @@ func TestLoadConfigCurrentConfiguration(t *testing.T) {
 	}
 }
 
+func TestContextRejectsInvalidBudgets(t *testing.T) {
+	for _, setting := range []string{
+		"max_input_tokens: -1", "review_after_wakes: -1",
+		"keep_recent_messages: -1", "summary_tokens: -1",
+		"max_input_tokens: 1024\n    summary_tokens: 2048",
+	} {
+		t.Run(setting, func(t *testing.T) {
+			filename := configTestDir(t)
+			content := strings.Replace(agentConfigYAML, "  debounce: 3s",
+				"  debounce: 3s\n  context:\n    "+setting, 1)
+			writeTestConfig(t, filename, content)
+			if got := new(Config).LoadConfig(); got != nil {
+				t.Fatalf("invalid context budget accepted: %s", setting)
+			}
+		})
+	}
+}
+
+func TestContextConfigurationLoadsNestedBudgets(t *testing.T) {
+	filename := configTestDir(t)
+	content := strings.Replace(agentConfigYAML, "  debounce: 3s", `  debounce: 3s
+  context:
+    max_input_tokens: 64000
+    review_after_wakes: 6
+    keep_recent_messages: 16
+    summary_tokens: 768`, 1)
+	writeTestConfig(t, filename, content)
+	got := new(Config).LoadConfig()
+	want := AgentContext{MaxInputTokens: 64000, ReviewAfterWakes: 6, KeepRecentMessages: 16, SummaryTokens: 768}
+	if got == nil || got.Agent.Context != want {
+		t.Fatalf("nested context configuration did not round-trip: %+v", got)
+	}
+}
+
 func TestLoadConfigRejectsInvalidConfiguration(t *testing.T) {
 	cases := []struct {
 		name  string

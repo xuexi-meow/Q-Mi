@@ -38,24 +38,35 @@ func main() {
 
 func run(ctx context.Context) error {
 	appInstance := app.GetApp()
-	if appInstance.Config == nil {
+	cfg := appInstance.Current()
+	if cfg == nil {
 		return fmt.Errorf("配置加载失败，请检查 Config.yaml")
 	}
 
+	// 配置热重载：监听 Config.yaml 与 Config.webui.yaml，改动后自动应用
+	// 热字段；需重启才能生效的字段由订阅方告警。
+	if appInstance.ConfigStore != nil {
+		if err := appInstance.ConfigStore.Watch(); err != nil {
+			slog.Warn("配置热重载启动失败，改动配置需重启生效", "err", err)
+		} else {
+			defer appInstance.ConfigStore.Close()
+		}
+	}
+
 	// 初始化 NapCat API 客户端(失败只告警,收事件不受影响,只是发不出消息)
-	if err := request.Init(appInstance.Config.Napcat); err != nil {
+	if err := request.Init(cfg.Napcat); err != nil {
 		slog.Warn("NapCat API 客户端初始化失败,无法发送消息", "err", err)
 	}
 
 	// 打开消息记忆库(失败只告警,本次运行不落库)
-	if appInstance.Config.Storage != nil && appInstance.Config.Storage.Enable {
-		st, err := storage.Open(appInstance.Config.Storage.Path)
+	if cfg.Storage != nil && cfg.Storage.Enable {
+		st, err := storage.Open(cfg.Storage.Path)
 		if err != nil {
 			slog.Warn("记忆库打开失败,本次运行不落库", "err", err)
 		} else {
 			appInstance.Store = st
 			defer st.Close()
-			slog.Info("记忆库已就绪", "path", appInstance.Config.Storage.Path)
+			slog.Info("记忆库已就绪", "path", cfg.Storage.Path)
 		}
 	}
 
@@ -63,10 +74,10 @@ func run(ctx context.Context) error {
 
 	c := &core.Core{
 		Server: &server.Server{
-			Port:    appInstance.Config.NetSetting.Port,
-			Host:    appInstance.Config.NetSetting.Host,
-			Pattern: appInstance.Config.NetSetting.Pattern,
-			Token:   appInstance.Config.NetSetting.Token,
+			Port:    cfg.NetSetting.Port,
+			Host:    cfg.NetSetting.Host,
+			Pattern: cfg.NetSetting.Pattern,
+			Token:   cfg.NetSetting.Token,
 		},
 	}
 
@@ -78,9 +89,9 @@ func run(ctx context.Context) error {
 	// W1 WebUI：agent 启用且 webui.enable 时启动控制台（独立端口）。
 	// Start 非阻塞；退出时与其他服务一并 Shutdown。
 	var webuiServer *http.Server
-	if appInstance.Config.Agent != nil && appInstance.Config.Agent.Enable &&
-		appInstance.Config.WebUI != nil && appInstance.Config.WebUI.Enable {
-		srv, err := webui.Start(*appInstance.Config.WebUI)
+	if cfg.Agent != nil && cfg.Agent.Enable &&
+		cfg.WebUI != nil && cfg.WebUI.Enable {
+		srv, err := webui.Start(*cfg.WebUI)
 		if err != nil {
 			slog.Warn("WebUI 启动失败，不影响其他功能", "err", err)
 		} else {

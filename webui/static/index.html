@@ -53,6 +53,7 @@ main { max-width: 960px; margin: 24px auto; padding: 0 16px; }
 .ebadge.finish       { background: rgba(139,145,160,.2); color: var(--dim); }
 .ebadge.interrupted  { background: rgba(248,113,113,.14); color: #fca5a5; }
 .ebadge.usage        { background: rgba(139,145,160,.12); color: var(--dim); }
+.ebadge.config       { background: rgba(56,189,248,.18); color: #38bdf8; }
 /* 消息流布局 */
 .stream { display: flex; gap: 14px; min-height: 60vh; }
 .chat-list { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -161,6 +162,7 @@ label.danger, span.danger { color: var(--bad); }
       <button :class="tab==='stream' && 'active'" @click="tab='stream'">消息流</button>
       <button :class="tab==='agent' && 'active'" @click="tab='agent'">Agent</button>
       <button :class="tab==='qq' && 'active'" @click="tab='qq'">QQ 管理</button>
+      <button :class="tab==='config' && 'active'" @click="tab='config'">配置</button>
     </nav>
   </header>
 
@@ -461,6 +463,88 @@ label.danger, span.danger { color: var(--bad); }
         危险动作（踢人/退群/删好友/改资料/改群名）需勾选确认，confirm 由服务端剥离后转发。
       </div>
     </section>
+    <!-- 配置 -->
+    <section x-show="tab==='config'">
+      <div class="toolbar">
+        <button class="act" @click="loadConfig()">刷新</button>
+        <button class="act" @click="reloadConfig()">重读文件</button>
+        <span class="muted" x-text="cfgPaths"></span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">
+        保存会写入 Config.webui.yaml 并立即生效（覆盖 Config.yaml 的同名键）。
+        监听地址 / 存储路径 / WebUI 端口 / bot.qq_number / agent.enable 等需重启，WebUI 不允许修改。
+      </div>
+      <div class="muted" x-show="cfgErr" style="color:var(--bad)" x-text="cfgErr"></div>
+
+      <div class="section-title">模型档位</div>
+      <template x-if="!cfgTiers.length">
+        <div class="muted">尚未配置 models，当前使用顶层单模型（base_url / api_key / model）。点「+ 档位」后加候选即可分档。</div>
+      </template>
+      <template x-for="(tier, ti) in cfgTiers" :key="tier.name">
+        <div class="card">
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <b x-text="tier.name"></b>
+            <label class="muted"><input type="checkbox" x-model="tier.enable"> 启用</label>
+            <label class="muted">策略
+              <select class="agent-input" x-model="tier.strategy" style="width:auto">
+                <option value="priority">priority</option>
+              </select>
+            </label>
+            <button class="act" @click="addCandidate(ti)">+ 候选</button>
+          </div>
+          <table class="timer-table" style="margin-top:8px">
+            <thead><tr><th>启用</th><th>名称</th><th>模型</th><th>base_url</th><th>api_key</th><th>能力</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="(c, ci) in tier.candidates" :key="ci">
+                <tr>
+                  <td><input type="checkbox" x-model="c.enable"></td>
+                  <td><input class="agent-input" style="width:110px" x-model="c.name"></td>
+                  <td><input class="agent-input" style="width:140px" x-model="c.model"></td>
+                  <td><input class="agent-input" style="width:200px" x-model="c.base_url" placeholder="留空=用顶层"></td>
+                  <td><input class="agent-input" style="width:150px" x-model="c.api_key" placeholder="掩码=不修改"></td>
+                  <td><input class="agent-input" style="width:120px" x-model="c.capabilities" placeholder="tools,vision"></td>
+                  <td style="white-space:nowrap">
+                    <button class="act" @click="testModel(tier.name, c.name)">测试</button>
+                    <button class="act danger" @click="removeCandidate(ti, ci)">删除</button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <div class="muted" style="font-size:12px;margin-top:4px">测试走已保存的配置：改完先保存再测。</div>
+        </div>
+      </template>
+      <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+        <button class="act" @click="addTier()">+ 档位</button>
+        <button class="act primary" @click="saveModels()">保存模型配置</button>
+        <span class="muted" x-text="cfgMsg"></span>
+      </div>
+
+      <div class="section-title">行为参数</div>
+      <div class="grid">
+        <label class="muted">temperature<input class="agent-input" x-model.number="cfgParams.temperature"></label>
+        <label class="muted">max_tool_rounds<input class="agent-input" x-model.number="cfgParams.max_tool_rounds"></label>
+        <label class="muted">debounce（秒）<input class="agent-input" x-model.number="cfgParams.debounce_seconds"></label>
+        <label class="muted">self_wake<input class="agent-input" x-model="cfgParams.self_wake" placeholder="10m / off"></label>
+        <label class="muted">max_attempts<input class="agent-input" x-model.number="cfgParams.max_attempts"></label>
+        <label class="muted">context.max_input_tokens<input class="agent-input" x-model.number="cfgParams.context.max_input_tokens"></label>
+        <label class="muted">context.review_after_wakes<input class="agent-input" x-model.number="cfgParams.context.review_after_wakes"></label>
+        <label class="muted">context.keep_recent_messages<input class="agent-input" x-model.number="cfgParams.context.keep_recent_messages"></label>
+        <label class="muted">context.summary_tokens<input class="agent-input" x-model.number="cfgParams.context.summary_tokens"></label>
+      </div>
+      <button class="act primary" style="margin-top:8px" @click="saveParams()">保存行为参数</button>
+
+      <div class="section-title">工具板块</div>
+      <div class="grid">
+        <template x-for="m in cfgModuleNames" :key="m">
+          <label class="muted"><input type="checkbox" x-model="cfgModules[m]"> <span x-text="m"></span></label>
+        </template>
+      </div>
+      <button class="act primary" style="margin-top:8px" @click="saveModules()">保存板块开关</button>
+
+      <div class="section-title">需重启（只读）</div>
+      <pre class="file-editor" style="min-height:90px" x-text="cfgRestartText"></pre>
+    </section>
   </main>
 
   <!-- 操作提示 toast -->
@@ -507,6 +591,10 @@ function app() {
     members: [], memberTotal: 0, memberTruncated: false, qqErr: '',
     napActions: [], napDangerous: {}, napAction: '', napParams: '{}',
     napConfirm: false, napResult: '', napBusy: false,
+    // 配置页
+    cfg: null, cfgErr: '', cfgMsg: '', cfgPaths: '', cfgRestartText: '',
+    cfgTiers: [], cfgParams: { context: {} }, cfgModules: {},
+    cfgModuleNames: ['core', 'memory', 'sticker', 'qzone', 'admin', 'computer', 'browser', 'system'],
     toastMsg: '', toastTimer: null,
     init() {
       if (!localStorage.qmi_token) {
@@ -520,6 +608,7 @@ function app() {
         if (t === 'stream' && !this.chatsLoaded) this.loadChats();
         if (t === 'agent') this.loadAgentData();
         if (t === 'qq') this.loadQQData();
+        if (t === 'config') this.loadConfig();
       });
     },
     async api(path, opts = {}) {
@@ -869,6 +958,164 @@ function app() {
         if (!this.needToken) this.agentToast('请求失败：' + e.message);
       } finally {
         this.napBusy = false;
+      }
+    },
+    // ---- 配置页 ----
+    async loadConfig() {
+      try {
+        const r = await this.api('/api/config');
+        const text = await r.text();
+        if (!r.ok) { this.cfgErr = '加载失败：' + text.trim(); return; }
+        const v = JSON.parse(text);
+        this.cfg = v; this.cfgErr = ''; this.cfgMsg = '';
+        this.cfgPaths = v.paths.base + '  +  ' + v.paths.overlay;
+        const a = (v.effective && v.effective.agent) || {};
+        const models = a.models || {};
+        this.cfgTiers = Object.keys(models).map(name => {
+          const t = models[name] || {};
+          const cands = t.candidates || [];
+          return {
+            name,
+            enable: t.enable !== false,
+            strategy: t.strategy || 'priority',
+            candidates: cands.map(c => ({
+              name: c.name || '', model: c.model || '', base_url: c.base_url || '',
+              api_key: c.api_key || '', api_key_env: c.api_key_env || '',
+              enable: c.enable !== false,
+              capabilities: (c.capabilities || []).join(','),
+              cooldown: c.cooldown || '',
+            })),
+          };
+        });
+        this.cfgParams = {
+          temperature: a.temperature === undefined ? 0.8 : a.temperature,
+          max_tool_rounds: a.max_tool_rounds || 0,
+          debounce_seconds: Math.round((a.debounce || 0) / 1e9),
+          self_wake: a.self_wake || '',
+          max_attempts: a.max_attempts || 0,
+          context: Object.assign(
+            { max_input_tokens: 32000, review_after_wakes: 8, keep_recent_messages: 12, summary_tokens: 1024 },
+            a.context || {}),
+        };
+        const mods = a.modules || {};
+        const m = {};
+        this.cfgModuleNames.forEach(k => { m[k] = mods[k] !== false; });
+        this.cfgModules = m;
+        const net = v.effective.netsetting || {}, st = v.effective.storage || {};
+        const wu = v.effective.webui || {}, b = v.effective.bot || {};
+        this.cfgRestartText =
+          'netsetting: ' + (net.host || '') + ':' + (net.port || 0) + '  pattern=' + (net.pattern || '') + '\n' +
+          'storage: enable=' + !!st.enable + '  path=' + (st.path || '') + '\n' +
+          'webui: ' + (wu.host || '') + ':' + (wu.port || 0) + '\n' +
+          'bot.qq_number: ' + (b.qq_number || 0) + '\n' +
+          'agent.enable: ' + !!a.enable;
+      } catch (e) {
+        if (!this.needToken) this.cfgErr = '加载失败：' + e.message;
+      }
+    },
+    async putConfig(patch, okMsg) {
+      this.cfgMsg = ''; this.cfgErr = '';
+      try {
+        const r = await this.api('/api/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        const text = await r.text();
+        if (!r.ok) { this.cfgErr = text.trim(); return false; }
+        await this.loadConfig();
+        this.cfgMsg = okMsg;
+        return true;
+      } catch (e) {
+        if (!this.needToken) this.cfgErr = '保存失败：' + e.message;
+        return false;
+      }
+    },
+    buildModels() {
+      const out = {};
+      this.cfgTiers.forEach(t => {
+        const cands = t.candidates.filter(c => c.name && c.model).map(c => {
+          const o = { name: c.name, model: c.model };
+          if (c.base_url) o.base_url = c.base_url;
+          if (c.api_key) o.api_key = c.api_key;
+          if (c.api_key_env) o.api_key_env = c.api_key_env;
+          if (c.enable === false) o.enable = false;
+          if (c.cooldown) o.cooldown = c.cooldown;
+          if (c.capabilities && c.capabilities.trim()) {
+            o.capabilities = c.capabilities.split(',').map(x => x.trim()).filter(Boolean);
+          }
+          return o;
+        });
+        out[t.name] = { enable: t.enable !== false, strategy: t.strategy || 'priority', candidates: cands };
+      });
+      return out;
+    },
+    async saveModels() {
+      await this.putConfig(
+        { agent: { models: this.buildModels(), max_attempts: this.cfgParams.max_attempts || 0 } },
+        '模型配置已保存');
+    },
+    addCandidate(ti) {
+      this.cfgTiers[ti].candidates.push({
+        name: '', model: '', base_url: '', api_key: '', api_key_env: '',
+        enable: true, capabilities: 'tools,vision', cooldown: '',
+      });
+    },
+    removeCandidate(ti, ci) { this.cfgTiers[ti].candidates.splice(ci, 1); },
+    addTier() {
+      const name = prompt('新档位名（如 cheap）');
+      if (!name) return;
+      if (this.cfgTiers.some(t => t.name === name)) { this.agentToast('档位已存在'); return; }
+      this.cfgTiers.push({ name, enable: true, strategy: 'priority', candidates: [] });
+    },
+    async saveParams() {
+      const p = this.cfgParams;
+      await this.putConfig({ agent: {
+        temperature: p.temperature,
+        max_tool_rounds: p.max_tool_rounds,
+        debounce: Math.max(1, Math.round(p.debounce_seconds)) + 's',
+        self_wake: p.self_wake,
+        max_attempts: p.max_attempts || 0,
+        context: {
+          max_input_tokens: p.context.max_input_tokens,
+          review_after_wakes: p.context.review_after_wakes,
+          keep_recent_messages: p.context.keep_recent_messages,
+          summary_tokens: p.context.summary_tokens,
+        },
+      } }, '行为参数已保存');
+    },
+    async saveModules() {
+      await this.putConfig({ agent: { modules: Object.assign({}, this.cfgModules) } }, '板块开关已保存');
+    },
+    async reloadConfig() {
+      try {
+        const r = await this.api('/api/config/reload', { method: 'POST' });
+        const text = await r.text();
+        if (!r.ok) { this.cfgErr = text.trim(); return; }
+        await this.loadConfig();
+        this.cfgMsg = '已重读配置文件';
+      } catch (e) {
+        if (!this.needToken) this.cfgErr = '重载失败：' + e.message;
+      }
+    },
+    async testModel(tier, name) {
+      if (!name) { this.agentToast('先给候选起名并保存'); return; }
+      this.cfgMsg = '测试 ' + name + ' …';
+      try {
+        const r = await this.api('/api/models/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tier, name }),
+        });
+        const text = await r.text();
+        let out = {};
+        try { out = JSON.parse(text); } catch (e) { /* 纯文本错误 */ }
+        if (!r.ok) { this.cfgMsg = '测试失败：' + (out.error || text.trim()); return; }
+        this.cfgMsg = out.ok
+          ? '✓ ' + name + ' 可用（' + out.latency_ms + 'ms）'
+          : '✗ ' + name + '：' + (out.error || '不可用');
+      } catch (e) {
+        if (!this.needToken) this.cfgMsg = '测试失败：' + e.message;
       }
     },
   };

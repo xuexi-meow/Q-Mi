@@ -107,14 +107,54 @@ type NapcatConn struct {
 	Token  string `yaml:"token"`
 }
 
-// ModelTier 一个模型档位（model profile）：接入参数 + 能力标签。
-// capabilities 自由标记（tools/vision/video/thinking…），路由与文档据此
-// 判断该档能处理什么内容。
+// ModelCandidate 档位内的一个模型候选：选择顺序、启停、能力与失败冷却。
+type ModelCandidate struct {
+	Name          string   `yaml:"name" mapstructure:"name"`
+	Enable        *bool    `yaml:"enable" mapstructure:"enable"` // 缺省 true
+	BaseURL       string   `yaml:"base_url" mapstructure:"base_url"`
+	APIKey        string   `yaml:"api_key" mapstructure:"api_key"`
+	APIKeyEnv     string   `yaml:"api_key_env" mapstructure:"api_key_env"`
+	Model         string   `yaml:"model" mapstructure:"model"`
+	Capabilities  []string `yaml:"capabilities" mapstructure:"capabilities"`
+	ContextWindow int      `yaml:"context_window" mapstructure:"context_window"`
+	Weight        int      `yaml:"weight" mapstructure:"weight"`
+	Cooldown      string   `yaml:"cooldown" mapstructure:"cooldown"` // 失败冷却，缺省 5m；"0" 关闭
+}
+
+// Enabled 候选是否启用（缺省启用）。
+func (c ModelCandidate) Enabled() bool { return c.Enable == nil || *c.Enable }
+
+// ModelTier 一个模型档位：多候选 + 选择策略 + 整档启停。
+// 旧写法（单模型字段 BaseURL/APIKey/Model/Capabilities）继续支持，
+// 经 EffectiveCandidates 归一为「唯一候选、name=档位名」。
 type ModelTier struct {
-	BaseURL      string   `yaml:"base_url" mapstructure:"base_url"`
-	APIKey       string   `yaml:"api_key" mapstructure:"api_key"`
-	Model        string   `yaml:"model" mapstructure:"model"`
-	Capabilities []string `yaml:"capabilities" mapstructure:"capabilities"`
+	Enable       *bool            `yaml:"enable" mapstructure:"enable"` // 缺省 true
+	Strategy     string           `yaml:"strategy" mapstructure:"strategy"`
+	Candidates   []ModelCandidate `yaml:"candidates" mapstructure:"candidates"`
+	BaseURL      string           `yaml:"base_url" mapstructure:"base_url"`
+	APIKey       string           `yaml:"api_key" mapstructure:"api_key"`
+	Model        string           `yaml:"model" mapstructure:"model"`
+	Capabilities []string         `yaml:"capabilities" mapstructure:"capabilities"`
+}
+
+// Enabled 档位是否启用（缺省启用）。
+func (t ModelTier) Enabled() bool { return t.Enable == nil || *t.Enable }
+
+// EffectiveCandidates 归一化新老写法：显式 candidates 优先；否则把旧单模型
+// 字段视为唯一候选（name = 档位名）。两者都没有返回 nil。
+func (t ModelTier) EffectiveCandidates(tierName string) []ModelCandidate {
+	if len(t.Candidates) > 0 {
+		out := make([]ModelCandidate, len(t.Candidates))
+		copy(out, t.Candidates)
+		return out
+	}
+	if t.BaseURL == "" && t.APIKey == "" && t.Model == "" {
+		return nil
+	}
+	return []ModelCandidate{{
+		Name: tierName, BaseURL: t.BaseURL, APIKey: t.APIKey,
+		Model: t.Model, Capabilities: t.Capabilities,
+	}}
 }
 
 // AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
@@ -138,6 +178,11 @@ type AgentConfig struct {
 	// （轮询/通知/定时/任务回执）→ background 档；其余 → chat。
 	// 不配置 Models 时整体回退到顶层 base_url/api_key/model（作为 chat 档）。
 	Models map[string]ModelTier `yaml:"models" mapstructure:"models"`
+	// WakeRoutes 唤醒类型 → 档位名。缺省 chat→chat、background→background；
+	// 自定义档位必须在这里显式路由才会被使用。
+	WakeRoutes map[string]string `yaml:"wake_routes" mapstructure:"wake_routes"`
+	// MaxAttempts 单次请求最多尝试的候选数（含首个），0=默认 2，上限 5。
+	MaxAttempts int `yaml:"max_attempts" mapstructure:"max_attempts"`
 	// Modules 工具板块启停（重启生效，无热插拔）：缺省键 = 启用；
 	// 显式 false 的板块不加载（工具与文档都不出现）。
 	Modules  map[string]bool `yaml:"modules" mapstructure:"modules"`
@@ -151,6 +196,35 @@ type AgentConfig struct {
 	Multimodal    *bool        `yaml:"multimodal" mapstructure:"multimodal"`
 	MaxToolRounds int          `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
 	History       AgentHistory `yaml:"history" mapstructure:"history"`
+	Context       AgentContext `yaml:"context" mapstructure:"context"`
+}
+
+// WakeChat 内置 chat 档名：唤醒路由与回退链的终点。
+const WakeChat = "chat"
+
+// AgentContext budgets the account-wide in-memory conversation.
+// Token counts are estimates, not a provider-specific tokenizer.
+type AgentContext struct {
+	MaxInputTokens     int `yaml:"max_input_tokens" mapstructure:"max_input_tokens"`
+	ReviewAfterWakes   int `yaml:"review_after_wakes" mapstructure:"review_after_wakes"`
+	KeepRecentMessages int `yaml:"keep_recent_messages" mapstructure:"keep_recent_messages"`
+	SummaryTokens      int `yaml:"summary_tokens" mapstructure:"summary_tokens"`
+}
+
+func (c AgentContext) WithDefaults() AgentContext {
+	if c.MaxInputTokens == 0 {
+		c.MaxInputTokens = 48000
+	}
+	if c.ReviewAfterWakes == 0 {
+		c.ReviewAfterWakes = 8
+	}
+	if c.KeepRecentMessages == 0 {
+		c.KeepRecentMessages = 12
+	}
+	if c.SummaryTokens == 0 {
+		c.SummaryTokens = 1024
+	}
+	return c
 }
 
 // AgentHistory 上下文历史携带策略。
@@ -182,16 +256,26 @@ func (c *Config) LoadConfig() *Config {
 		}
 	}
 
+	cfg, err := decodeConfig(v)
+	if err != nil {
+		slog.Error("配置加载失败", "err", err)
+		return nil
+	}
+	slog.Info("读取配置文件成功")
+	return cfg
+}
+
+// decodeConfig 把已就绪的 viper 实例解码为 Config 并校验。
+// LoadConfig（单文件）与 Store（分层合并）共用这一条解析+校验路径，
+// 避免两套逻辑漂移；错误语义一致：解析失败或校验失败都返回 error。
+func decodeConfig(v *viper.Viper) (*Config, error) {
 	bot, netSetting, napcat, storageCfg, agentCfg, webuiCfg := initConfig(*v)
 	if bot == nil || netSetting == nil || napcat == nil || storageCfg == nil || agentCfg == nil || webuiCfg == nil {
-		return nil
+		return nil, fmt.Errorf("配置结构解码失败")
 	}
 	if err := validateConfig(netSetting, napcat, storageCfg, agentCfg, webuiCfg); err != nil {
-		slog.Error("配置校验失败", "err", err)
-		return nil
+		return nil, err
 	}
-
-	slog.Info("读取配置文件成功")
 	return &Config{
 		Bot:        bot,
 		NetSetting: netSetting,
@@ -199,7 +283,7 @@ func (c *Config) LoadConfig() *Config {
 		Storage:    storageCfg,
 		Agent:      agentCfg,
 		WebUI:      webuiCfg,
-	}
+	}, nil
 }
 
 func makeNewConfig() bool {
@@ -256,7 +340,8 @@ func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, ag
 }
 
 // validateAgentConfig 校验启用的 agent 块。
-func validateAgentConfig(agent *AgentConfig) error {	baseURL := strings.TrimSpace(agent.BaseURL)
+func validateAgentConfig(agent *AgentConfig) error {
+	baseURL := strings.TrimSpace(agent.BaseURL)
 	u, err := url.ParseRequestURI(baseURL)
 	if err != nil {
 		return fmt.Errorf("agent.base_url: %w", err)
@@ -279,16 +364,67 @@ func validateAgentConfig(agent *AgentConfig) error {	baseURL := strings.TrimSpac
 	if agent.Debounce <= 0 {
 		return fmt.Errorf("agent.debounce must be a positive duration, got %s", agent.Debounce)
 	}
-	// models 分档：每个显式配置的档位必须有完整接入参数
+	// models 分档：支持一档多候选，同时兼容旧的单模型写法。
 	for name, tier := range agent.Models {
-		if strings.TrimSpace(tier.BaseURL) == "" {
-			return fmt.Errorf("agent.models.%s.base_url must not be empty", name)
+		switch tier.Strategy {
+		case "", "priority":
+		default:
+			return fmt.Errorf("agent.models.%s.strategy %q is not supported yet (only priority)", name, tier.Strategy)
 		}
-		if strings.TrimSpace(tier.APIKey) == "" {
-			return fmt.Errorf("agent.models.%s.api_key must not be empty", name)
+		candidates := tier.EffectiveCandidates(name)
+		if tier.Enabled() && len(candidates) == 0 {
+			return fmt.Errorf("agent.models.%s must define at least one candidate", name)
 		}
-		if strings.TrimSpace(tier.Model) == "" {
-			return fmt.Errorf("agent.models.%s.model must not be empty", name)
+		seen := make(map[string]bool, len(candidates))
+		for i, cand := range candidates {
+			label := fmt.Sprintf("agent.models.%s.candidates[%d]", name, i)
+			if strings.TrimSpace(cand.Name) == "" {
+				return fmt.Errorf("%s.name must not be empty", label)
+			}
+			if seen[cand.Name] {
+				return fmt.Errorf("%s.name %q is duplicated", label, cand.Name)
+			}
+			seen[cand.Name] = true
+			if strings.TrimSpace(cand.Model) == "" {
+				return fmt.Errorf("%s.model must not be empty", label)
+			}
+			if baseURL := strings.TrimSpace(cand.BaseURL); baseURL != "" {
+				u, err := url.ParseRequestURI(baseURL)
+				if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+					return fmt.Errorf("%s.base_url %q must be a valid http(s) URL", label, cand.BaseURL)
+				}
+			}
+			if cand.APIKey != "" && cand.APIKeyEnv != "" {
+				return fmt.Errorf("%s: api_key and api_key_env are mutually exclusive", label)
+			}
+			if cand.Cooldown != "" {
+				d, err := time.ParseDuration(cand.Cooldown)
+				if err != nil {
+					return fmt.Errorf("%s.cooldown %q: %w", label, cand.Cooldown, err)
+				}
+				if d < 0 {
+					return fmt.Errorf("%s.cooldown must not be negative", label)
+				}
+			}
+			if cand.ContextWindow < 0 {
+				return fmt.Errorf("%s.context_window must not be negative", label)
+			}
+			if cand.Weight < 0 {
+				return fmt.Errorf("%s.weight must not be negative", label)
+			}
+		}
+	}
+	if agent.MaxAttempts < 0 || agent.MaxAttempts > 5 {
+		return fmt.Errorf("agent.max_attempts must be between 0 and 5, got %d", agent.MaxAttempts)
+	}
+	for wake, target := range agent.WakeRoutes {
+		if strings.TrimSpace(target) == "" {
+			return fmt.Errorf("agent.wake_routes.%s must not be empty", wake)
+		}
+		if target != WakeChat {
+			if _, ok := agent.Models[target]; !ok {
+				return fmt.Errorf("agent.wake_routes.%s points to unknown tier %q", wake, target)
+			}
 		}
 	}
 	// self_wake P3.6：空串=默认 10 分钟，"off"/"0"=关闭；其余须解析成功且 ≥30s。
@@ -309,6 +445,14 @@ func validateAgentConfig(agent *AgentConfig) error {	baseURL := strings.TrimSpac
 	}
 	if agent.History.Max < agent.History.Trim {
 		return fmt.Errorf("agent.history.max %d must be >= agent.history.trim %d", agent.History.Max, agent.History.Trim)
+	}
+	raw := agent.Context
+	if raw.MaxInputTokens < 0 || raw.ReviewAfterWakes < 0 || raw.KeepRecentMessages < 0 || raw.SummaryTokens < 0 {
+		return fmt.Errorf("agent.context budgets must not be negative")
+	}
+	policy := raw.WithDefaults()
+	if policy.MaxInputTokens < 2048 || policy.SummaryTokens >= policy.MaxInputTokens/2 || policy.KeepRecentMessages < 2 {
+		return fmt.Errorf("agent.context requires max_input_tokens >= 2048, summary_tokens < half the input budget, and keep_recent_messages >= 2")
 	}
 	return nil
 }

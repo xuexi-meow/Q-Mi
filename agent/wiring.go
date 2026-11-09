@@ -34,18 +34,24 @@ var (
 // 工具文档（PromptDocs）在此注入 builder 的 system 静态区。
 func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
 	cfgQQ := int64(0)
-	if a := app.GetApp(); a != nil && a.Config != nil && a.Config.Bot != nil {
-		cfgQQ = int64(a.Config.Bot.QQ_Number)
+	if a := app.GetApp(); a != nil {
+		if cur := a.Current(); cur != nil && cur.Bot != nil {
+			cfgQQ = int64(cur.Bot.QQ_Number)
+		}
 	}
 	b := NewDefaultBuilder(store, cfg)
 	m := NewManager(b, NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store, cfgQQ)
-	b.SetToolDocs(m.registry.PromptDocs())
+	b.SetToolDocs(m.toolRegistry().PromptDocs())
 	globalBrowser = m.browser
 	m.StartSelfWake(selfWakeInterval(cfg))
+	// 订阅配置热重载：模型/提示词/阈值热生效，需重启字段只告警。
+	if a := app.GetApp(); a != nil && a.ConfigStore != nil {
+		m.AttachConfigStore(a.ConfigStore)
+	}
 	return m
 }
 
-// urgentFromEvent 判定消息紧急度（spec §5 插话打断）：
+// urgentFromEvent 标记私聊/@，仅作消息属性，不取消正在进行的请求：
 // 私聊一律紧急；群聊仅当消息 @ 了机器人自身（按事件自带 self_id）才紧急。
 func urgentFromEvent(chatType string, msgs []*evmsg.Message, selfID int64) bool {
 	if chatType == "private" {
@@ -87,7 +93,7 @@ func init() {
 		if bot.IsAdmin(int64(e.UserID)) && m.TryResolveApproval(bot.Text(e.Message)) {
 			return
 		}
-		// 私聊一律响应
+		// 私聊进入收件箱；是否回复由模型决定。
 		m.Enqueue(IncomingMessage{
 			MessageID:  int64(e.MessageID),
 			ChatType:   "private",
@@ -99,6 +105,7 @@ func init() {
 			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("private", e.Message, int64(e.SelfID)),
+			Mentioned:  mentionedFromEvent(e.Message, int64(e.SelfID)),
 		})
 	})
 	event.RegisterTyped("message.group", func(e *event.GroupMessageEvent) {
@@ -119,6 +126,7 @@ func init() {
 			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),
+			Mentioned:  mentionedFromEvent(e.Message, int64(e.SelfID)),
 		})
 	})
 	registerNoticeWake()
@@ -200,6 +208,17 @@ func registerNoticeWake() {
 	})
 }
 
+// UsageByModelTotals 返回运行中 manager 的按候选用量（未初始化时为空表）。
+// 只读快照，供 WebUI 概览展示「哪个模型花了多少」。
+func UsageByModelTotals() map[string]UsageSnapshot {
+	managerMu.Lock()
+	defer managerMu.Unlock()
+	if manager == nil {
+		return map[string]UsageSnapshot{}
+	}
+	return manager.UsageByModel()
+}
+
 // getManager 惰性初始化全局 Manager,只初始化一次。
 // enable=false 或配置缺失返回 nil,handler 直接 return,零影响。
 func getManager() *Manager {
@@ -208,13 +227,14 @@ func getManager() *Manager {
 	if !managerInited {
 		managerInited = true
 		a := app.GetApp()
-		if a.Config == nil || a.Config.Agent == nil || !a.Config.Agent.Enable {
+		cur := a.Current()
+		if cur == nil || cur.Agent == nil || !cur.Agent.Enable {
 			return nil
 		}
 		if a.Store == nil {
 			slog.Warn("记忆库未启用,agent 将没有历史上下文,仅凭当前消息对话")
 		}
-		manager = newManagerFunc(*a.Config.Agent, a.Store)
+		manager = newManagerFunc(*cur.Agent, a.Store)
 	}
 	return manager
 }

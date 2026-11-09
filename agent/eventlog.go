@@ -32,6 +32,7 @@ const (
 	KindFinish      = "finish"
 	KindInterrupted = "interrupted"
 	KindUsage       = "usage"
+	KindConfig      = "config"
 )
 
 // eventLogCapacity 环形缓冲容量：超出后丢最旧事件。

@@ -64,7 +64,7 @@ func (r *SetGroupLeave) Path() string { return "/set_group_leave" }
 // SetGroupWholeBan 全员禁言 POST /set_group_whole_ban
 type SetGroupWholeBan struct {
 	GroupID int64 `json:"group_id"`
-	Enable  bool  `json:"enable,omitempty"`
+	Enable  bool  `json:"enable"`
 }
 
 func (r *SetGroupWholeBan) Path() string { return "/set_group_whole_ban" }
@@ -91,7 +91,7 @@ func (r *SetGroupKick) Path() string { return "/set_group_kick" }
 type SetGroupAdmin struct {
 	GroupID int64 `json:"group_id"`
 	UserID  int64 `json:"user_id"`
-	Enable  bool  `json:"enable,omitempty"`
+	Enable  bool  `json:"enable"`
 }
 
 func (r *SetGroupAdmin) Path() string { return "/set_group_admin" }

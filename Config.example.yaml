@@ -1,5 +1,9 @@
 # ============================================================
 # Q-Mi 配置示例（复制为 Config.yaml 后填 key）
+#
+# 热重载：运行中修改本文件会自动生效（模型/提示词/阈值/工具板块/轮询间隔）；
+# 监听地址、存储路径、WebUI 端口、bot.qq_number 等改完需重启。
+# WebUI 写入的配置单独存在 Config.webui.yaml（覆盖本文件，删除即恢复本文件的值）。
 # ============================================================
 
 bot:
@@ -39,29 +43,53 @@ agent:
   api_key: "sk-..."
   model: "deepseek-flash"                # deepseek-flash=DeepSeek 便宜的视觉档
 
-  # 方式二（分档模型，model profile）：按唤醒类型/内容选档，配置后覆盖顶层
+  # 方式二（分档模型）：一个档位可以有多个候选，按顺序取第一个可用；
+  # 候选可单独 enable:false 停用，配置保留不删。
   # models:
   #   chat:                              # 主对话（有人找它/它主动说话）
-  #     base_url: "https://api.deepseek.com"
-  #     api_key: "sk-..."
-  #     model: "deepseek-flash"
-  #     capabilities: [tools, vision]    # 能力标签（tools/vision/video/thinking…）
-  #   background:                        # 后台唤醒（轮询/通知/定时/任务回执）——免费/便宜档
-  #     base_url: "https://open.bigmodel.cn/api/paas/v4"
-  #     api_key: "sk-..."
-  #     model: "glm-4.6v-flash"
-  #     capabilities: [tools, vision]
-  #   video:                             # 含视频内容的 turn（视频送进模型需要 Files API 支持，尚未落地）
-  #     base_url: "https://api.minimax.io/v1"
-  #     api_key: "sk-..."
-  #     model: "MiniMax-M3.1-Flash"
-  #     capabilities: [tools, vision, video]
+  #     enable: true                     # 整档停用 = 回退到 chat 的顶层三件套
+  #     strategy: priority               # 目前只支持 priority（按列表顺序）
+  #     candidates:
+  #       - name: deepseek               # 日志/统计/事件里的标签，档内唯一
+  #         enable: true
+  #         base_url: "https://api.deepseek.com"
+  #         api_key: "sk-..."            # 与 api_key_env 二选一
+  #         model: "deepseek-flash"
+  #         capabilities: [tools, vision]  # 不写 = 不限制；写了就按能力过滤
+  #         context_window: 64000        # 仅用于预算参考
+  #         cooldown: 5m                 # 失败后冷却，缺省 5m；"0" 关闭
+  #       - name: zhipu
+  #         enable: false                # 备用候选：先停用，随时打开
+  #         base_url: "https://open.bigmodel.cn/api/paas/v4"
+  #         api_key_env: ZHIPU_API_KEY   # 从环境变量读，避免明文
+  #         model: "glm-4.6v-flash"
+  #         capabilities: [tools, vision]
+  #   background:                        # 后台唤醒（轮询/通知/定时/任务回执）
+  #     candidates:
+  #       - name: glm-flash
+  #         base_url: "https://open.bigmodel.cn/api/paas/v4"
+  #         api_key_env: ZHIPU_API_KEY
+  #         model: "glm-4.6v-flash"
+  #         capabilities: [tools, vision]
+  #   video:                             # 含视频内容的 turn（尚未落地，可先停用）
+  #     enable: false
+  #     candidates: []
+  #
+  # 唤醒类型 → 档位：缺省 chat→chat、background→background。
+  # 自定义档位必须在这里显式路由才会被用到。
+  # wake_routes:
+  #   background: background
+  #
+  # max_attempts: 2                      # 单次请求最多试几个候选（含首个），上限 5
+
 
   # ---- 提示词与行为 ----
-  persona_file: "agent/persona.md"       # 人设（你的文件，AI 不动）
-  guide_file: "agent/guide.md"           # 行为/礼仪约束（工具用法在 system 的「工具使用说明」，自动生成）
+  persona_file: "agent/persona.md"       # 人设（你的文件，AI 不动）；每次模型请求前热读取
+  guide_file: "agent/guide.md"           # 行为/礼仪约束；修改后下一次请求生效，保存时短暂空文件保留上一版
+  # 自学的真人聊天习惯由 AI 保存在 workspace_dir/chat_style.md（缺省 agent/workspace/chat_style.md）。
+  # 每次模型请求前读取，最多注入 2000 字；笔记/情绪/习惯仅变化时追加快照，删除也生效。
   temperature: 0.8
-  debounce: 3s                           # 防抖窗口：窗口内消息合并成一个 turn
+  debounce: 3s                           # 空闲时账号级合并窗口；忙时在下次请求前插入，不取消当前请求
   self_wake: "10m"                       # 定时轮询间隔，"off" 关闭；轮询只是唤醒，发不发言模型自决
   max_tool_rounds: 180                   # 思考轮数上限（finish 提前终止）；长任务工作流保持大值
   multimodal: true                       # 图片多模态直送模型；模型不支持图片输入设 false（维持纯文本+CQ 码）
@@ -83,9 +111,20 @@ agent:
   #   system: true      # 定时器/后台任务管理/行为回溯
 
   debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/
+  context:               # 账号级工作上下文：finish 暂停执行，不清空；当前仅进程内保留
+    max_input_tokens: 48000       # 估算输入预算，含 system/工具/图片；不是提供商的精确 tokenizer
+    review_after_wakes: 8         # 有效唤醒后的复查点，不是到次数就强制清空；无行动的轮询不计
+    keep_recent_messages: 12     # 至少原样保留的尾部消息数；工具调用与回执作为完整组保留
+    summary_tokens: 1024         # 摘要生成额度及正文估算上限；摘要请求也计入用量，不会发到 QQ
+  # 只压缩较早且模型已读的工作记录。人格/指南/工具说明不进入摘要，最新笔记/情绪/习惯原样保留。
+  # 固定提示/最新状态/工具开销扣除后，工作记录占剩余预算约 75% 时复查；唤醒复查时超过 50% 也可压缩。
+  # 只有预计至少释放剩余预算的 25%（最少 256 tokens）且能容纳受保护内容时才请求摘要。
+  # 当前活动的触发消息、未读工具结果和近期窗口不因预算被摘要；仍超限时记错误，不发送请求。
+  # 零值/缺项使用上述默认值。模型上下文较小请降低预算或关闭不需要的工具板块。
+  # 以上参数修改需重启；只有 persona/guide 和笔记/情绪/chat_style.md 是请求级热更新。
   history:
-    max: 40              # 上下文携带的最近消息条数（跨会话混合）
-    trim: 20             # 超出后按块裁剪（时间水印锚，保证缓存前缀稳定）
+    max: 40              # 首次启动工作上下文时携带的最近 QQ 历史条数（之后按增量追加）
+    trim: 20             # 启动历史的块裁剪大小；工作上下文压缩由 context 控制
 
 webui:                   # Web 控制台（概览/消息流+思考链/agent 控制/QQ 管理）
   enable: false          # agent 需同时启用；局域网/手机访问把 host 改 0.0.0.0

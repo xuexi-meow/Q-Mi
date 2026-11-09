@@ -57,6 +57,11 @@ type ChatMessage struct {
 	Content    any        `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	// ReasoningContent 思考模式的思维链：只要请求带 tools，后续所有请求必须
+	// 原样回传，否则 DeepSeek 返回 400。只存在于进程内工作上下文，
+	// 不写消息库、不进压缩摘要。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	kind             contextKind
 }
 
 // ChatRequest chat/completions 请求体。
@@ -69,14 +74,16 @@ type ChatRequest struct {
 	Tools       []ToolDef     `json:"tools,omitempty"`
 }
 
-// responseMessage 响应 choices[].message：比请求消息多 reasoning_content
-// （DeepSeek 系思维链，仅捕获不注入上下文）。Content 兼容字符串与多模态
-// 数组两种响应形态，文本经 TextContent 提取。
+// responseMessage 响应 choices[].message：兼容 reasoning_content（DeepSeek）
+// 和 reasoning（SenseNova）。两种字段的回传语义不同：DeepSeek 在带 tools 时
+// 要求原样回传 reasoning_content；SenseNova 的 reasoning 只用于展示。
+// Content 兼容字符串与多模态数组两种响应形态，文本经 TextContent 提取。
 type responseMessage struct {
 	Role             string     `json:"role"`
 	Content          any        `json:"content"`
 	ToolCalls        []ToolCall `json:"tool_calls"`
 	ReasoningContent string     `json:"reasoning_content"`
+	Reasoning        string     `json:"reasoning"`
 }
 
 // Usage 用量统计（OpenAI usage 字段 + DeepSeek 缓存命中扩展）：
@@ -92,10 +99,18 @@ type Usage struct {
 // ChatResponse chat/completions 响应体，仅解析用到的字段。
 type ChatResponse struct {
 	Choices []struct {
-		Index   int             `json:"index"`
-		Message responseMessage `json:"message"`
+		Index        int             `json:"index"`
+		Message      responseMessage `json:"message"`
+		FinishReason string          `json:"finish_reason"`
 	} `json:"choices"`
 	Usage Usage `json:"usage"`
+}
+
+func (r *ChatResponse) FinishReason() string {
+	if r == nil || len(r.Choices) == 0 {
+		return ""
+	}
+	return r.Choices[0].FinishReason
 }
 
 // TextContent 返回 choices[0].message.content 的文本：content 为字符串时
@@ -135,8 +150,22 @@ func (r *ChatResponse) ToolCalls() []ToolCall {
 	return r.Choices[0].Message.ToolCalls
 }
 
-// ReasoningContent 返回 choices[0].message.reasoning_content（仅捕获，不注入上下文）。
+// ReasoningContent 用于展示/日志：优先 reasoning_content，回退 reasoning。
 func (r *ChatResponse) ReasoningContent() string {
+	if r == nil || len(r.Choices) == 0 {
+		return ""
+	}
+	msg := r.Choices[0].Message
+	if msg.ReasoningContent != "" {
+		return msg.ReasoningContent
+	}
+	return msg.Reasoning
+}
+
+// ReplayReasoning 只返回需要随请求回传的 reasoning_content。
+// SenseNova 的 reasoning 字段语义不同（仅展示），不能当作 reasoning_content
+// 回传，否则会被对方拒绝或污染上下文。
+func (r *ChatResponse) ReplayReasoning() string {
 	if r == nil || len(r.Choices) == 0 {
 		return ""
 	}
@@ -186,7 +215,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, fmt.Errorf("agent: 读取响应失败: %w", err)
 	}
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("agent: LLM 返回 HTTP %d: %s", httpResp.StatusCode, truncateForLog(body))
+		return nil, &HTTPError{Status: httpResp.StatusCode, Body: truncateForLog(body)}
 	}
 
 	var resp ChatResponse
@@ -197,6 +226,17 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, fmt.Errorf("agent: 响应中没有 choices (body=%s)", truncateForLog(body))
 	}
 	return &resp, nil
+}
+
+// HTTPError 模型接口返回非 200 时的错误（保留状态码供失败切换判断：
+// 429/5xx 可换候选，4xx 参数/模型错误换候选也没用）。
+type HTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("agent: LLM 返回 HTTP %d: %s", e.Status, e.Body)
 }
 
 // truncateForLog 截断响应体，避免错误日志过大。

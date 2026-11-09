@@ -66,7 +66,7 @@ func AtUserID(msgs []*evmsg.Message, selfID int64) bool {
 
 // IsAdmin 判断 QQ 是否在配置 bot.admin_number 中。
 func IsAdmin(qq int64) bool {
-	cfg := app.GetApp().Config
+	cfg := app.GetApp().Current()
 	if cfg == nil || cfg.Bot == nil {
 		return false
 	}
@@ -93,7 +93,7 @@ func Reply(ctx context.Context, chatType string, chatID int64, c chain.Chain) er
 }
 
 func selfQQ() int {
-	cfg := app.GetApp().Config
+	cfg := app.GetApp().Current()
 	if cfg == nil || cfg.Bot == nil {
 		return 0
 	}

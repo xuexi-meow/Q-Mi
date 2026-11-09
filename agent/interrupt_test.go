@@ -13,7 +13,7 @@ import (
 	evmsg "Q-Mi/event/message"
 )
 
-// ---------- 插话打断（spec §5）----------
+// ---------- 消息插入与旧紧急度标记 ----------
 
 // joinNewMessages builder 替身:把 turn 的新消息文本拼成一条 user 消息,
 // 便于断言 LLM 实际收到的内容。
@@ -56,29 +56,27 @@ func readDebugRecords(t *testing.T, dir string) (interrupted []debugRecord, norm
 	return interrupted, normal
 }
 
-// TestUrgentMessageInterruptsSlowTurn 慢 LLM 期间同会话来 urgent 消息：
-// 第一请求的 ctx 被取消（服务端 handler 观察到 r.Context().Done()）；
-// pending 合并成新 turn 立即重开，新消息进入第二次请求并正常回复；
-// 被打断轮次不回复、debug 记录 interrupted=true，新 turn 正常记录。
-func TestUrgentMessageInterruptsSlowTurn(t *testing.T) {
+// Urgent arrivals wait for the active request, then join after tool results.
+func TestUrgentMessageJoinsSlowTurn(t *testing.T) {
 	b := &stubBuilder{fn: joinNewMessages}
 	cfg := testCfg(20 * time.Millisecond)
 	cfg.Debug = true
 
 	f, srv := newFakeLLM(t, "")
 	f.mu.Lock()
-	f.script = []string{plainResp("被取消的回复"), plainResp("新回复")}
+	f.script = []string{toolCallResp("query", "get_recent_messages", "{}"), plainResp("新回复")}
 	var once sync.Once
 	cancelSeen := make(chan struct{})
+	released := make(chan struct{})
+	t.Cleanup(func() { once.Do(func() { close(released) }) })
 	f.hook = func(idx int, r *http.Request) {
 		if idx != 0 {
 			return
 		}
 		select {
 		case <-r.Context().Done():
-			once.Do(func() { close(cancelSeen) }) // 服务端观察到客户端取消
-		case <-time.After(2 * time.Second):
-			// 未被取消:超时照常返回,下方断言会失败
+			close(cancelSeen)
+		case <-released:
 		}
 	}
 	f.mu.Unlock()
@@ -99,10 +97,11 @@ func TestUrgentMessageInterruptsSlowTurn(t *testing.T) {
 
 	select {
 	case <-cancelSeen:
-	case <-time.After(3 * time.Second):
-		t.Fatal("第一请求的 ctx 应被取消（服务端应观察到 r.Context().Done()）")
+		t.Fatal("紧急消息不应取消正在进行的请求")
+	case <-time.After(70 * time.Millisecond):
 	}
-	waitFor(t, 3*time.Second, func() bool { return f.count() == 2 }, "urgent 消息应打断当前 turn 并立即重开")
+	once.Do(func() { close(released) })
+	waitFor(t, 3*time.Second, func() bool { return f.count() == 2 }, "urgent 消息应加入下一次请求")
 
 	// 新 turn 的 LLM 请求应包含新消息（且只是 pending 里的内容）
 	last := f.reqs[1].Messages[len(f.reqs[1].Messages)-1]
@@ -110,26 +109,23 @@ func TestUrgentMessageInterruptsSlowTurn(t *testing.T) {
 		t.Errorf("新 turn 请求的末条消息 = %q, want 插队！", last.Content)
 	}
 
-	// 被打断的轮次不回复;新 turn 正常回复
+	// 查询工具不发言，包含插入消息的下一次请求正常回复。
 	waitFor(t, 3*time.Second, func() bool { return napcat.count() == 1 }, "新 turn 应发出回复")
 	if got := napcat.sentText(t, 0); got != "新回复" {
 		t.Errorf("回复文本 = %q, want 新回复", got)
 	}
 	time.Sleep(100 * time.Millisecond)
 	if got := napcat.count(); got != 1 {
-		t.Errorf("被打断的轮次不应回复, 发送次数 = %d", got)
+		t.Errorf("仅纯文本响应应发送一次, 发送次数 = %d", got)
 	}
 
-	// debug:被取消轮次 interrupted=true + 错误;新 turn 正常记录
+	// 两次请求都正常完成，不再有 interrupted 记录。
 	interruptedRecs, normalRecs := readDebugRecords(t, m.debugDir)
-	if len(interruptedRecs) != 1 {
-		t.Fatalf("应恰好 1 条 interrupted=true 记录, got %d", len(interruptedRecs))
+	if len(interruptedRecs) != 0 {
+		t.Fatalf("追加消息不应记录 interrupted=true, got %d", len(interruptedRecs))
 	}
-	if !strings.Contains(interruptedRecs[0].Err, "context canceled") {
-		t.Errorf("被打断记录的错误 = %q, 应包含 context canceled", interruptedRecs[0].Err)
-	}
-	if len(normalRecs) != 1 || normalRecs[0].Content != "新回复" {
-		t.Errorf("新 turn 的 debug 记录应正常(content=新回复), got %+v", normalRecs)
+	if len(normalRecs) != 2 || normalRecs[1].Content != "新回复" {
+		t.Errorf("两次请求均应正常记录, got %+v", normalRecs)
 	}
 }
 

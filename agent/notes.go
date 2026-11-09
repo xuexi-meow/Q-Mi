@@ -1,6 +1,6 @@
 // agent/notes.go 思考笔记存储（spec §3.5）：think 工具把笔记落盘为
-// JSON 数组文件，只保留最近 maxNotes 条；下一轮思考由 manager 读出并
-// 经 Turn 注入最终 user 消息头部（不进 system，保缓存前缀）。
+// JSON 数组文件，只保留最近 maxNotes 条；每次模型请求前读出，
+// 变化追加为末尾状态快照（不进 system，保留已有消息前缀）。
 package agent
 
 import (

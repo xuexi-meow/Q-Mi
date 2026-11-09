@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,11 +139,11 @@ var wantToolNames = []string{
 	// core
 	"send_message", "think", "update_mood", "finish",
 	// memory
-	"get_recent_messages", "search_messages", "view_message_images",
+	"get_recent_messages", "search_messages", "view_message_images", "chat_dnd",
 	// sticker
 	"save_sticker", "list_stickers", "delete_sticker", "collect_qq_sticker",
 	// qzone
-	"post_qzone", "browse_qzone_feeds", "read_qzone_post",
+	"post_qzone", "browse_qzone_feeds", "read_qzone_post", "view_qzone_images",
 	"qzone_like", "comment_qzone", "qzone_profile", "delete_qzone",
 	// admin：QQ 能力工具 + 逃生舱
 	"recall_message", "get_friend_list",
@@ -162,12 +163,13 @@ var wantToolNames = []string{
 	"read_file", "write_file", "list_dir", "delete_file", "download_file", "run_command", "save_message_media",
 	// browser
 	"browser_navigate", "browser_read_page", "browser_click", "browser_type", "browser_scroll", "browser_screenshot",
+	"browser_mouse", "browser_keyboard", "browser_tabs", "browser_dialog",
 	// system
 	"schedule", "cancel_timer", "task_list", "task_get", "task_cancel", "self_events",
 }
 
 // dangerousToolNames 需要管理员权限的工具。
-var dangerousToolNames = []string{"kick_member", "set_group_admin", "leave_group"}
+var dangerousToolNames = []string{"kick_member", "set_group_admin", "leave_group", "set_group_name", "send_group_notice"}
 
 // TestToolSetContainsAllTools 工具集包含全部工具，finish 无 Run（纯终止标记）。
 func TestToolSetContainsAllTools(t *testing.T) {
@@ -196,8 +198,14 @@ func TestDangerousToolsBlockedForNonAdmin(t *testing.T) {
 	for _, name := range dangerousToolNames {
 		t.Run(name, func(t *testing.T) {
 			nap := startP3NapCat(t, func(string, map[string]any) any { return map[string]any{} })
+			args := `{"group_id":888,"user_id":5,"enable":true,"reject_add_request":true}`
+			if name == "set_group_name" {
+				args = `{"group_id":888,"name":"新群名"}`
+			} else if name == "send_group_notice" {
+				args = `{"group_id":888,"content":"新公告"}`
+			}
 			tools, _, _ := testToolSet(t, nil)
-			err := runToolErr(t, tools, name, `{"group_id":888,"user_id":5,"enable":true,"reject_add_request":true}`)
+			err := runToolErr(t, tools, name, args)
 			if !strings.Contains(err.Error(), "管理员权限") {
 				t.Errorf("非管理员 %s 报错应含「管理员权限」, got %v", name, err)
 			}
@@ -205,7 +213,7 @@ func TestDangerousToolsBlockedForNonAdmin(t *testing.T) {
 				t.Errorf("非管理员 %s 不应发起 NapCat 请求, got %d 次", name, nap.count())
 			}
 			adminTools := testToolSetAdmin(t)
-			runToolOK(t, adminTools, name, `{"group_id":888,"user_id":5,"enable":true,"reject_add_request":true}`)
+			runToolOK(t, adminTools, name, args)
 			if nap.count() != 1 {
 				t.Errorf("管理员调用 %s 应发出 1 次请求, got %d", name, nap.count())
 			}
@@ -213,7 +221,7 @@ func TestDangerousToolsBlockedForNonAdmin(t *testing.T) {
 	}
 }
 
-// TestGetRecentMessagesTool 查询结果为紧凑 JSON 数组、按时间正序，
+// TestGetRecentMessagesTool 查询结果为带元数据的紧凑 JSON、消息按时间正序，
 // 字段含 message_id/chat_type/chat_id/sender_name/text/time；支持
 // chat_type/chat_id 过滤与 limit。
 func TestGetRecentMessagesTool(t *testing.T) {
@@ -229,10 +237,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 	if strings.ContainsAny(out, "\n\t") || strings.Contains(out, ": ") {
 		t.Errorf("输出应为紧凑 JSON: %q", out)
 	}
-	var rows []map[string]any
-	if err := json.Unmarshal([]byte(out), &rows); err != nil {
-		t.Fatalf("输出不是 JSON 数组: %v (%s)", err, out)
-	}
+	rows := messageRowsOf(t, out)
 	if len(rows) != 2 {
 		t.Fatalf("limit=2 应返回 2 条, got %d: %s", len(rows), out)
 	}
@@ -262,9 +267,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 
 	// chat_type 过滤
 	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","limit":10}`)
-	if err := json.Unmarshal([]byte(out), &rows); err != nil {
-		t.Fatal(err)
-	}
+	rows = messageRowsOf(t, out)
 	if len(rows) != 2 {
 		t.Fatalf("group 过滤应返回 2 条, got %d: %s", len(rows), out)
 	}
@@ -276,9 +279,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 
 	// 超上限 clamp 到 100（3 条全出，不报错）
 	out = runToolOK(t, tools, "get_recent_messages", `{"limit":999}`)
-	if err := json.Unmarshal([]byte(out), &rows); err != nil {
-		t.Fatal(err)
-	}
+	rows = messageRowsOf(t, out)
 	if len(rows) != 3 {
 		t.Errorf("limit=999 应 clamp 并返回全部 3 条, got %d", len(rows))
 	}
@@ -294,10 +295,7 @@ func TestSearchMessagesTool(t *testing.T) {
 	putRecord(t, s, 2, "recv", "group", 888, 10003, "群友C", "不了我要写代码", t1.Add(time.Minute).Unix())
 
 	out := runToolOK(t, tools, "search_messages", `{"query":"游戏","limit":10}`)
-	var rows []map[string]any
-	if err := json.Unmarshal([]byte(out), &rows); err != nil {
-		t.Fatalf("输出不是 JSON 数组: %v (%s)", err, out)
-	}
+	rows := messageRowsOf(t, out)
 	if len(rows) != 1 || rows[0]["text"] != "今晚一起打游戏吗" {
 		t.Errorf("搜索结果 = %v, want 命中「今晚一起打游戏吗」", rows)
 	}
@@ -582,8 +580,19 @@ func TestToolDefsSchemaNoNulls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "null") {
-		t.Errorf("工具 schema 序列化含 null，会被提供商拒绝:\n%s", data)
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		// JSON null is invalid here; the word "null" in a description is not.
+		if token == nil {
+			t.Errorf("工具 schema 序列化含 null，会被提供商拒绝:\n%s", data)
+		}
 	}
 }
 
@@ -1180,10 +1189,7 @@ func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
 		t.Fatalf("queryMessageRows: %v", err)
 	}
 
-	var rows []map[string]any
-	if err := json.Unmarshal([]byte(out), &rows); err != nil {
-		t.Fatalf("输出应为 JSON 数组: %v", err)
-	}
+	rows := messageRowsOf(t, out)
 	if len(rows) != 3 {
 		t.Fatalf("应返回 3 行, got %d", len(rows))
 	}

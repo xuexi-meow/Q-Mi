@@ -15,7 +15,7 @@ Config.webui.yaml
 agent/images/
 agent/workspace/
 agent/browser-profile/
-.workbuddy/
+.workbuddy/memory/
 agent/images/
 agent/workspace/
 docs/

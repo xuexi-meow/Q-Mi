@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# qqfreeze —— 冻结 WSL 内 QQ 的更新/热更新通道（不影响正常运行）
+#
+# 原理：QQ 以 snowluma 用户运行，/opt/QQ 本就 root 所有不可写；更新的实际
+# 落点是用户数据目录下的 versions/（热更新版本包）与 dynamic_module/、
+# dynamic_package/（运行时动态下载模块）。对这三个目录 chattr -R +i
+# （递归不可变）：QQ 读现有内容正常，任何写入/新建/删除都失败 → 更新被挡。
+# 账号数据（nt_qq_*）、配置（global）、缓存一律不碰。
+#
+# 用法: qqfreeze {freeze|unfreeze|status}
+set -u
+QQ_HOME=/var/lib/snowluma/qq/.config/QQ
+TARGETS=("$QQ_HOME/versions" "$QQ_HOME/dynamic_module" "$QQ_HOME/dynamic_package")
+
+color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
+
+flags() { lsattr -d "$1" 2>/dev/null | awk '{print $1}'; }
+
+case "${1:-status}" in
+  freeze)
+    for d in "${TARGETS[@]}"; do
+      if [ ! -d "$d" ]; then
+        color "1;33" "[跳过] 不存在: $d"
+        continue
+      fi
+      chattr -R +i "$d" 2>/dev/null
+      color "1;32" "[冻结] $d  ($(flags "$d"))"
+    done
+    color "1;32" "[完成] QQ 更新通道已冻结；账号数据/配置未动。重启 QQ 生效: systemctl restart snowluma-qq"
+    ;;
+  unfreeze)
+    for d in "${TARGETS[@]}"; do
+      [ -d "$d" ] || continue
+      chattr -R -i "$d" 2>/dev/null
+      color "1;33" "[解冻] $d"
+    done
+    ;;
+  status)
+    for d in "${TARGETS[@]}"; do
+      if [ -d "$d" ]; then
+        f=$(flags "$d")
+        case "$f" in
+          *i*) color "1;32" "[已冻结] $d  ($f)";;
+          *)   color "1;31" "[未冻结] $d  ($f)";;
+        esac
+      else
+        color "1;33" "[不存在] $d"
+      fi
+    done
+    echo "--- QQ 进程 ---"
+    pgrep -af "/opt/QQ/qq" | head -2 || echo "(QQ 未运行)"
+    ;;
+  *)
+    echo "用法: qqfreeze {freeze|unfreeze|status}"
+    ;;
+esac

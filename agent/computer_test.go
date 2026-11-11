@@ -190,7 +190,7 @@ func TestApprovalFlowEndToEnd(t *testing.T) {
 
 	// 用 download_file 伪造一个"越界"操作：直接构造 approvalNeeded 的工具
 	tool := Tool{
-		Name: "danger_op", Description: "测试", Parameters: objectParams(nil, nil),
+		Name: "danger_op", Description: "测试", Parameters: objectParams(map[string]any{"x": intProp("x")}, nil),
 		Run: func(args json.RawMessage) (string, error) {
 			return "{}", approvalNeeded{"演示用危险操作"}
 		},

@@ -69,7 +69,8 @@ func Do[T any](ctx context.Context, req api.Request) (*api.Response[T], error) {
 		return nil, fmt.Errorf("解析响应失败: %w", err)
 	}
 	if resp.Retcode != 0 {
-		return &resp, fmt.Errorf("API 调用失败 retcode=%d status=%s wording=%s", resp.Retcode, resp.Status, resp.Wording)
+		return &resp, fmt.Errorf("API %s 调用失败 retcode=%d status=%s message=%s wording=%s",
+			req.Path(), resp.Retcode, resp.Status, resp.Message, resp.Wording)
 	}
 	return &resp, nil
 }

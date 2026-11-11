@@ -142,3 +142,28 @@ func TestValidateRejectsEmptyEnabledTier(t *testing.T) {
 		t.Fatalf("enabled tier without candidates must be rejected, err = %v", err)
 	}
 }
+
+func TestToolChoiceConfigValidationAndDecode(t *testing.T) {
+	for _, fragment := range []string{
+		"  tool_choice: none\n",
+		"  models:\n    chat:\n      model: m\n      tool_choice: typo\n",
+		"  models:\n    chat:\n      candidates:\n        - name: a\n          model: m\n          tool_choice: typo\n",
+	} {
+		store, err := newModelStore(t, fragment)
+		if store != nil {
+			store.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), "tool_choice") {
+			t.Errorf("invalid action tool choice must be rejected: fragment=%s err=%v", fragment, err)
+		}
+	}
+	store, err := newModelStore(t, "  tool_choice: required\n  models:\n    chat:\n      model: m\n      tool_choice: auto\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := store.Snapshot().Agent
+	if cfg.ToolChoice != "required" || cfg.Models["chat"].EffectiveCandidates("chat")[0].ToolChoice != "auto" {
+		t.Fatal("tool_choice must survive YAML decode and legacy tier normalization")
+	}
+}

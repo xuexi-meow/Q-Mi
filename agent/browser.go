@@ -286,6 +286,7 @@ func browserTools(ctx *ToolContext) []Tool {
 			},
 		},
 		browserScreenshotTool(ctx),
+		browserSaveScreenshotTool(ctx),
 		browserMouseTool(ctx),
 		browserKeyboardTool(ctx),
 		browserTabsTool(ctx),

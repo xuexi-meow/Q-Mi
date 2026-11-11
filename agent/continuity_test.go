@@ -126,7 +126,7 @@ func TestAccountInsertsUrgentWithoutCancelling(t *testing.T) {
 
 func TestAccountMixedSourcesHaveNoImplicitReply(t *testing.T) {
 	b := &stubBuilder{fn: joinNewMessages}
-	m, f, napcat := newLoopManager(t, testCfg(30*time.Millisecond), b, nil, []string{plainResp("ambiguous")})
+	m, f, napcat := newLoopManager(t, testCfg(30*time.Millisecond), b, nil, []string{plainResp("ambiguous"), toolCallResp("done", "finish", "{}")})
 	m.Enqueue(msg("group", 888, "group-message"))
 	m.Enqueue(msg("private", 222, "private-message"))
 	waitFor(t, time.Second, func() bool { return f.count() > 0 }, "mixed wake")
@@ -134,8 +134,8 @@ func TestAccountMixedSourcesHaveNoImplicitReply(t *testing.T) {
 	if napcat.count() != 0 {
 		t.Fatalf("ambiguous plain text was sent to %d destinations", napcat.count())
 	}
-	if f.count() != 1 {
-		t.Fatalf("account debounce must merge chats, got %d requests", f.count())
+	if f.count() != 2 || b.callCount() != 1 {
+		t.Fatalf("account debounce must merge chats then repair output, got %d requests/%d batches", f.count(), b.callCount())
 	}
 	turn := b.turn(0)
 	if len(turn.NewMessages) != 2 || turn.NewMessages[0].ChatID != 888 ||

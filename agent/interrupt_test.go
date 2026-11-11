@@ -64,7 +64,8 @@ func TestUrgentMessageJoinsSlowTurn(t *testing.T) {
 
 	f, srv := newFakeLLM(t, "")
 	f.mu.Lock()
-	f.script = []string{toolCallResp("query", "get_recent_messages", "{}"), plainResp("新回复")}
+	f.script = []string{toolCallResp("query", "get_recent_messages", "{}"),
+		twoToolCallResp("send", "send_message", `{"chat_type":"group","chat_id":888,"text":"新回复"}`, "done", "finish", "{}")}
 	var once sync.Once
 	cancelSeen := make(chan struct{})
 	released := make(chan struct{})
@@ -101,7 +102,7 @@ func TestUrgentMessageJoinsSlowTurn(t *testing.T) {
 	case <-time.After(70 * time.Millisecond):
 	}
 	once.Do(func() { close(released) })
-	waitFor(t, 3*time.Second, func() bool { return f.count() == 2 }, "urgent 消息应加入下一次请求")
+	waitFor(t, 3*time.Second, func() bool { return f.count() >= 2 }, "urgent 消息应加入下一次请求")
 
 	// 新 turn 的 LLM 请求应包含新消息（且只是 pending 里的内容）
 	last := f.reqs[1].Messages[len(f.reqs[1].Messages)-1]
@@ -116,7 +117,7 @@ func TestUrgentMessageJoinsSlowTurn(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 	if got := napcat.count(); got != 1 {
-		t.Errorf("仅纯文本响应应发送一次, 发送次数 = %d", got)
+		t.Errorf("仅显式发送工具应发送一次, 发送次数 = %d", got)
 	}
 
 	// 两次请求都正常完成，不再有 interrupted 记录。
@@ -124,7 +125,7 @@ func TestUrgentMessageJoinsSlowTurn(t *testing.T) {
 	if len(interruptedRecs) != 0 {
 		t.Fatalf("追加消息不应记录 interrupted=true, got %d", len(interruptedRecs))
 	}
-	if len(normalRecs) != 2 || normalRecs[1].Content != "新回复" {
+	if len(normalRecs) != 2 || len(normalRecs[1].ToolCalls) != 2 || normalRecs[1].ToolCalls[0].Name != "send_message" {
 		t.Errorf("两次请求均应正常记录, got %+v", normalRecs)
 	}
 }
@@ -138,7 +139,10 @@ func TestNonUrgentDuringSlowTurnDoesNotInterrupt(t *testing.T) {
 
 	f, srv := newFakeLLM(t, "")
 	f.mu.Lock()
-	f.script = []string{plainResp("回复一"), plainResp("回复二")}
+	f.script = []string{
+		twoToolCallResp("send1", "send_message", `{"chat_type":"group","chat_id":888,"text":"回复一"}`, "done1", "finish", "{}"),
+		twoToolCallResp("send2", "send_message", `{"chat_type":"group","chat_id":888,"text":"回复二"}`, "done2", "finish", "{}"),
+	}
 	released := make(chan struct{})
 	f.hook = func(idx int, r *http.Request) {
 		if idx == 0 {

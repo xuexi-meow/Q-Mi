@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,31 @@ func TestChatFailoverOnServerError(t *testing.T) {
 	}
 	if slot.name != "good" || tier != "chat" || resp.TextContent() != "ok" {
 		t.Fatalf("unexpected result: slot=%s tier=%s content=%q", slot.name, tier, resp.TextContent())
+	}
+}
+
+// TestChatFailoverOnAccountErrors 账号/凭据/限流类错误换候选就能成功。
+func TestChatFailoverOnAccountErrors(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			bad := newModelServer(t, status, "", nil)
+			good := newModelServer(t, http.StatusOK, okCompletion, nil)
+			cfg := config.AgentConfig{Models: map[string]config.ModelTier{
+				"chat": {Candidates: []config.ModelCandidate{
+					candidate("bad", bad.URL, "m1", "tools"),
+					candidate("good", good.URL, "m2", "tools"),
+				}},
+			}}
+			m := &Manager{pool: buildPool(cfg, nil)}
+			resp, slot, _, err := m.chat(context.Background(), &Turn{},
+				ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, modelNeed{Tools: true}, 2)
+			if err != nil {
+				t.Fatalf("status %d should fail over to next candidate: %v", status, err)
+			}
+			if slot.name != "good" || resp.TextContent() != "ok" {
+				t.Fatalf("status %d picked %s/%q", status, slot.name, resp.TextContent())
+			}
+		})
 	}
 }
 

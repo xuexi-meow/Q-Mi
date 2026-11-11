@@ -72,6 +72,7 @@ type ChatRequest struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Temperature float64       `json:"temperature,omitempty"`
 	Tools       []ToolDef     `json:"tools,omitempty"`
+	ToolChoice  string        `json:"tool_choice,omitempty"`
 }
 
 // responseMessage 响应 choices[].message：兼容 reasoning_content（DeepSeek）

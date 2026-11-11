@@ -122,8 +122,12 @@ func TestSearchMessagesHistoryBoundsAndEvidence(t *testing.T) {
 		{`{"chat_type":"group","chat_id":888,"limit":999}`, 50, 16},
 		{`{"chat_type":"group","chat_id":888,"limit":0}`, 20, 46},
 	} {
-		rows := messageRowsOf(t, runToolOK(t, tools, "search_messages", tc.args))
-		if len(rows) != tc.count || rows[0]["message_id"] != tc.first {
+		out := runToolOK(t, tools, "search_messages", tc.args)
+		rows := messageRowsOf(t, out)
+		// The JSON budget may reduce the selected window after adding source,
+		// mention and quote metadata, but must retain the newest complete rows.
+		if len(rows) == 0 || len(rows) > tc.count || rows[0]["message_id"] != float64(66-len(rows)) ||
+			rows[len(rows)-1]["message_id"] != float64(65) {
 			t.Fatalf("wrong latest bounded window for %s: %v", tc.args, rows)
 		}
 		if rows[0]["user_id"] != float64(7001) {
@@ -134,8 +138,14 @@ func TestSearchMessagesHistoryBoundsAndEvidence(t *testing.T) {
 			t.Fatalf("full timestamp missing from evidence: %#v", rows[0])
 		}
 		parsed, err := time.Parse(time.RFC3339Nano, ts)
-		if err != nil || parsed.Unix() != 1794189600+int64(tc.first) {
+		if err != nil || parsed.Unix() != 1794189600+int64(rows[0]["message_id"].(float64)) {
 			t.Fatalf("invalid timestamp %q: %v", ts, err)
+		}
+		if len(rows) < tc.count {
+			var result messageQueryResult
+			if err := json.Unmarshal([]byte(out), &result); err != nil || !result.Truncated || result.Omitted != tc.count-len(rows) {
+				t.Fatalf("budget trimming must report omitted records: %s", out)
+			}
 		}
 	}
 }

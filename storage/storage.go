@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS stickers (
     "key"            TEXT NOT NULL DEFAULT '',
     url              TEXT NOT NULL DEFAULT '',
     summary          TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    preview_sha      TEXT NOT NULL DEFAULT '',
+    preview_mime     TEXT NOT NULL DEFAULT '',
+    qq_emoji_id      TEXT NOT NULL DEFAULT '',
+    qq_res_id        TEXT NOT NULL DEFAULT '',
+    qq_md5           TEXT NOT NULL DEFAULT '',
+    qq_desc          TEXT NOT NULL DEFAULT '',
     created_at       REAL NOT NULL
 );
 
@@ -117,6 +124,27 @@ func initSchema(db *sql.DB) error {
 	if hasSenderName == 0 {
 		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("迁移 messages.sender_name 列失败: %w", err)
+		}
+	}
+	// 旧库迁移:stickers 表补备注/预览列(幂等,事务内)。
+	stickerColumns := []struct{ name, ddl string }{
+		{"note", "ALTER TABLE stickers ADD COLUMN note TEXT NOT NULL DEFAULT ''"},
+		{"preview_sha", "ALTER TABLE stickers ADD COLUMN preview_sha TEXT NOT NULL DEFAULT ''"},
+		{"preview_mime", "ALTER TABLE stickers ADD COLUMN preview_mime TEXT NOT NULL DEFAULT ''"},
+		{"qq_emoji_id", "ALTER TABLE stickers ADD COLUMN qq_emoji_id TEXT NOT NULL DEFAULT ''"},
+		{"qq_res_id", "ALTER TABLE stickers ADD COLUMN qq_res_id TEXT NOT NULL DEFAULT ''"},
+		{"qq_md5", "ALTER TABLE stickers ADD COLUMN qq_md5 TEXT NOT NULL DEFAULT ''"},
+		{"qq_desc", "ALTER TABLE stickers ADD COLUMN qq_desc TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, col := range stickerColumns {
+		var exists int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info('stickers') WHERE name = ?", col.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := tx.Exec(col.ddl); err != nil {
+				return fmt.Errorf("迁移 stickers.%s 列失败: %w", col.name, err)
+			}
 		}
 	}
 	var definition string

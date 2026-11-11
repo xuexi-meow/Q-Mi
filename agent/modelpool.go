@@ -62,6 +62,7 @@ func needForMessages(msgs []ChatMessage) modelNeed {
 type modelSlot struct {
 	name         string
 	model        string
+	toolChoice   string
 	client       *Client
 	capabilities map[string]bool
 	unrestricted bool // capabilities 未声明 = 不限制
@@ -84,7 +85,7 @@ func newModelSlot(cand config.ModelCandidate, client *Client) *modelSlot {
 		}
 	}
 	return &modelSlot{
-		name: cand.Name, model: cand.Model, client: client,
+		name: cand.Name, model: cand.Model, client: client, toolChoice: cand.ToolChoice,
 		capabilities: caps, unrestricted: len(caps) == 0, cooldown: cooldown,
 	}
 }
@@ -137,7 +138,7 @@ type modelPool struct {
 // 显式配置的档位按 candidates 顺序展开（旧单模型写法归一为单候选）。
 func buildPool(cfg config.AgentConfig, legacy *Client) *modelPool {
 	pool := &modelPool{tiers: map[string][]*modelSlot{}, routes: map[string]string{}}
-	legacySlot := newModelSlot(config.ModelCandidate{Name: "legacy", Model: cfg.Model}, legacy)
+	legacySlot := newModelSlot(config.ModelCandidate{Name: "legacy", Model: cfg.Model, ToolChoice: cfg.ToolChoice}, legacy)
 	pool.tiers[WakeChat] = []*modelSlot{legacySlot}
 
 	for tierName, tier := range cfg.Models {
@@ -149,6 +150,9 @@ func buildPool(cfg config.AgentConfig, legacy *Client) *modelPool {
 		for _, cand := range tier.EffectiveCandidates(tierName) {
 			if !cand.Enabled() {
 				continue
+			}
+			if cand.ToolChoice == "" {
+				cand.ToolChoice = cfg.ToolChoice
 			}
 			client, ok := candidateClient(cand, legacy)
 			if !ok {
@@ -226,15 +230,24 @@ func tierChain(tier string) []string {
 	return []string{tier, WakeChat}
 }
 
-// retryableError 判断失败是否值得换候选：网络错误/超时/429/5xx 可重试；
-// 4xx（模型不存在、参数错误、图片不支持）换候选也无意义，直接失败。
+// retryableError 判断失败是否值得换候选。
+//
+// 换：网络错误/超时、401（key 失效）、402（余额不足）、403（无权限/模型不可用）、
+// 429（限流）、5xx（服务端故障）——这些都是「这个候选自己的问题」，
+// 另一个候选（不同 key/账号/供应商）往往能成功。
+// 不换：400/404/422 这类请求本身的问题（参数、模型名、上下文超限），
+// 换候选只会白烧一次请求。
 func retryableError(err error) bool {
 	if err == nil {
 		return false
 	}
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.Status == 429 || httpErr.Status >= 500
+		switch httpErr.Status {
+		case 401, 402, 403, 429:
+			return true
+		}
+		return httpErr.Status >= 500
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {

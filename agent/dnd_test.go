@@ -93,7 +93,12 @@ func TestChatDNDRecentContextFiltersBeforeLimitButSearchKeepsArchive(t *testing.
 			t.Fatal(err)
 		}
 	}
-	out := runToolOK(t, tools, "get_recent_messages", `{"limit":7}`)
+	// Bootstrap history still spans the account; explicit retrieval is scoped.
+	out, err := queryMessageRows(store, nil, &Turn{SelfID: 999},
+		storage.MessageFilter{Limit: 7, Attention: recentAttention(&Turn{SelfID: 999})})
+	if err != nil {
+		t.Fatal(err)
+	}
 	rows := messageRowsOf(t, out)
 	var ids []int64
 	for _, row := range rows {
@@ -119,7 +124,7 @@ func TestChatDNDRecentContextFiltersBeforeLimitButSearchKeepsArchive(t *testing.
 	}
 	// Rules are consulted on every query, not captured when tools were built.
 	runToolOK(t, tools, "chat_dnd", `{"action":"remove","chat_type":"group","chat_id":888}`)
-	out = runToolOK(t, tools, "get_recent_messages", `{"limit":1}`)
+	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888,"limit":1}`)
 	if !strings.Contains(out, "hidden-flood-131") {
 		t.Fatalf("DND removal did not apply immediately: %s", out)
 	}
@@ -183,7 +188,7 @@ func TestChatDNDRecentContextIgnoresMalformedSegments(t *testing.T) {
 		}
 	}
 	tools := buildTools(&ToolContext{Store: store, Turn: &Turn{SelfID: 999}})
-	rows := messageRowsOf(t, runToolOK(t, tools, "get_recent_messages", `{}`))
+	rows := messageRowsOf(t, runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888}`))
 	if len(rows) != 1 || rows[0]["message_id"] != float64(8) {
 		t.Fatalf("malformed or non-at segments passed as mentions: %#v", rows)
 	}
@@ -212,7 +217,7 @@ func TestChatDNDRecentContextUsesCurrentAdminsAndEventSelfID(t *testing.T) {
 		if i > 0 {
 			app.GetApp().Config.Bot.Admin_Number = []int{556}
 		}
-		rows := messageRowsOf(t, runToolOK(t, tools, "get_recent_messages", `{}`))
+		rows := messageRowsOf(t, runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888}`))
 		var got []int64
 		for _, row := range rows {
 			got = append(got, int64(row["message_id"].(float64)))

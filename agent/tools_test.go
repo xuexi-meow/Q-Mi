@@ -139,9 +139,10 @@ var wantToolNames = []string{
 	// core
 	"send_message", "think", "update_mood", "finish",
 	// memory
-	"get_recent_messages", "search_messages", "view_message_images", "chat_dnd",
+	"get_recent_messages", "search_messages", "get_message", "view_message_images", "chat_dnd",
 	// sticker
-	"save_sticker", "list_stickers", "delete_sticker", "collect_qq_sticker",
+	"save_sticker", "list_stickers", "delete_sticker", "view_sticker", "update_sticker",
+	"send_qq_face", "list_qq_faces", "sync_qq_faces", "collect_qq_sticker",
 	// qzone
 	"post_qzone", "browse_qzone_feeds", "read_qzone_post", "view_qzone_images",
 	"qzone_like", "comment_qzone", "qzone_profile", "delete_qzone",
@@ -162,7 +163,7 @@ var wantToolNames = []string{
 	// computer
 	"read_file", "write_file", "list_dir", "delete_file", "download_file", "run_command", "save_message_media",
 	// browser
-	"browser_navigate", "browser_read_page", "browser_click", "browser_type", "browser_scroll", "browser_screenshot",
+	"browser_navigate", "browser_read_page", "browser_click", "browser_type", "browser_scroll", "browser_screenshot", "browser_save_screenshot",
 	"browser_mouse", "browser_keyboard", "browser_tabs", "browser_dialog",
 	// system
 	"schedule", "cancel_timer", "task_list", "task_get", "task_cancel", "self_events",
@@ -233,7 +234,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 	putRecord(t, s, 2, "recv", "private", 20002, 20002, "私聊B", "第二条", t1.Add(time.Minute).Unix())
 	putRecord(t, s, 3, "recv", "group", 888, 10003, "群友C", "第三条", t1.Add(2*time.Minute).Unix())
 
-	out := runToolOK(t, tools, "get_recent_messages", `{"limit":2}`)
+	out := runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888,"limit":2}`)
 	if strings.ContainsAny(out, "\n\t") || strings.Contains(out, ": ") {
 		t.Errorf("输出应为紧凑 JSON: %q", out)
 	}
@@ -241,7 +242,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("limit=2 应返回 2 条, got %d: %s", len(rows), out)
 	}
-	// 正序：最新的第 3 条在前? 不——正序 = 旧→新，取最近 2 条即第 2、3 条
+	// Same-chat rows are returned oldest first; private messages stay separate.
 	want := []struct {
 		id     float64
 		chat   string
@@ -249,7 +250,7 @@ func TestGetRecentMessagesTool(t *testing.T) {
 		name   string
 		text   string
 	}{
-		{2, "private", 20002, "私聊B", "第二条"},
+		{1, "group", 888, "群友A", "第一条"},
 		{3, "group", 888, "群友C", "第三条"},
 	}
 	for i, w := range want {
@@ -260,13 +261,13 @@ func TestGetRecentMessagesTool(t *testing.T) {
 				i, rows[i], w.id, w.chat, w.chatID, w.name, w.text)
 		}
 	}
-	wantTime := t1.Add(time.Minute).Format("01-02 15:04")
+	wantTime := t1.Format("01-02 15:04")
 	if rows[0]["time"] != wantTime {
 		t.Errorf("rows[0].time = %v, want %q", rows[0]["time"], wantTime)
 	}
 
 	// chat_type 过滤
-	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","limit":10}`)
+	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888,"limit":10}`)
 	rows = messageRowsOf(t, out)
 	if len(rows) != 2 {
 		t.Fatalf("group 过滤应返回 2 条, got %d: %s", len(rows), out)
@@ -277,11 +278,11 @@ func TestGetRecentMessagesTool(t *testing.T) {
 		}
 	}
 
-	// 超上限 clamp 到 100（3 条全出，不报错）
-	out = runToolOK(t, tools, "get_recent_messages", `{"limit":999}`)
+	// Clamp without mixing in other conversations.
+	out = runToolOK(t, tools, "get_recent_messages", `{"chat_type":"group","chat_id":888,"limit":999}`)
 	rows = messageRowsOf(t, out)
-	if len(rows) != 3 {
-		t.Errorf("limit=999 应 clamp 并返回全部 3 条, got %d", len(rows))
+	if len(rows) != 2 {
+		t.Errorf("limit=999 应 clamp 并返回该群全部 2 条, got %d", len(rows))
 	}
 }
 
@@ -1219,18 +1220,38 @@ func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
 	}
 }
 
-// TestToolDefsMinimalSchema wire 层 schema 全量极简：parameters 恒为
-// {"type":"object"}，参数细节由 system 工具文档承载。
-func TestToolDefsMinimalSchema(t *testing.T) {
+func TestToolDefsExposeRealParameters(t *testing.T) {
 	tools, _, _ := testToolSet(t, nil)
 	defs := toolDefs(tools)
 	if len(defs) == 0 {
 		t.Fatal("无工具定义")
 	}
-	for _, d := range defs {
+	for i, d := range defs {
 		p, ok := d.Function.Parameters.(map[string]any)
-		if !ok || len(p) != 1 || p["type"] != "object" {
-			t.Errorf("%s 的 wire schema 应为 {\"type\":\"object\"}, got %#v", d.Function.Name, d.Function.Parameters)
+		if !ok || p["type"] != "object" || p["properties"] == nil {
+			t.Errorf("%s missing parameter properties: %#v", d.Function.Name, p)
 		}
+		if !tools[i].Asyncable && !reflect.DeepEqual(p, tools[i].Parameters) {
+			t.Errorf("%s wire schema differs from declared parameters", d.Function.Name)
+		}
+		if d.Function.Name == "send_message" {
+			props, _ := p["properties"].(map[string]any)
+			if props["chat_id"] == nil || props["chat_type"] == nil || props["text"] == nil {
+				t.Fatalf("send_message missing destination/text schema: %#v", p)
+			}
+		}
+	}
+}
+
+func TestToolDefsAsyncSchemaDoesNotMutateDefinition(t *testing.T) {
+	params := objectParams(map[string]any{"url": strProp("URL")}, []string{"url"})
+	defs := toolDefs([]Tool{{Name: "slow", Parameters: params, Asyncable: true}})
+	wire := defs[0].Function.Parameters.(map[string]any)
+	props, _ := wire["properties"].(map[string]any)
+	if props["_async"] == nil || props["url"] == nil {
+		t.Fatalf("missing async or real parameters: %#v", wire)
+	}
+	if params["properties"].(map[string]any)["_async"] != nil {
+		t.Fatal("wire generation mutated shared tool definition")
 	}
 }

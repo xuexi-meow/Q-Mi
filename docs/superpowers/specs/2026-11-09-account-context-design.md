@@ -24,7 +24,7 @@ Append tool-call results, including finish,
 in protocol order. Bootstrap QQ history only once; omit bootstrap records that
 are already represented by incoming messages.
 
-Add agent.context configuration with max_input_tokens (default 48000),
+Add agent.context configuration with max_input_tokens (default 64000),
 review_after_wakes (default 8), keep_recent_messages (default 12), and
 summary_tokens (default 1024). Zero uses defaults; negative or inconsistent
 values fail configuration validation. Input sizing is a documented conservative
@@ -35,7 +35,9 @@ Review before requests. Deduct fixed system/schema/latest-state overhead first, 
 near 75% of the remaining working budget, or after the wake review threshold when
 over half that remaining budget. Small conversations need no summary. The bundled
 prompts/tools measured roughly 30000 tokens with the conservative estimator;
-48000 leaves working room without pretending to be a provider context limit.
+64000 leaves working room for the bundled prompts and tools without pretending to be a
+provider context limit. It was raised from 48000 once the bundled prompt stopped
+fitting the old 75% guard.
 Compact only complete old message/tool groups already read by the model.
 Only the working record is summarized: persona, guide, tool documentation,
 system/developer messages and tool schemas are excluded from summary input.

@@ -120,6 +120,26 @@ type FetchCustomFaceDetail struct {
 
 func (r *FetchCustomFaceDetail) Path() string { return "/fetch_custom_face_detail" }
 
+// CustomFaceDetail 一条账号收藏表情的详情（SnowLuma 扩展）。
+type CustomFaceDetail struct {
+	EmojiID string `json:"emoji_id"`
+	ResID   string `json:"resId"`
+	URL     string `json:"url"`
+	MD5     string `json:"md5"`
+	Desc    string `json:"desc"`
+}
+
+// SendCustomFace 发送账号收藏表情 POST /send_custom_face（SnowLuma 扩展）。
+// 该接口只能单独发一条，不能塞进 message 数组。
+type SendCustomFace struct {
+	EmojiID string `json:"emoji_id"`
+	GroupID int64  `json:"group_id,omitempty"`
+	UserID  int64  `json:"user_id,omitempty"`
+	ReplyTo int64  `json:"reply_to,omitempty"`
+}
+
+func (r *SendCustomFace) Path() string { return "/send_custom_face" }
+
 // AddCustomFace 添加自定义表情 POST /add_custom_face
 type AddCustomFace struct {
 	File       string `json:"file"`

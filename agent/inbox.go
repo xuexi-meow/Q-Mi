@@ -37,7 +37,8 @@ func (m *Manager) Enqueue(msg IncomingMessage) {
 	s.pending = append(s.pending, TurnMessage{
 		MessageID: msg.MessageID, Wake: msg.Wake, ChatType: msg.ChatType, ChatID: msg.ChatID,
 		SenderID: msg.SenderID, SenderName: msg.SenderName, Text: msg.Text,
-		Images: msg.Images, Time: msg.Time, Mentioned: msg.Mentioned,
+		Segments: append([]byte(nil), msg.Segments...),
+		Images:   msg.Images, Time: msg.Time, Mentioned: msg.Mentioned,
 	})
 	// Start once per batch so a busy chat cannot postpone a wake indefinitely.
 	if s.timer == nil {

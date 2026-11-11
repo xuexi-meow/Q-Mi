@@ -89,7 +89,7 @@ func (r *ToolRegistry) PromptDocs() string {
 	for _, m := range r.modules {
 		fmt.Fprintf(&b, "- %s：%s（%s）\n", m.Name(), m.OneLiner(), strings.Join(toolNames(m.Tools(&ToolContext{})), " "))
 	}
-	b.WriteString("\n调用参数经 function calling 传递；每个工具的参数明细/示例见下文。\n\n")
+	b.WriteString("\n调用参数通过 API tool_calls 传递，字段/类型/必填项以 tools 中的参数 schema 为准；下文只补充行为规则和示例，不重复参数表。\n\n")
 	for _, m := range r.modules {
 		b.WriteString("## " + m.Name() + "\n\n")
 		if m.OneLiner() != "" {
@@ -102,9 +102,6 @@ func (r *ToolRegistry) PromptDocs() string {
 			b.WriteString("### " + t.Name + "\n\n")
 			if t.Description != "" {
 				b.WriteString(t.Description + "\n\n")
-			}
-			if ps := renderParams(t.Parameters); ps != "" {
-				b.WriteString(ps + "\n")
 			}
 			if t.Usage != "" {
 				b.WriteString(t.Usage + "\n\n")
@@ -176,6 +173,7 @@ func stickerIntro() string {
 		}
 		b.WriteString(row + "\n")
 	}
+	b.WriteString("\n收藏：save_sticker 可带 note 备注并默认加入 QQ 收藏表情；不确定长相用 view_sticker 看预览；补名字/备注用 update_sticker；QQ 收藏表情用 send_qq_face 单独发（不能和文字拼一条）。")
 	b.WriteString("\n礼仪：表情是调味料，一条消息里一两个就够；别连发表情刷屏，骰子/猜拳同理。")
 	return b.String()
 }
@@ -200,10 +198,10 @@ func enabledModules(cfg config.AgentConfig) []ToolModule {
 func defaultModules() []ToolModule {
 	return []ToolModule{
 		module{name: "core", oneliner: "发消息、记思考笔记、更新情绪、结束思考",
-			intro: "发言用 send_message，通常合成一条，正文不带上下文前缀或内部标签；普通文本输出也可能被兼容路径直接发送。不想发言就调用 finish，别输出沉默说明。finish 是唯一的轮终止工具。",
+			intro: "只用 API tool_calls 行动，arguments 必须为 JSON 对象。发言用 send_message，通常合成一条，正文只写给目标会话看的话，不带分析、草稿、输入 JSON 或内部标签；普通 content 不外发。不想发言就调用 finish({})，别输出沉默说明。finish 是唯一的轮终止工具。",
 			tools: coreTools},
 		module{name: "memory", oneliner: "查聊天记录、搜历史、看消息图片、管理会话勿扰",
-			intro: "旧话、约定或引用不清时主动查证，不每轮机械查询。get_recent_messages 看近期（遵守勿扰）；search_messages 按会话、发送者、时间和可选关键词查存档。查图先理解语境，不默认复述画面。",
+			intro: "缺背景且打算参与时先查原会话，不每轮机械查询。get_recent_messages 补上文（明确 chat_type+chat_id）；get_message 按原会话和 message_id 核对引用；search_messages 查旧约定。缺失不代表没发生，更不代表引用自己。查图先理解语境，不默认复述画面。",
 			tools: memoryTools},
 		module{name: "sticker", oneliner: "表情收藏与 QQ 账号级收藏表情",
 			intro: stickerIntro(),

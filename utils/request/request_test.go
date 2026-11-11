@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	apimsg "Q-Mi/api/message"
@@ -101,6 +102,17 @@ func TestRetcodeError(t *testing.T) {
 	_, err := DeleteMsg(context.Background(), 1)
 	if err == nil {
 		t.Fatal("retcode=1400 应返回错误")
+	}
+}
+
+func TestRetcodeErrorPreservesMessageAndAction(t *testing.T) {
+	addr, _, _, _ := startMockNapCat(t,
+		`{"status":"failed","retcode":1400,"data":null,"message":"missing parameter message_id","wording":""}`)
+	initTestClient(t, addr, "")
+	_, err := DeleteMsg(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "missing parameter message_id") ||
+		!strings.Contains(err.Error(), "/delete_msg") || !strings.Contains(err.Error(), "1400") {
+		t.Fatalf("model needs the action and concrete upstream error, got %v", err)
 	}
 }
 

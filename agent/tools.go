@@ -39,9 +39,7 @@ type Tool struct {
 	Run       func(args json.RawMessage) (string, error)
 }
 
-// toolDefs 把工具集转成 OpenAI tools 请求参数。schema 全量极简（{"type":"object"}）：
-// 参数细节由 system 工具文档承载（PromptDocs 从 Tool.Parameters 渲染），
-// 详见 docs/specs/2026-11-08-tool-registry-design.md §7。
+// toolDefs sends the same parameter contract used by the tool documentation.
 func toolDefs(tools []Tool) []ToolDef {
 	defs := make([]ToolDef, 0, len(tools))
 	for _, t := range tools {
@@ -50,11 +48,35 @@ func toolDefs(tools []Tool) []ToolDef {
 			Function: ToolSchema{
 				Name:        t.Name,
 				Description: t.Description,
-				Parameters:  map[string]any{"type": "object"},
+				Parameters:  toolParameters(t),
 			},
 		})
 	}
 	return defs
+}
+
+func toolParameters(t Tool) any {
+	if !t.Asyncable {
+		if t.Parameters == nil {
+			return objectParams(nil, nil)
+		}
+		return t.Parameters
+	}
+	// Copy the schema and properties; definitions are shared between requests.
+	base, _ := t.Parameters.(map[string]any)
+	schema := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		schema[key] = value
+	}
+	props := map[string]any{}
+	if existing, ok := base["properties"].(map[string]any); ok {
+		for key, value := range existing {
+			props[key] = value
+		}
+	}
+	props["_async"] = boolProp("可选，true 表示后台执行，完成后自动回填结果")
+	schema["type"], schema["properties"] = "object", props
+	return schema
 }
 
 // objectParams 生成 {"type":"object","properties":...} 形态的参数 schema。
@@ -65,8 +87,9 @@ func objectParams(properties map[string]any, required []string) map[string]any {
 		properties = map[string]any{}
 	}
 	schema := map[string]any{
-		"type":       "object",
-		"properties": properties,
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": false,
 	}
 	if len(required) > 0 {
 		schema["required"] = required
@@ -94,7 +117,7 @@ func memoryTools(ctx *ToolContext) []Tool {
 	return []Tool{
 		{
 			Name:        "get_recent_messages",
-			Description: "查询最近聊天，可按会话取最近 N 条，旧到新返回限长 JSON。遵循 chat_dnd 勿扰；完整存档用 search_messages。",
+			Description: "查询指定会话最近 N 条，旧到新返回限长 JSON；省略会话时仅使用本轮单一会话，混合来源必须明确指定。遵循 chat_dnd 勿扰；完整存档用 search_messages。",
 			Parameters: objectParams(map[string]any{
 				"chat_type": strProp("可选，按会话类型过滤：private / group"),
 				"chat_id":   intProp("可选，按会话 ID 过滤：群号；私聊 = 对方 QQ"),
@@ -109,6 +132,12 @@ func memoryTools(ctx *ToolContext) []Tool {
 				}
 				if err := decodeArgs(args, &p); err != nil {
 					return "", err
+				}
+				if p.ChatType == "" && p.ChatID == 0 && turn != nil {
+					p.ChatType, p.ChatID = turn.ChatType, turn.ChatID
+				}
+				if (p.ChatType != "group" && p.ChatType != "private") || p.ChatID <= 0 {
+					return "", fmt.Errorf("需要一起指定 chat_type(group/private) 和正数 chat_id；混合来源没有默认会话，请按相关消息来源查询")
 				}
 				limit := p.Limit
 				if limit <= 0 {
@@ -126,6 +155,7 @@ func memoryTools(ctx *ToolContext) []Tool {
 			},
 		},
 		searchMessagesTool(ctx),
+		getMessageTool(ctx),
 		{
 			Name:        "view_message_images",
 			Description: "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。查询工具的结果会自动附带最新几条消息的图片，单条消息的图或自动附带跳过的图用这个工具补看。",
@@ -300,6 +330,22 @@ func coreTools(ctx *ToolContext) []Tool {
 					}
 					segs = []*apimsg.Message{apimsg.Text(p.Text)}
 				case len(p.Segments) > 0:
+					if err := validateReplyScope(store, p.ChatType, p.ChatID, p.Segments); err != nil {
+						return "", err
+					}
+					// 已加入 QQ 收藏的表情只能单独一条发（协议端限制），
+					// 单段 sticker 直接走 send_custom_face，保住表情样式。
+					if len(p.Segments) == 1 && p.Segments[0].Type == "sticker" {
+						if st := stickerBySegment(store, p.Segments[0].Data); st != nil && st.QQEmojiID != "" {
+							data, err := sendQQFace(p.ChatType, p.ChatID, st.QQEmojiID, 0)
+							if err != nil {
+								return "", err
+							}
+							return marshalCompact(map[string]any{
+								"sent": true, "as": "qq_custom_face", "sticker_id": st.ID, "result": data,
+							})
+						}
+					}
 					var err error
 					if segs, err = buildSegments(store, ctx.Workspace, p.Segments); err != nil {
 						return "", err
@@ -366,18 +412,22 @@ func stickerTools(ctx *ToolContext) []Tool {
 	return []Tool{
 		{
 			Name:        "save_sticker",
-			Description: "把一条消息里的表情/图片收藏起来（自带表情 face、商城表情 mface、图片 image），之后可用 send_message 的 sticker 段随时发出去。seg_index 是该消息里第几个消息段（从 0 开始，默认 0）。",
+			Description: "把一条消息里的表情/图片收藏起来（face/mface/image），并默认顺手加入 QQ 账号收藏表情（协议端 SnowLuma 扩展），之后可用 send_message 的 sticker 段或 send_qq_face 发出。seg_index 是该消息里第几个消息段（从 0 开始，默认 0）。",
 			Parameters: objectParams(map[string]any{
 				"message_id": intProp("消息 ID（从聊天记录或上下文里拿）"),
 				"seg_index":  intProp("可选，消息段下标（从 0 开始），默认 0"),
+				"note":       strProp("可选备注：给这个表情起的名字或使用场景，会同步到 QQ 收藏表情的备注"),
+				"qq":         boolProp("是否加入 QQ 账号收藏表情，默认 true；填 false 只存本地"),
 			}, []string{"message_id"}),
 			Run: func(args json.RawMessage) (string, error) {
 				if store == nil {
 					return "", errors.New("记忆库未启用，无法收藏表情")
 				}
 				var p struct {
-					MessageID int64 `json:"message_id"`
-					SegIndex  int   `json:"seg_index"`
+					MessageID int64  `json:"message_id"`
+					SegIndex  int    `json:"seg_index"`
+					Note      string `json:"note"`
+					QQ        *bool  `json:"qq"`
 				}
 				if err := decodeArgs(args, &p); err != nil {
 					return "", err
@@ -414,7 +464,7 @@ func stickerTools(ctx *ToolContext) []Tool {
 						return "", fmt.Errorf("解析消息段 data 失败: %w", err)
 					}
 				}
-				st := storage.Sticker{Kind: seg.Type}
+				st := storage.Sticker{Kind: seg.Type, Note: strings.TrimSpace(p.Note)}
 				switch seg.Type {
 				case "face":
 					st.FaceID, err = segFlex(data, "id", p.SegIndex)
@@ -444,12 +494,68 @@ func stickerTools(ctx *ToolContext) []Tool {
 				if err != nil {
 					return "", err
 				}
-				return marshalCompact(map[string]any{"sticker_id": id, "kind": st.Kind, "summary": st.Summary})
+				// 预览是尽力而为：下载失败不影响收藏，之后 view_sticker 会再试。
+				segURL := anyString(data["url"])
+				previewSHA, previewMime, previewURL := cacheStickerPreview(ctx,
+					stickerPreviewCandidates(st.Kind, segURL, st.EmojiID))
+				if previewSHA != "" {
+					if err := store.UpdateSticker(id, storage.StickerUpdate{
+						PreviewSHA: &previewSHA, PreviewMime: &previewMime,
+					}); err == nil {
+						st.PreviewSHA, st.PreviewMime = previewSHA, previewMime
+					}
+				}
+
+				// 顺手加入 QQ 账号收藏表情：成功后有 emoji_id，可当真正的收藏表情发。
+				addToQQ := p.QQ == nil || *p.QQ
+				qqSaved, qqEmojiID, qqErrMsg := false, "", ""
+				if addToQQ {
+					switch {
+					case st.Kind == "face":
+						qqErrMsg = "自带小黄脸无需加入收藏"
+					case previewURL == "":
+						qqErrMsg = "没有可交给协议端下载的图片地址"
+					default:
+						detail, qqErr := qqFaceAdd(previewURL)
+						if qqErr != nil {
+							qqErrMsg = qqErr.Error()
+						} else {
+							qqSaved, qqEmojiID = true, detail.EmojiID
+							upd := storage.StickerUpdate{QQEmojiID: &detail.EmojiID}
+							if detail.ResID != "" {
+								upd.QQResID = &detail.ResID
+							}
+							if detail.MD5 != "" {
+								upd.QQMD5 = &detail.MD5
+							}
+							desc := qqFaceDescOr(st.Note, st.Summary)
+							if desc != "" {
+								if err := qqFaceSetDesc(detail, desc); err == nil {
+									upd.QQDesc = &desc
+								}
+							}
+							if err := store.UpdateSticker(id, upd); err != nil {
+								qqErrMsg = "本地记录 QQ 收藏信息失败: " + err.Error()
+							}
+						}
+					}
+				}
+
+				out := map[string]any{
+					"sticker_id": id, "kind": st.Kind, "summary": st.Summary, "note": st.Note,
+					"has_preview": previewSHA != "", "preview_mime": previewMime,
+					"qq_saved": qqSaved, "qq_emoji_id": qqEmojiID,
+					"hint": "QQ 收藏表情用 send_qq_face 单独发；本地预览用 view_sticker",
+				}
+				if qqErrMsg != "" {
+					out["qq_error"] = qqErrMsg
+				}
+				return marshalCompact(out)
 			},
 		},
 		{
 			Name:        "list_stickers",
-			Description: "列出你收藏的全部表情（id/kind/summary），用于选择 sticker 段要发的 id。",
+			Description: "列出收藏的表情：id/kind/summary/note/has_preview。发的时候用 sticker 段的 id；不确定长相用 view_sticker 看预览，备注用 update_sticker 补。",
 			Parameters:  objectParams(nil, nil),
 			Run: func(json.RawMessage) (string, error) {
 				if store == nil {
@@ -461,7 +567,11 @@ func stickerTools(ctx *ToolContext) []Tool {
 				}
 				rows := make([]map[string]any, 0, len(list))
 				for _, st := range list {
-					rows = append(rows, map[string]any{"id": st.ID, "kind": st.Kind, "summary": st.Summary})
+					rows = append(rows, map[string]any{
+						"id": st.ID, "kind": st.Kind, "summary": st.Summary, "note": st.Note,
+						"display": stickerDisplayName(st), "has_preview": st.PreviewSHA != "",
+						"qq_face": st.QQEmojiID != "",
+					})
 				}
 				return marshalCompact(rows)
 			},
@@ -496,6 +606,303 @@ func stickerTools(ctx *ToolContext) []Tool {
 					return "", err
 				}
 				return marshalCompact(map[string]any{"deleted": true})
+			},
+		},
+		{
+			Name:        "view_sticker",
+			Description: "查看收藏表情的预览图（附图到下一轮），一次 1-4 个。确认长相后再决定发哪个；没有预览的会列在 missing 里。",
+			Parameters: objectParams(map[string]any{
+				"sticker_ids": map[string]any{
+					"type":        "array",
+					"description": "要查看的收藏 id 列表（1-4 个）",
+					"items":       map[string]any{"type": "integer"},
+				},
+				"sticker_id": intProp("单个收藏 id（与 sticker_ids 二选一）"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法查看收藏")
+				}
+				if ctx.Turn == nil {
+					return "", errors.New("无会话上下文，预览图无处附加")
+				}
+				var p struct {
+					StickerIDs []int64 `json:"sticker_ids"`
+					StickerID  int64   `json:"sticker_id"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				ids := make([]int64, 0, len(p.StickerIDs)+1)
+				if p.StickerID != 0 {
+					ids = append(ids, p.StickerID)
+				}
+				ids = append(ids, p.StickerIDs...)
+				if len(ids) == 0 {
+					return "", errors.New("需要 sticker_id 或 sticker_ids")
+				}
+				if len(ids) > 4 {
+					ids = ids[:4]
+				}
+				viewed := make([]map[string]any, 0, len(ids))
+				missing := make([]map[string]any, 0)
+				seen := make(map[int64]bool, len(ids))
+				for _, id := range ids {
+					if id == 0 || seen[id] {
+						continue
+					}
+					seen[id] = true
+					st, err := store.GetSticker(id)
+					if err != nil {
+						return "", err
+					}
+					if st == nil {
+						missing = append(missing, map[string]any{"id": id, "reason": "不存在"})
+						continue
+					}
+					du := ensureStickerPreview(ctx, st)
+					if du == "" {
+						reason := "无预览（自带表情只有名称，或图片下载失败）"
+						missing = append(missing, map[string]any{"id": id, "reason": reason})
+						continue
+					}
+					ctx.Turn.AddPendingImage(du)
+					viewed = append(viewed, map[string]any{
+						"id": id, "kind": st.Kind, "name": st.Summary, "note": st.Note,
+					})
+				}
+				return marshalCompact(map[string]any{
+					"attached": len(viewed), "viewed": viewed, "missing": missing,
+				})
+			},
+		},
+		{
+			Name:        "update_sticker",
+			Description: "给收藏表情补备注或改名：note 是你自己的叫法/使用场景；name 会覆盖展示名（商城表情默认 summary 可能只是「动画表情」）。两个都不传则报错。",
+			Parameters: objectParams(map[string]any{
+				"sticker_id": intProp("收藏 id"),
+				"note":       strProp("备注（叫法、风格、适合什么场景），传空串表示清空"),
+				"name":       strProp("覆盖展示名（同时作为发送时的 summary），传空串表示清空"),
+				"qq":         boolProp("可选：把这张老收藏补录进 QQ 收藏表情（已加入则忽略）"),
+			}, []string{"sticker_id"}),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法修改收藏")
+				}
+				var p struct {
+					StickerID int64   `json:"sticker_id"`
+					Note      *string `json:"note"`
+					Name      *string `json:"name"`
+					QQ        *bool   `json:"qq"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.StickerID == 0 {
+					return "", errors.New("sticker_id 不能为 0")
+				}
+				if p.Note == nil && p.Name == nil && (p.QQ == nil || !*p.QQ) {
+					return "", errors.New("note / name / qq 至少要给一个")
+				}
+				update := storage.StickerUpdate{Note: p.Note, Summary: p.Name}
+				if err := store.UpdateSticker(p.StickerID, update); err != nil {
+					return "", err
+				}
+				st, err := store.GetSticker(p.StickerID)
+				if err != nil {
+					return "", err
+				}
+				if st == nil {
+					return "", fmt.Errorf("没有找到表情 %d", p.StickerID)
+				}
+				out := map[string]any{
+					"sticker_id": st.ID, "kind": st.Kind, "name": st.Summary,
+					"note": st.Note, "display": stickerDisplayName(*st),
+				}
+				if p.QQ != nil && *p.QQ && st.QQEmojiID == "" {
+					if st.URL == "" {
+						out["qq_error"] = "这张收藏没有图片地址，无法补录进 QQ 收藏"
+					} else if detail, qqErr := qqFaceAdd(st.URL); qqErr != nil {
+						out["qq_error"] = qqErr.Error()
+					} else {
+						upd := storage.StickerUpdate{QQEmojiID: &detail.EmojiID}
+						if detail.ResID != "" {
+							upd.QQResID = &detail.ResID
+						}
+						if detail.MD5 != "" {
+							upd.QQMD5 = &detail.MD5
+						}
+						desc := qqFaceDescOr(st.Note, st.Summary)
+						if desc != "" {
+							if err := qqFaceSetDesc(detail, desc); err == nil {
+								upd.QQDesc = &desc
+							}
+						}
+						if err := store.UpdateSticker(st.ID, upd); err != nil {
+							out["qq_error"] = "记录 QQ 收藏信息失败: " + err.Error()
+						} else {
+							st.QQEmojiID, st.QQResID, st.QQMD5 = detail.EmojiID, detail.ResID, detail.MD5
+							if upd.QQDesc != nil {
+								st.QQDesc = *upd.QQDesc
+							}
+							out["qq_saved"] = true
+							out["qq_emoji_id"] = detail.EmojiID
+						}
+					}
+				}
+				if st.QQEmojiID != "" {
+					detail := &api.CustomFaceDetail{
+						EmojiID: st.QQEmojiID, ResID: st.QQResID, MD5: st.QQMD5, Desc: st.QQDesc,
+					}
+					if desc := qqFaceDescOr(st.Note, st.Summary); desc != "" {
+						if err := qqFaceSetDesc(detail, desc); err == nil {
+							if err := store.UpdateSticker(st.ID, storage.StickerUpdate{QQDesc: &desc}); err == nil {
+								st.QQDesc = desc
+								out["qq_desc_synced"] = true
+							}
+						}
+					}
+				}
+				return marshalCompact(out)
+			},
+		},
+		{
+			Name:        "send_qq_face",
+			Description: "把 QQ 账号收藏表情以真正的表情样式发给指定会话（协议端 SnowLuma 扩展）。表情只能单独一条：需要配文字时用 text 参数先发文字，再发这条表情。",
+			Parameters: objectParams(map[string]any{
+				"chat_type": strProp("会话类型：private / group"),
+				"chat_id":   intProp("会话 ID：群号；私聊 = 对方 QQ"),
+				"emoji_id":  strProp("收藏表情的 emoji_id 或 32 位 md5（list_qq_faces / list_stickers 里拿）"),
+				"text":      strProp("可选：先发一条文字，再发表情"),
+				"reply_to":  intProp("可选：要引用的消息 ID"),
+			}, []string{"chat_type", "chat_id", "emoji_id"}),
+			Usage: "示例——先说话再甩表情：`{\"chat_type\":\"group\",\"chat_id\":928952016,\"text\":\"笑死\",\"emoji_id\":\"abc123...\"}`。协议端不支持扩展接口时返回错误，可退回图片发送；emoji_id 为空直接报错。",
+			Run: func(args json.RawMessage) (string, error) {
+				var p struct {
+					ChatType string `json:"chat_type"`
+					ChatID   int64  `json:"chat_id"`
+					EmojiID  string `json:"emoji_id"`
+					Text     string `json:"text"`
+					ReplyTo  int64  `json:"reply_to"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				if p.ChatType != "private" && p.ChatType != "group" {
+					return "", fmt.Errorf("chat_type 必须是 private 或 group, got %q", p.ChatType)
+				}
+				if p.ChatID == 0 {
+					return "", errors.New("chat_id 不能为 0")
+				}
+				out := map[string]any{"sent": true, "as": "qq_custom_face", "emoji_id": p.EmojiID}
+				if text := strings.TrimSpace(p.Text); text != "" {
+					if _, err := sendSegments(p.ChatType, p.ChatID, []*apimsg.Message{apimsg.Text(text)}); err != nil {
+						return "", fmt.Errorf("先发文字失败: %w", err)
+					}
+					out["text_sent"] = true
+				}
+				data, err := sendQQFace(p.ChatType, p.ChatID, p.EmojiID, p.ReplyTo)
+				if err != nil {
+					return "", fmt.Errorf("发送收藏表情失败（协议端需支持 send_custom_face）: %w", err)
+				}
+				out["result"] = data
+				return marshalCompact(out)
+			},
+		},
+		{
+			Name:        "list_qq_faces",
+			Description: "列出 QQ 账号收藏表情（协议端 SnowLuma 扩展）：emoji_id / md5 / 备注。按备注挑好后用 send_qq_face 发；要看图片先用 sync_qq_faces 导入本地再 view_sticker。",
+			Parameters: objectParams(map[string]any{
+				"query": strProp("可选：按备注或 emoji_id 过滤"),
+				"count": intProp("可选：拉取条数，默认 48"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				var p struct {
+					Query string `json:"query"`
+					Count int    `json:"count"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				list, err := qqFaceList(p.Count)
+				if err != nil {
+					return "", fmt.Errorf("获取 QQ 收藏表情失败（协议端需支持 fetch_custom_face_detail）: %w", err)
+				}
+				q := strings.ToLower(strings.TrimSpace(p.Query))
+				rows := make([]map[string]any, 0, len(list))
+				for _, d := range list {
+					if q != "" && !strings.Contains(strings.ToLower(d.Desc), q) &&
+						!strings.Contains(strings.ToLower(d.EmojiID), q) &&
+						!strings.Contains(strings.ToLower(d.MD5), q) {
+						continue
+					}
+					rows = append(rows, map[string]any{
+						"emoji_id": d.EmojiID, "md5": d.MD5, "desc": d.Desc,
+						"has_url": d.URL != "",
+					})
+				}
+				return marshalCompact(map[string]any{"total": len(rows), "faces": rows})
+			},
+		},
+		{
+			Name:        "sync_qq_faces",
+			Description: "把 QQ 账号收藏表情导入本地收藏（带备注和预览），之后可用 list_stickers/view_sticker 统一管理、用 sticker 段或 send_qq_face 发。已导入的按 emoji_id 跳过。",
+			Parameters: objectParams(map[string]any{
+				"count": intProp("可选：拉取条数，默认 48"),
+			}, nil),
+			Run: func(args json.RawMessage) (string, error) {
+				if store == nil {
+					return "", errors.New("记忆库未启用，无法导入收藏")
+				}
+				var p struct {
+					Count int `json:"count"`
+				}
+				if err := decodeArgs(args, &p); err != nil {
+					return "", err
+				}
+				list, err := qqFaceList(p.Count)
+				if err != nil {
+					return "", fmt.Errorf("获取 QQ 收藏表情失败（协议端需支持 fetch_custom_face_detail）: %w", err)
+				}
+				existing, err := store.ListStickers()
+				if err != nil {
+					return "", err
+				}
+				known := make(map[string]bool, len(existing))
+				for _, st := range existing {
+					if st.QQEmojiID != "" {
+						known[strings.ToLower(st.QQEmojiID)] = true
+					}
+				}
+				imported, skipped := 0, 0
+				for _, d := range list {
+					key := strings.ToLower(strings.TrimSpace(d.EmojiID))
+					if key == "" || known[key] {
+						skipped++
+						continue
+					}
+					id, err := store.AddSticker(storage.Sticker{
+						Kind: "image", URL: d.URL, Summary: d.Desc, Note: d.Desc,
+						QQEmojiID: d.EmojiID, QQResID: d.ResID, QQMD5: d.MD5, QQDesc: d.Desc,
+					})
+					if err != nil {
+						skipped++
+						continue
+					}
+					known[key] = true
+					imported++
+					if ctx.Images != nil && d.URL != "" {
+						if sha, mime, _ := cacheStickerPreview(ctx, []string{d.URL}); sha != "" {
+							_ = store.UpdateSticker(id, storage.StickerUpdate{
+								PreviewSHA: &sha, PreviewMime: &mime,
+							})
+						}
+					}
+				}
+				return marshalCompact(map[string]any{
+					"total": len(list), "imported": imported, "skipped": skipped,
+					"hint": "导入后 list_stickers 可见，view_sticker 看预览",
+				})
 			},
 		},
 		{
@@ -948,6 +1355,22 @@ func anyString(v any) string {
 	return ""
 }
 
+// stickerBySegment 从 sticker 段参数解析收藏 id 并取记录；失败返回 nil。
+func stickerBySegment(store *storage.Store, data map[string]any) *storage.Sticker {
+	if store == nil {
+		return nil
+	}
+	id, err := segID(data, "id", 1)
+	if err != nil || id == 0 {
+		return nil
+	}
+	st, err := store.GetSticker(id)
+	if err != nil {
+		return nil
+	}
+	return st
+}
+
 // stickerSegment 把收藏的表情转成可发送的消息段：face→face 段、
 // mface→mface 段（key 必需，缺失报错）、image→image 段（file=url）。
 func stickerSegment(store *storage.Store, id int64, at int) (*apimsg.Message, error) {
@@ -971,6 +1394,9 @@ func stickerSegment(store *storage.Store, id int64, at int) (*apimsg.Message, er
 		}
 		return apimsg.MFace(st.EmojiID, st.EmojiPackageID, &st.Key, summary), nil
 	case "image":
+		if st.QQEmojiID != "" {
+			return nil, fmt.Errorf("第 %d 段: 表情 %d 已加入 QQ 收藏，只能单独一条发；请单独发这个 sticker 段或用 send_qq_face", at, id)
+		}
 		return apimsg.Image(st.URL, summary, nil), nil
 	default:
 		return nil, fmt.Errorf("第 %d 段: 表情 %d 类型未知 %q", at, id, st.Kind)

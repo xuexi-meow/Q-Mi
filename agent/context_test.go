@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -288,13 +287,12 @@ func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 
 	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t5.Add(time.Minute)})
 
-	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <香菜不吃屿烬燃(3929930584)> 这个我不背锅！！！！"},
-		{Role: "user", Content: "[" + t2.Format("01-02 15:04") + "] [私聊:3394859101] <小奶猫雪溪(3394859101)> 在吗"},
-		{Role: "assistant", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <我> 收到"},
-		{Role: "user", Content: "[" + t4.Format("01-02 15:04") + "] [群:928952016] <10086> 旧库没存昵称"},
-		{Role: "user", Content: "[" + t5.Format("01-02 15:04") + "] [群:928952016] <路人(10002)> [CQ:face,id=1]哈哈"},
+	assertContextRows(t, msgs[1:], []map[string]any{
+		{"message_id": float64(1), "chat_type": "group", "chat_id": float64(928952016), "user_id": float64(3929930584), "sender_name": "香菜不吃屿烬燃", "text": "这个我不背锅！！！！"},
+		{"message_id": float64(2), "chat_type": "private", "chat_id": float64(3394859101), "text": "在吗"},
+		{"message_id": float64(3), "is_self": true, "text": "收到"},
+		{"message_id": float64(4), "user_id": float64(10086), "sender_name": "", "text": "旧库没存昵称"},
+		{"message_id": float64(5), "is_self": false, "text": "[CQ:face,id=1]哈哈"},
 	})
 }
 
@@ -321,10 +319,9 @@ func TestBuildHistoryExcludesRecalled(t *testing.T) {
 
 	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t3.Add(time.Minute)})
 
-	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第一条"},
-		{Role: "user", Content: "[" + t3.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 第三条"},
+	assertContextRows(t, msgs[1:], []map[string]any{
+		{"message_id": float64(1), "text": "第一条"},
+		{"message_id": float64(3), "text": "第三条"},
 	})
 }
 
@@ -378,12 +375,11 @@ func TestBuildTrimsHistoryAcrossChatsInBlocks(t *testing.T) {
 	if len(msgs) != 5 {
 		t.Fatalf("裁剪后消息条数 = %d, want 5 (system+4): %+v", len(msgs), msgs)
 	}
-	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + base.Add(3*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m3"},
-		{Role: "assistant", Content: "[" + base.Add(4*time.Second).Format("01-02 15:04") + "] [群:928952016] <我> m4"},
-		{Role: "user", Content: "[" + base.Add(5*time.Second).Format("01-02 15:04") + "] [私聊:20001] <私聊B(20001)> m5"},
-		{Role: "assistant", Content: "[" + base.Add(6*time.Second).Format("01-02 15:04") + "] [群:928952016] <我> m6"},
+	assertContextRows(t, msgs[1:], []map[string]any{
+		{"message_id": float64(3), "chat_type": "private", "chat_id": float64(20001), "text": "m3"},
+		{"message_id": float64(4), "chat_type": "group", "is_self": true, "text": "m4"},
+		{"message_id": float64(5), "chat_type": "private", "text": "m5"},
+		{"message_id": float64(6), "chat_type": "group", "is_self": true, "text": "m6"},
 	})
 }
 
@@ -425,7 +421,7 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 			t.Fatalf("messages[%d] 前缀被破坏:\nfirst:  %+v\nsecond: %+v", i, first[i], second[i])
 		}
 	}
-	if second[22].Content != "["+base.Add(42*time.Second).Format("01-02 15:04")+"] [群:928952016] <群友A(10001)> m42" {
+	if row := contextRecord(t, second[22]); row["text"] != "m42" || row["message_id"] != float64(42) {
 		t.Errorf("新历史应原样追加在末尾: %+v", second[22])
 	}
 }
@@ -508,13 +504,15 @@ func TestBuildAppendsNewMessagesWithTimeHeader(t *testing.T) {
 		},
 	})
 
-	assertMessages(t, msgs, []ChatMessage{
-		{Role: "system", Content: "你是QQ上的AI成员。\n" + agentGuideText + "\n当前账号QQ: 9527"},
-		{Role: "user", Content: "[" + t1.Format("01-02 15:04") + "] [群:928952016] <群友A(10001)> 早"},
-		{Role: "assistant", Content: "[" + t2.Format("01-02 15:04") + "] [群:928952016] <我> 早呀"},
-		{Role: "user", Content: "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" + m1t.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 在吗"},
-		{Role: "user", Content: "[" + m2t.Format("01-02 15:04") + "] [群:928952016] <10003> 来打游戏"},
+	assertContextRows(t, msgs[1:], []map[string]any{
+		{"message_id": float64(1), "text": "早", "origin": "history"},
+		{"message_id": float64(2), "is_self": true, "text": "早呀"},
+		{"user_id": float64(10001), "text": "在吗", "origin": "live", "timestamp": m1t.Format(time.RFC3339Nano)},
+		{"user_id": float64(10003), "text": "来打游戏", "origin": "live", "timestamp": m2t.Format(time.RFC3339Nano)},
 	})
+	if prefix := "当前时间: " + now.Format("2006-01-02 15:04") + "\n"; !strings.HasPrefix(contentText(msgs[3]), prefix) || strings.Contains(contentText(msgs[4]), "当前时间:") {
+		t.Fatal("current time must appear once before first incoming record")
+	}
 }
 
 // TestBuildInjectsNotesBeforeFirstNewMessage 思考笔记以 "[思考笔记]" 块注入
@@ -553,9 +551,8 @@ func TestBuildInjectsNotesBeforeFirstNewMessage(t *testing.T) {
 	}
 	wantFirst := "[思考笔记]\n[" + noteT.Format("01-02 15:04") + "] 上轮决定先查群名片\n[" +
 		noteT.Add(time.Minute).Format("01-02 15:04") + "] 他在开玩笑，别当真\n\n" +
-		"当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
-		newT.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 在吗"
-	if withNotes[1].Content != wantFirst {
+		"当前时间: " + now.Format("2006-01-02 15:04") + "\n"
+	if !strings.HasPrefix(contentText(withNotes[1]), wantFirst) || contextRecord(t, withNotes[1])["text"] != "在吗" {
 		t.Errorf("首条新消息未带笔记前缀:\ngot:  %q\nwant: %q", withNotes[1].Content, wantFirst)
 	}
 	if strings.Contains(contentText(withNotes[2]), "[思考笔记]") {
@@ -650,13 +647,10 @@ func TestBuildTruncatesLongContent(t *testing.T) {
 	})
 
 	wantTail := strings.Repeat("长", 20000) + "...(截断)"
-	wantHistory := "[" + base.Format("01-02 15:04") + "] [群:928952016] <10001> " + wantTail
-	if contentText(msgs[1]) != wantHistory {
+	if contextRecord(t, msgs[1])["text"] != wantTail {
 		t.Errorf("超长历史未按 20000 字符截断: rune 数 = %d", len([]rune(contentText(msgs[1]))))
 	}
-	wantNew := "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
-		now.Format("01-02 15:04") + "] [群:928952016] <10001> " + strings.Repeat("新", 20000) + "...(截断)"
-	if contentText(msgs[2]) != wantNew {
+	if contextRecord(t, msgs[2])["text"] != strings.Repeat("新", 20000)+"...(截断)" {
 		t.Errorf("超长新消息未按 20000 字符截断: rune 数 = %d", len([]rune(contentText(msgs[2]))))
 	}
 }
@@ -756,49 +750,18 @@ func TestBuildHistoryImageRowBecomesMultimodal(t *testing.T) {
 	}
 
 	// 带图行 → 多模态数组，图片部分为本地下载的 data URL
-	line1 := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> [图片] 看这张图"
-	wantParts := []ContentPart{
-		{Type: "text", Text: line1},
-		imagePart(pngDataURL),
-	}
 	gotParts, ok := msgs[1].Content.([]ContentPart)
 	if !ok {
 		t.Fatalf("带图历史行 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
 	}
-	if !reflect.DeepEqual(gotParts, wantParts) {
-		t.Errorf("带图行 content =\n%#v\nwant\n%#v", gotParts, wantParts)
+	if len(gotParts) != 2 || gotParts[0].Type != "text" || contextRecord(t, msgs[1])["text"] != "[图片] 看这张图" {
+		t.Fatalf("image caption/source missing: %#v", gotParts)
 	}
 	if got := gotParts[1].ImageURL.URL; !strings.HasPrefix(got, "data:image/png;base64,") {
 		t.Errorf("image_url 应为 base64 data URL 前缀, got %q", got)
 	}
-	// wire 字节级校验
-	gotJSON, err := json.Marshal(msgs[1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantJSON, err := json.Marshal(ChatMessage{Role: "user", Content: wantParts})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotJSON) != string(wantJSON) {
-		t.Errorf("带图行 wire 字节不符:\ngot:  %s\nwant: %s", gotJSON, wantJSON)
-	}
-
-	// 无图行 → 仍为 string，字节级与旧行为一致
-	line2 := "[" + t2.Format("01-02 15:04") + "] [群:928952016] <小红(10002)> 纯文本"
-	if got, ok := msgs[2].Content.(string); !ok || got != line2 {
-		t.Fatalf("无图历史行 content 应保持 string %q, got %#v", line2, msgs[2].Content)
-	}
-	oldJSON, err := json.Marshal(ChatMessage{Role: "user", Content: line2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got2JSON, err := json.Marshal(msgs[2])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got2JSON) != string(oldJSON) {
-		t.Errorf("无图行 wire 字节被改变:\ngot:  %s\nwant: %s", got2JSON, oldJSON)
+	if _, ok := msgs[2].Content.(string); !ok || contextRecord(t, msgs[2])["text"] != "纯文本" {
+		t.Fatalf("plain records should remain string JSON: %#v", msgs[2])
 	}
 }
 
@@ -829,13 +792,11 @@ func TestBuildHistorySentImageRowStaysString(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("应返回 system+1 条历史, got %d", len(msgs))
 	}
-	want := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <我> [CQ:image,file=out.image,url=" + imgURL + "]"
-	got, ok := msgs[1].Content.(string)
-	if !ok || got != want {
-		t.Fatalf("assistant 行应保持纯文本 %q, got %#v", want, msgs[1].Content)
+	if _, ok := msgs[1].Content.(string); !ok || contextRecord(t, msgs[1])["text"] != "[图片]" {
+		t.Fatalf("own archived image should remain text data: %#v", msgs[1].Content)
 	}
-	if msgs[1].Role != "assistant" {
-		t.Errorf("发出行 role = %q, want assistant", msgs[1].Role)
+	if msgs[1].Role != "user" || contextRecord(t, msgs[1])["is_self"] != true {
+		t.Errorf("own archive must be attributed input data: %+v", msgs[1])
 	}
 }
 
@@ -866,9 +827,8 @@ func TestBuildHistoryMultimodalDisabledKeepsRawCQ(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("应返回 system+1 条历史, got %d", len(msgs))
 	}
-	want := "[" + t1.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> [CQ:image,file=a.image,subType=0,url=" + imgURL + "] 看这张图"
-	if got, ok := msgs[1].Content.(string); !ok || got != want {
-		t.Fatalf("multimodal=false 时应为纯文本 %q, got %#v", want, msgs[1].Content)
+	if _, ok := msgs[1].Content.(string); !ok || contextRecord(t, msgs[1])["text"] != "[图片] 看这张图" {
+		t.Fatalf("multimodal=false must retain text without images: %#v", msgs[1].Content)
 	}
 }
 
@@ -907,28 +867,22 @@ func TestBuildNewMessageImagesMultimodal(t *testing.T) {
 	if len(msgs) != 3 {
 		t.Fatalf("应返回 system+2 条新消息, got %d: %+v", len(msgs), msgs)
 	}
-	wantText := "当前时间: " + now.Format("2006-01-02 15:04") + "\n[" +
-		newT.Format("01-02 15:04") + "] [群:928952016] <小明(10001)> 看这张图"
-	wantParts := []ContentPart{
-		{Type: "text", Text: wantText},
-		imagePart(pngDataURL),
-	}
 	gotParts, ok := msgs[1].Content.([]ContentPart)
 	if !ok {
 		t.Fatalf("带图新消息 content 应为 []ContentPart, got %T: %#v", msgs[1].Content, msgs[1].Content)
 	}
-	if !reflect.DeepEqual(gotParts, wantParts) {
-		t.Errorf("带图新消息 content =\n%#v\nwant\n%#v", gotParts, wantParts)
+	if len(gotParts) != 2 || gotParts[1].ImageURL.URL != pngDataURL || contextRecord(t, msgs[1])["text"] != "看这张图" ||
+		!strings.HasPrefix(gotParts[0].Text, "当前时间: "+now.Format("2006-01-02 15:04")+"\n") {
+		t.Errorf("new image input lost content or time: %#v", gotParts)
 	}
 	// 无图新消息 → string
-	line2 := "[" + now.Add(-10*time.Second).Format("01-02 15:04") + "] [群:928952016] <小红(10002)> 纯文本"
-	if got, ok := msgs[2].Content.(string); !ok || got != line2 {
-		t.Errorf("无图新消息 content 应保持 string %q, got %#v", line2, msgs[2].Content)
+	if _, ok := msgs[2].Content.(string); !ok || contextRecord(t, msgs[2])["text"] != "纯文本" {
+		t.Errorf("plain input must remain text JSON: %#v", msgs[2].Content)
 	}
 
 	// multimodal=false：全部 string
 	msgsOff := build(false)
-	if got, ok := msgsOff[1].Content.(string); !ok || got != wantText {
+	if _, ok := msgsOff[1].Content.(string); !ok || contextRecord(t, msgsOff[1])["text"] != "看这张图" {
 		t.Errorf("multimodal=false 时带图新消息应为纯文本, got %#v", msgsOff[1].Content)
 	}
 }

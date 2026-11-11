@@ -42,6 +42,9 @@ func reasoningToolCallResp(reasoning, content, id, name, args string) string {
 func newLoopManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder, store *storage.Store, script []string) (*Manager, *fakeLLM, *napcatRec) {
 	t.Helper()
 	f, srv := newFakeLLM(t, "")
+	if len(script) == 0 {
+		script = []string{toolCallResp("done", "finish", "{}")}
+	}
 	f.mu.Lock()
 	f.script = script
 	f.mu.Unlock()
@@ -182,24 +185,40 @@ func TestHandleTurnLoadsNotesAndMoodIntoTurn(t *testing.T) {
 	}
 }
 
-// TestHandleTurnPlainTextCompat 纯文本响应直接经 bot.Reply 发出（兼容路径）。
-func TestHandleTurnPlainTextCompat(t *testing.T) {
-	b := &stubBuilder{}
-	cfg := testCfg(20 * time.Millisecond)
-	m, f, napcat := newLoopManager(t, cfg, b, nil, []string{
-		`{"choices":[{"index":0,"message":{"role":"assistant","content":"直接回复"}}]}`,
+func TestHandleTurnPlainContentNeverSentAndCanRepair(t *testing.T) {
+	m, f, napcat := newLoopManager(t, testCfg(time.Millisecond), &stubBuilder{}, nil, []string{
+		`{"choices":[{"message":{"content":"可以轻松接一句，但先看看是谁在说话","reasoning_content":"private-reasoning"}}]}`,
+		toolCallResp("send", "send_message", `{"chat_type":"private","chat_id":20002,"text":"你好"}`),
+		toolCallResp("done", "finish", `{}`),
 	})
+	m.handleTurn(&Turn{ChatType: "private", ChatID: 20002, SelfID: 999, Now: time.Now()})
+	if napcat.count() != 1 || napcat.sentText(t, 0) != "你好" {
+		t.Fatalf("only explicit send_message may send, got paths=%v", napcat.paths)
+	}
+	if f.count() != 3 {
+		t.Fatalf("expected repair followed by send and finish, got %d requests", f.count())
+	}
+	var feedback map[string]any
+	last := f.reqs[1].Messages[len(f.reqs[1].Messages)-1]
+	if json.Unmarshal([]byte(contentText(last)), &feedback) != nil || feedback["error"] != "tool_call_required" {
+		t.Fatalf("missing structured protocol feedback: %+v", last)
+	}
+	if replay := f.reqs[1].Messages[len(f.reqs[1].Messages)-2].ReasoningContent; replay != "private-reasoning" {
+		t.Fatalf("reasoning replay lost: %q", replay)
+	}
+}
 
-	m.Enqueue(msg("private", 20002, "你好"))
-	waitFor(t, 5*time.Second, func() bool { return napcat.count() == 1 }, "纯文本应直接回复")
-	if f.count() != 1 {
-		t.Errorf("纯文本路径应只有 1 次 LLM 请求, got %d", f.count())
+func TestHandleTurnRepeatedMalformedOutputStopsWithoutSending(t *testing.T) {
+	cfg := testCfg(time.Millisecond)
+	cfg.MaxToolRounds = 10
+	raw := `{"choices":[{"message":{"content":"{\"tool\":\"send_message\",\"text\":\"草稿\"}"}}]}`
+	m, f, napcat := newLoopManager(t, cfg, &stubBuilder{}, nil, []string{raw, raw, raw, raw})
+	m.handleTurn(&Turn{ChatType: "group", ChatID: 888, SelfID: 999, Now: time.Now()})
+	if napcat.count() != 0 {
+		t.Fatal("JSON-looking content must not be executed or sent")
 	}
-	if napcat.paths[0] != "/send_private_msg" {
-		t.Errorf("回复 path = %q, want /send_private_msg", napcat.paths[0])
-	}
-	if got := napcat.sentText(t, 0); got != "直接回复" {
-		t.Errorf("回复文本 = %q, want 直接回复", got)
+	if got := f.count(); got != 3 {
+		t.Fatalf("protocol repair must stop after 3 invalid responses, got %d", got)
 	}
 }
 
@@ -438,7 +457,7 @@ func TestHandleTurnToolErrorContinues(t *testing.T) {
 		t.Errorf("未知工具的回填 = %+v", msgs[2])
 	}
 	if msgs[n-1].Role != "tool" || msgs[n-1].ToolCallID != "c2" ||
-		!strings.Contains(contentText(msgs[n-1]), `"error"`) || !strings.Contains(contentText(msgs[n-1]), "chat_type") {
+		!strings.Contains(contentText(msgs[n-1]), `"error"`) || !strings.Contains(contentText(msgs[n-1]), "chat_id") {
 		t.Errorf("非法参数的回填 = %+v", msgs[n-1])
 	}
 	if napcat.count() != 0 {

@@ -326,22 +326,25 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 	}
 }
 
-// TestHandleTurnRecordsReplyAndErrorEvents 纯文本回复成功 → reply 事件；
-// 空回复 → error 事件；LLM 请求失败 → error 事件。
+// Explicit sends record tool results; malformed output and HTTP failures record errors.
 func TestHandleTurnRecordsReplyAndErrorEvents(t *testing.T) {
 	t.Run("reply on success", func(t *testing.T) {
 		b := &stubBuilder{}
 		cfg := testCfg(20 * time.Millisecond)
 		m, f, napcat := newLoopManager(t, cfg, b, nil, []string{
-			`{"choices":[{"index":0,"message":{"role":"assistant","content":"直接回复"}}]}`,
+			twoToolCallResp("send", "send_message", `{"chat_type":"private","chat_id":20002,"text":"明确回复"}`, "done", "finish", "{}"),
 		})
 		m.Enqueue(msg("private", 20002, "你好"))
-		waitFor(t, 5*time.Second, func() bool { return napcat.count() == 1 }, "纯文本应直接回复")
+		waitFor(t, 5*time.Second, func() bool { return napcat.count() == 1 }, "显式工具应发送回复")
 		time.Sleep(100 * time.Millisecond)
 		_ = f
 		evs := m.events.After(0)
-		if len(evs) == 0 || evs[len(evs)-1].Kind != KindReply || evs[len(evs)-1].Text != "直接回复" {
-			t.Errorf("成功回复应以 reply 事件收尾, got %+v", evs)
+		found := false
+		for _, ev := range evs {
+			found = found || (ev.Kind == KindToolCall && strings.Contains(ev.Text, "明确回复"))
+		}
+		if !found || napcat.sentText(t, 0) != "明确回复" {
+			t.Errorf("成功发言应有明确工具调用和正文, got %+v", evs)
 		}
 	})
 
@@ -352,7 +355,7 @@ func TestHandleTurnRecordsReplyAndErrorEvents(t *testing.T) {
 			`{"choices":[{"index":0,"message":{"role":"assistant","content":""}}]}`,
 		})
 		m.Enqueue(msg("group", 888, "在吗"))
-		waitFor(t, 5*time.Second, func() bool { return f.count() == 1 }, "LLM 应收到请求")
+		waitFor(t, 5*time.Second, func() bool { return f.count() == 3 }, "空输出应有限纠错后停止")
 		time.Sleep(150 * time.Millisecond)
 		evs := m.events.After(0)
 		if len(evs) == 0 || evs[len(evs)-1].Kind != KindError {

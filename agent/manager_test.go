@@ -187,6 +187,7 @@ func testCfg(debounce time.Duration) config.AgentConfig {
 func newTestManager(t *testing.T, cfg config.AgentConfig, b *stubBuilder) (*Manager, *fakeLLM) {
 	t.Helper()
 	f, srv := newFakeLLM(t, "pong")
+	f.script = []string{reasoningToolCallResp("", "pong", "done", "finish", "{}")}
 	m := NewManager(b, NewClient(srv.URL, "sk-test", 5*time.Second), cfg, nil, 999)
 	m.notesPath = filepath.Join(t.TempDir(), "notes.json")
 	m.statePath = filepath.Join(t.TempDir(), "state.json")
@@ -302,6 +303,7 @@ func TestWorkerSurvivesBuilderPanic(t *testing.T) {
 		return []ChatMessage{{Role: "user", Content: "ok"}}
 	}
 	m, f := newTestManager(t, testCfg(20*time.Millisecond), b)
+	f.script = []string{twoToolCallResp("send", "send_message", `{"chat_type":"group","chat_id":888,"text":"pong"}`, "done", "finish", "{}")}
 	napcat := startFakeNapCat(t)
 
 	m.Enqueue(msg("group", 888, "第一轮"))
@@ -379,7 +381,7 @@ func TestEmptyContentNotSent(t *testing.T) {
 	napcat := startFakeNapCat(t)
 
 	m.Enqueue(msg("private", 111, "你好"))
-	waitFor(t, 3*time.Second, func() bool { return emptyF.count() == 1 }, "LLM 应收到请求")
+	waitFor(t, 3*time.Second, func() bool { return emptyF.count() == 3 }, "空输出应在有限纠错后停止")
 	time.Sleep(100 * time.Millisecond)
 	if got := napcat.count(); got != 0 {
 		t.Errorf("空回复不应发送消息,发送次数 = %d", got)

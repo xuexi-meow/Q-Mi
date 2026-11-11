@@ -113,6 +113,25 @@ func TestApplyConfigRebuildsModelPool(t *testing.T) {
 	}
 }
 
+func TestApplyConfigUpdatesToolChoiceAtNextRequest(t *testing.T) {
+	cfg := testCfg(time.Millisecond)
+	m, f := newTestManager(t, cfg, &stubBuilder{})
+	f.script = []string{toolCallResp("done", "finish", "{}")}
+	next := cfg
+	next.ToolChoice = "required"
+	m.ApplyConfig(next)
+
+	m.handleTurn(&Turn{SelfID: 999, Now: time.Now(),
+		NewMessages: []TurnMessage{{ChatType: "group", ChatID: 888, Text: "hi"}}})
+	reqs := requestsSnapshot(f)
+	if len(reqs) == 0 {
+		t.Fatal("expected a model request")
+	}
+	if reqs[0].ToolChoice != "required" {
+		t.Fatalf("request tool_choice = %q, want required after hot reload", reqs[0].ToolChoice)
+	}
+}
+
 func TestAttachConfigStoreAppliesOverlayChange(t *testing.T) {
 	dir := t.TempDir()
 	basePath := filepath.Join(dir, "Config.yaml")

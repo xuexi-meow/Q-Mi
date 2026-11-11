@@ -47,19 +47,16 @@ func queryMessageRows(store *storage.Store, images *imageStore, turn *Turn, f st
 	}
 	partial := false
 	for _, r := range records { // Select newest first; reverse only after budgeting.
-		row := map[string]any{
-			"message_id":  r.MessageID,
-			"chat_type":   r.ChatType,
-			"chat_id":     r.ChatID,
-			"user_id":     r.UserID,
-			"sender_name": r.SenderName,
-			"text":        r.RawMessage,
-			"time":        time.Unix(int64(r.Time), 0).Format(timeLayout),
-			"timestamp":   time.UnixMilli(int64(r.Time * 1000)).Format(time.RFC3339Nano),
+		var selfID int64
+		if turn != nil {
+			selfID = turn.SelfID
 		}
+		row := messageView(store, selfID, recordTurnMessage(r), "archive")
+		row["time"] = time.Unix(int64(r.Time), 0).Format(timeLayout)
 		rowPartial := false
-		if length := utf8.RuneCountInString(r.RawMessage); length > maxQueryMessageRunes {
-			row["text"] = string([]rune(r.RawMessage)[:maxQueryMessageRunes])
+		text, _ := row["text"].(string)
+		if length := utf8.RuneCountInString(text); length > maxQueryMessageRunes {
+			row["text"] = string([]rune(text)[:maxQueryMessageRunes])
 			row["text_truncated"], row["text_length"] = true, length
 			rowPartial = true
 		}

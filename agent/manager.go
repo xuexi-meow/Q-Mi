@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +31,8 @@ type IncomingMessage struct {
 	SenderID   int64
 	SenderName string
 	Text       string
-	Images     []imageRef // 消息里的图片段（P2.7 多模态，wiring 提取）
+	Segments   json.RawMessage // 原始消息段，保留 @ 和 reply 的明确指向
+	Images     []imageRef      // 消息里的图片段（P2.7 多模态，wiring 提取）
 	Time       time.Time
 	Urgent     bool // 私聊/群@标记；不再取消正在进行的请求
 	Mentioned  bool // 真实 @自己/@全体消息段，勿扰例外
@@ -173,7 +173,7 @@ func (m *Manager) ApplyConfig(next config.AgentConfig) {
 
 	// 模型接入变更：重建候选池；顶层三件套变了就换 legacy 客户端。
 	endpointChanged := old.BaseURL != next.BaseURL || old.APIKey != next.APIKey
-	if endpointChanged || !reflect.DeepEqual(old.Models, next.Models) {
+	if endpointChanged || old.ToolChoice != next.ToolChoice || !reflect.DeepEqual(old.Models, next.Models) {
 		m.poolMu.Lock()
 		if endpointChanged && next.BaseURL != "" {
 			m.legacyClient = NewClient(next.BaseURL, next.APIKey, llmRequestTimeout)
@@ -357,6 +357,9 @@ func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need mo
 		tierName = tier
 		tried[slot.key()] = true
 		req.Model = slot.model
+		if len(req.Tools) > 0 {
+			req.ToolChoice = slot.toolChoice
+		}
 		if need.Vision && !slot.supports("vision") {
 			// 候选不支持视觉：图片降级为文字标注（不修改会话里的原消息）。
 			req.Messages = stripImageParts(req.Messages)
@@ -442,6 +445,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 		attempts = defaultMaxAttempts
 	}
 
+	protocolFailures := 0
 	for round := 1; round <= maxRounds; round++ {
 		var toolCtx *ToolContext
 		var tools []Tool
@@ -520,24 +524,30 @@ func (m *Manager) handleTurn(turn *Turn) {
 		}
 
 		calls := resp.ToolCalls()
-		if len(calls) == 0 {
-			// 兼容路径：纯文本直接回复
-			content := strings.TrimSpace(resp.TextContent())
-			if content != "" && !counted {
-				m.conversation.wakes++
-			}
+		protocolError := responseProtocolError(resp)
+		if protocolError != "" {
+			// Assistant content is private work, never an implicit QQ send.
+			protocolFailures++
 			if cfg.Debug {
 				m.dumpDebug(turn, req, round, resp, nil, nil, false)
 			}
 			msgs = append(msgs, ChatMessage{
-				Role: "assistant", Content: content,
+				Role: "assistant", Content: resp.TextContent(),
 				ReasoningContent: resp.ReplayReasoning(),
 			})
+			feedback, _ := marshalCompact(map[string]any{
+				"error": "tool_call_required", "sent": false, "detail": protocolError,
+				"instruction": "没有消息发出。必须使用完整的 API tool_calls、唯一非空 id 和 function 类型，arguments 为 JSON 对象；不要在 content 中模拟调用。发言用 send_message，暂停用 finish({})。分析、草稿不得放入发送正文。",
+			})
+			msgs = append(msgs, ChatMessage{Role: "user", Content: feedback})
 			m.conversation.messages = msgs
-			m.conversation.unreadStart = len(msgs)
-			m.replyText(turn, content)
-			return
+			m.events.Record(turn.ChatType, turn.ChatID, KindError, "tool_call_required: 普通输出未发送")
+			if protocolFailures >= 3 {
+				return
+			}
+			continue
 		}
+		protocolFailures = 0
 		if !counted {
 			for _, call := range calls {
 				if call.Function.Name != "finish" {
@@ -564,8 +574,13 @@ func (m *Manager) handleTurn(turn *Turn) {
 		var wg sync.WaitGroup
 		for i, call := range calls {
 			if call.Function.Name == "finish" {
-				finished = true
-				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: "{}"}
+				result := "{}"
+				if _, err := validateToolArguments(Tool{Name: "finish", Parameters: objectParams(nil, nil)}, call.Function.Arguments); err != nil {
+					result = toolErrorJSON(err)
+				} else {
+					finished = true
+				}
+				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: result}
 				continue
 			}
 			wg.Add(1)
@@ -582,7 +597,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 						fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
 					result = toolErrorJSON(toolErr)
 				}
-				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: truncateContent(result)}
+				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: truncateToolResult(result)}
 			}(i, call)
 		}
 		wg.Wait()
@@ -622,33 +637,6 @@ func (m *Manager) handleTurn(turn *Turn) {
 		"chat_type", turn.ChatType, "chat_id", turn.ChatID, "max_tool_rounds", maxRounds)
 }
 
-// replyText 兼容路径发送纯文本回复；空内容不发送。
-func (m *Manager) replyText(turn *Turn, content string) {
-	if content == "" {
-		m.events.Record(turn.ChatType, turn.ChatID, KindError, "LLM 返回空回复，不发送")
-		slog.Warn("LLM 返回空回复，不发送",
-			"chat_type", turn.ChatType, "chat_id", turn.ChatID)
-		return
-	}
-	if (turn.ChatType != "group" && turn.ChatType != "private") || turn.ChatID <= 0 {
-		m.events.Record(turn.ChatType, turn.ChatID, KindError, "混合来源没有默认回复目标，请使用 send_message 明确指定会话")
-		return
-	}
-	if err := validateOutgoingText(content); err != nil {
-		m.events.Record(turn.ChatType, turn.ChatID, KindError, err.Error())
-		slog.Warn("回复正文格式错误，不发送",
-			"chat_type", turn.ChatType, "chat_id", turn.ChatID, "err", err)
-		return
-	}
-	if err := bot.Reply(context.Background(), turn.ChatType, turn.ChatID, chain.New().Text(content)); err != nil {
-		m.events.Record(turn.ChatType, turn.ChatID, KindError, "回复发送失败: "+err.Error())
-		slog.Warn("回复发送失败",
-			"chat_type", turn.ChatType, "chat_id", turn.ChatID, "err", err)
-		return
-	}
-	m.events.Record(turn.ChatType, turn.ChatID, KindReply, content)
-}
-
 // execToolCall 执行一次工具调用：普通调用同步执行返回结果；Asyncable 工具
 // 带 {"_async":true,...} 时转入 TaskManager 后台执行，立即返回任务回执
 // （结果完成经 deliverTaskResult 唤醒投递，不阻塞本 turn，spec §2.5 方案 B）。
@@ -667,6 +655,14 @@ func (m *Manager) execToolCall(ctx *ToolContext, tools []Tool, call ToolCall) (s
 	if tool.Run == nil {
 		return "", fmt.Errorf("工具 %q 不可执行", call.Function.Name)
 	}
+	if asyncRequested(json.RawMessage(call.Function.Arguments)) && !tool.Asyncable {
+		return "", fmt.Errorf("工具 %q 不支持 _async 后台执行", tool.Name)
+	}
+	args, err := validateToolArguments(*tool, call.Function.Arguments)
+	if err != nil {
+		return "", err
+	}
+	call.Function.Arguments = string(args)
 	if asyncRequested(json.RawMessage(call.Function.Arguments)) {
 		if !tool.Asyncable {
 			return "", fmt.Errorf("工具 %q 不支持 _async 后台执行", tool.Name)

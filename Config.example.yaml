@@ -81,6 +81,10 @@ agent:
   #   background: background
   #
   # max_attempts: 2                      # 单次请求最多试几个候选（含首个），上限 5
+  # tool_choice: required               # 仅在提供商支持时开启：强制实际 tool_calls，仍可 finish 不发言
+  # 候选也可单独设置 tool_choice: auto 覆盖顶层；缺省不发送该参数，兼容旧接口。
+  # 主循环使用原生 function calling + 参数 schema/本地校验，不把 content 的 JSON 当工具执行。
+  # 不同时强制 response_format: json_object；它约束的是普通 content，不是工具参数。
 
 
   # ---- 提示词与行为 ----
@@ -112,7 +116,7 @@ agent:
 
   debug: false           # true 时每个 turn 的完整请求/响应落盘到 agent/debug/
   context:               # 账号级工作上下文：finish 暂停执行，不清空；当前仅进程内保留
-    max_input_tokens: 48000       # 估算输入预算，含 system/工具/图片；不是提供商的精确 tokenizer
+    max_input_tokens: 128000       # 估算输入预算，含 system/工具/图片；不是提供商的精确 tokenizer
     review_after_wakes: 8         # 有效唤醒后的复查点，不是到次数就强制清空；无行动的轮询不计
     keep_recent_messages: 12     # 至少原样保留的尾部消息数；工具调用与回执作为完整组保留
     summary_tokens: 1024         # 摘要生成额度及正文估算上限；摘要请求也计入用量，不会发到 QQ

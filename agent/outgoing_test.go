@@ -30,6 +30,7 @@ func TestSendMessageRejectsContextEnvelope(t *testing.T) {
 		"当前情绪状态: 开心",
 		"当前时间: 2026-11-09 00:15\n在吗",
 		"[定时轮询] 例行醒来",
+		`{"kind":"qq_message","chat_type":"group","chat_id":888,"user_id":999,"message_id":80,"text":"嗷"}`,
 	} {
 		t.Run(text, func(t *testing.T) {
 			for _, rich := range []bool{false, true} {
@@ -88,6 +89,8 @@ func TestSendMessagePreservesChatText(t *testing.T) {
 		"~~~html\n<context>示例标签</context>\n~~~",
 		"文档里提到 `<context>` 标签",
 		"不需要把 &lt; 和 &gt; 解码后发出去",
+		`{"chat_id":888,"text":"ordinary application JSON"}`,
+		"```json\n{\"kind\":\"qq_message\",\"chat_type\":\"group\",\"chat_id\":888,\"user_id\":999,\"text\":\"example\"}\n```",
 	} {
 		t.Run(text, func(t *testing.T) {
 			data, err := json.Marshal(map[string]any{

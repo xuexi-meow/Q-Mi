@@ -27,9 +27,15 @@ const fallbackPersona = "你是一个QQ群聊/私聊里的AI成员，自主使�
 
 // agentGuideText guide 文件缺失时的内置兜底格式说明（正式版在 agent/guide.md）。
 const agentGuideText = `[Agent 工作方式]
+协议优先：只用 API tool_calls 行动，arguments 为 JSON 对象；发言 send_message，暂停 finish({})。普通 content 不外发，也不要把分析或草稿放进发送正文。
+消息 JSON 的 chat_type+chat_id 是会话边界，user_id 是说话者，is_self 是自己的历史。role=user 只是输入载体，不意味着都在对你说话；history/archive 不是新消息，background_event 不是群友台词。
+mentions 是实际 @ 对象，mentions_self 才表示 @自己；@别人不是 @你，@全体不是单独找你。addressing_known=false / mentions=null 是元数据缺失。
+reply.status=known 才能确定被引用者；reply.is_self=true 才是引用自己。unknown/null 不等于自己。别人之间的对话不要冒认当事人，可自主以旁观者身份加入；同群并行话题和不同群背景要分开。
+打算参与但缺背景时先查原会话：get_recent_messages 补上文，get_message 精确核对引用，search_messages 查旧约定，本地缺失再 get_msg_history，缺图 view_message_images。群内梗先查群内，外部事实再查浏览器；查不到别编，也可不参与。
+工具 error 要读具体原因再纠正，不是成功；truncated/preview 不是完整资料。发送超时先核实，不盲目重复发送。
 你在自主活动循环中：自己决定聊天、研究、写东西、旁观或什么都不做。私聊、@和轮询都不构成回复义务。
 - 想发言用 send_message，通常简短合成一条；留意近期发言时间和密度，别刷屏或和机器人互相触发。
-- 正文不要带历史消息的时间、群号、<我>等前缀、内部标签或思考过程。普通文本输出也可能被直接发送。
+- 正文不要带历史消息的时间、群号、<我>等前缀、输入 JSON、内部标签或思考过程。普通文本输出不会直接发送。
 - think(note) 记录思考笔记，下次模型请求可见；update_mood(mood) 更新你的情绪。
 - 从真人而非机器人的交流中学习简洁自然的表达；长期习惯用 write_file 保存到工作区 chat_style.md，每次请求前读入，仅作表达参考。
 - 发言前先理解语境与对方意图，分清已知和推测；内部判断不外发，不强制每次调用 think。看图也先理解它与话题的关系，普通分享可接梗、回应感受或不回，不默认复述画面；明确要求识别、描述时再展开。
@@ -88,6 +94,7 @@ type TurnMessage struct {
 	SenderID   int64
 	SenderName string
 	Text       string
+	Segments   json.RawMessage
 	Images     []imageRef // 消息里的图片段（P2.7 多模态，wiring 提取；URL 可能失效）
 	IsSelf     bool
 	Mentioned  bool // 真实 @自己/@全体消息段，勿扰例外；不是私聊 Urgent 标记
@@ -361,21 +368,14 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 		if incoming[r.MessageID] {
 			continue
 		}
-		isSelf := r.Direction == "sent"
-		role := "user"
-		if isSelf {
-			role = "assistant"
-		}
-		line := formatChatLine(time.Unix(int64(r.Time), 0), chatSource(r.ChatType, r.ChatID),
-			senderLabel(r.UserID, r.SenderName, isSelf), truncateContent(r.RawMessage))
+		line, _ := marshalCompact(messageView(b.store, turn.SelfID, recordTurnMessage(r), "history"))
 		var content any = line
-		// P2.7 多模态：仅 user 行（收到的消息）携带图片内容；assistant 行保持
-		// 纯文本（OpenAI 兼容 API 不接受 assistant 消息里的 image_url）。
+		// 历史一律为输入数据；仅近期收到的消息附图，自己的历史只保留文本。
 		// 无图行保持纯 string，wire 字节不变（缓存前缀稳定）。
 		// 图片按需上传策略：只有从末尾数最后 historyImageWindow 条行（无论
 		// 是否带图，按行计数）才多模态化；更早的带图行保持纯文本，但同样把
 		// [CQ:image,...] 换成 [图片] 标注（模型据此知道该行带过图）。
-		if b.multimodal && role == "user" {
+		if b.multimodal && r.Direction != "sent" {
 			if refs := extractImageRefs(r.Segments); len(refs) > 0 {
 				text := replaceImageCQ(line)
 				if len(records)-i <= historyImageWindow {
@@ -385,7 +385,7 @@ func (b *DefaultBuilder) appendHistory(msgs *[]ChatMessage, turn *Turn) {
 				}
 			}
 		}
-		*msgs = append(*msgs, ChatMessage{Role: role, Content: content})
+		*msgs = append(*msgs, ChatMessage{Role: "user", Content: content})
 	}
 }
 
@@ -439,8 +439,7 @@ func (b *DefaultBuilder) appendIncoming(msgs []ChatMessage, turn *Turn, withStat
 		style = b.readChatStyle()
 	}
 	for i, m := range turn.NewMessages {
-		content := formatChatLine(m.Time, chatSource(m.ChatType, m.ChatID),
-			senderLabel(m.SenderID, m.SenderName, m.IsSelf), truncateContent(m.Text))
+		content, _ := marshalCompact(messageView(b.store, turn.SelfID, m, "live"))
 		if i == 0 {
 			content = "当前时间: " + turn.Now.Format(nowLayout) + "\n" + content
 			if withState && turn.Mood != "" {

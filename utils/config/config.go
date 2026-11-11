@@ -115,6 +115,7 @@ type ModelCandidate struct {
 	APIKey        string   `yaml:"api_key" mapstructure:"api_key"`
 	APIKeyEnv     string   `yaml:"api_key_env" mapstructure:"api_key_env"`
 	Model         string   `yaml:"model" mapstructure:"model"`
+	ToolChoice    string   `yaml:"tool_choice" mapstructure:"tool_choice"`
 	Capabilities  []string `yaml:"capabilities" mapstructure:"capabilities"`
 	ContextWindow int      `yaml:"context_window" mapstructure:"context_window"`
 	Weight        int      `yaml:"weight" mapstructure:"weight"`
@@ -134,6 +135,7 @@ type ModelTier struct {
 	BaseURL      string           `yaml:"base_url" mapstructure:"base_url"`
 	APIKey       string           `yaml:"api_key" mapstructure:"api_key"`
 	Model        string           `yaml:"model" mapstructure:"model"`
+	ToolChoice   string           `yaml:"tool_choice" mapstructure:"tool_choice"`
 	Capabilities []string         `yaml:"capabilities" mapstructure:"capabilities"`
 }
 
@@ -153,17 +155,20 @@ func (t ModelTier) EffectiveCandidates(tierName string) []ModelCandidate {
 	}
 	return []ModelCandidate{{
 		Name: tierName, BaseURL: t.BaseURL, APIKey: t.APIKey,
-		Model: t.Model, Capabilities: t.Capabilities,
+		Model: t.Model, Capabilities: t.Capabilities, ToolChoice: t.ToolChoice,
 	}}
 }
 
 // AgentConfig AI 交互配置，与 Config.yaml 中 agent 块对应。
 // 注意：viper UnmarshalKey 走 mapstructure，多单词键需 mapstructure 标签。
 type AgentConfig struct {
-	Enable      bool   `yaml:"enable" mapstructure:"enable"`
-	BaseURL     string `yaml:"base_url" mapstructure:"base_url"`
-	APIKey      string `yaml:"api_key" mapstructure:"api_key"`
-	Model       string `yaml:"model" mapstructure:"model"`
+	Enable  bool   `yaml:"enable" mapstructure:"enable"`
+	BaseURL string `yaml:"base_url" mapstructure:"base_url"`
+	APIKey  string `yaml:"api_key" mapstructure:"api_key"`
+	Model   string `yaml:"model" mapstructure:"model"`
+	// ToolChoice: empty preserves provider defaults; required forces tool calls.
+	// A candidate may override with auto if its provider lacks required support.
+	ToolChoice  string `yaml:"tool_choice" mapstructure:"tool_choice"`
 	PersonaFile string `yaml:"persona_file" mapstructure:"persona_file"`
 	GuideFile   string `yaml:"guide_file" mapstructure:"guide_file"`
 	// ImageDir 内容寻址图片缓存落盘目录；空串 = 默认 agent/images。
@@ -213,7 +218,9 @@ type AgentContext struct {
 
 func (c AgentContext) WithDefaults() AgentContext {
 	if c.MaxInputTokens == 0 {
-		c.MaxInputTokens = 48000
+		// 固定开销（人格+指南+全量工具文档）已接近 3.7 万估算 token，
+		// 预算须留出工作记录空间；实际提供商上下文更小时请显式调低。
+		c.MaxInputTokens = 64000
 	}
 	if c.ReviewAfterWakes == 0 {
 		c.ReviewAfterWakes = 8
@@ -341,6 +348,9 @@ func validateConfig(netSetting *NetSetting, napcat *Napcat, storage *Storage, ag
 
 // validateAgentConfig 校验启用的 agent 块。
 func validateAgentConfig(agent *AgentConfig) error {
+	if err := validateToolChoice("agent.tool_choice", agent.ToolChoice); err != nil {
+		return err
+	}
 	baseURL := strings.TrimSpace(agent.BaseURL)
 	u, err := url.ParseRequestURI(baseURL)
 	if err != nil {
@@ -366,6 +376,9 @@ func validateAgentConfig(agent *AgentConfig) error {
 	}
 	// models 分档：支持一档多候选，同时兼容旧的单模型写法。
 	for name, tier := range agent.Models {
+		if err := validateToolChoice("agent.models."+name+".tool_choice", tier.ToolChoice); err != nil {
+			return err
+		}
 		switch tier.Strategy {
 		case "", "priority":
 		default:
@@ -378,6 +391,9 @@ func validateAgentConfig(agent *AgentConfig) error {
 		seen := make(map[string]bool, len(candidates))
 		for i, cand := range candidates {
 			label := fmt.Sprintf("agent.models.%s.candidates[%d]", name, i)
+			if err := validateToolChoice(label+".tool_choice", cand.ToolChoice); err != nil {
+				return err
+			}
 			if strings.TrimSpace(cand.Name) == "" {
 				return fmt.Errorf("%s.name must not be empty", label)
 			}
@@ -455,6 +471,15 @@ func validateAgentConfig(agent *AgentConfig) error {
 		return fmt.Errorf("agent.context requires max_input_tokens >= 2048, summary_tokens < half the input budget, and keep_recent_messages >= 2")
 	}
 	return nil
+}
+
+func validateToolChoice(label, value string) error {
+	switch value {
+	case "", "auto", "required":
+		return nil
+	default:
+		return fmt.Errorf("%s must be empty, auto or required, got %q", label, value)
+	}
 }
 
 // MultimodalEnabled 缺键(nil)默认开启。

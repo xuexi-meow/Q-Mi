@@ -79,11 +79,13 @@ type At struct {
 }
 
 func (a *At) TypeMake(data json.RawMessage) (any, error) {
-	var v At
+	var v struct {
+		QQ FlexString `json:"qq"`
+	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return nil, err
 	}
-	return v, nil
+	return At{QQ: string(v.QQ)}, nil
 }
 
 func (a At) Stringf() string {
@@ -95,11 +97,13 @@ type Reply struct {
 }
 
 func (r *Reply) TypeMake(data json.RawMessage) (any, error) {
-	var v Reply
+	var v struct {
+		ID FlexString `json:"id"`
+	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return nil, err
 	}
-	return v, nil
+	return Reply{ID: string(v.ID)}, nil
 }
 
 func (r Reply) Stringf() string {

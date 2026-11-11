@@ -80,7 +80,7 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 	// 假 OpenAI:固定返回 pong-reply
 	openai := &e2eRecorder{}
 	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		openai.handle(w, r, `{"choices":[{"index":0,"message":{"role":"assistant","content":"pong-reply"}}]}`)
+		openai.handle(w, r, twoToolCallResp("send", "send_message", `{"chat_type":"group","chat_id":888,"text":"pong-reply"}`, "done", "finish", "{}"))
 	}))
 	defer openaiSrv.Close()
 
@@ -151,7 +151,7 @@ func TestEndToEndGroupAtMessageReplies(t *testing.T) {
 		t.Errorf("假 OpenAI 请求数 = %d, want 1", got)
 	}
 
-	// 未 @ 的群消息:P2 起同样入队进思考循环,模型(此处为纯文本兼容路径)直接回复
+	// 未 @ 的群消息仍可由模型主动通过工具参与。
 	noAtMsg := `{
 		"post_type":"message","message_type":"group","sub_type":"normal",
 		"message_id":2,"group_id":888,"user_id":12345,"self_id":999,
@@ -208,7 +208,7 @@ func TestEndToEndGroupImageMessageMultimodal(t *testing.T) {
 
 	openai := &e2eRecorder{}
 	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		openai.handle(w, r, `{"choices":[{"index":0,"message":{"role":"assistant","content":"图收到了"}}]}`)
+		openai.handle(w, r, twoToolCallResp("send", "send_message", `{"chat_type":"group","chat_id":888,"text":"图收到了"}`, "done", "finish", "{}"))
 	}))
 	defer openaiSrv.Close()
 

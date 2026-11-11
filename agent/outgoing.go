@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"errors"
 	"html"
 	"regexp"
@@ -17,6 +18,7 @@ var (
 // validateOutgoingText rejects copied context envelopes instead of guessing which
 // part to delete. Explicit code blocks and blockquotes can still quote raw logs.
 func validateOutgoingText(text string) error {
+	envelope := copiedContextEnvelope(text)
 	fence := ""
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(html.UnescapeString(raw))
@@ -31,9 +33,25 @@ func validateOutgoingText(text string) error {
 		if fence != "" || strings.HasPrefix(line, ">") {
 			continue
 		}
-		if contextChatLine.MatchString(line) || internalTagLine.MatchString(line) || contextMetaLine.MatchString(line) {
+		if envelope || copiedContextEnvelope(line) || contextChatLine.MatchString(line) || internalTagLine.MatchString(line) || contextMetaLine.MatchString(line) {
 			return errors.New("消息正文混入上下文前缀或内部标签，未发送；请只保留给对方看的正文，不含时间/会话/发送者包装或思考过程。确需引用原始日志或标签时使用代码块或引用格式")
 		}
 	}
 	return nil
+}
+
+func copiedContextEnvelope(text string) bool {
+	var row struct {
+		Kind     string          `json:"kind"`
+		ChatType string          `json:"chat_type"`
+		ChatID   json.RawMessage `json:"chat_id"`
+		UserID   json.RawMessage `json:"user_id"`
+		Text     *string         `json:"text"`
+	}
+	if json.Unmarshal([]byte(text), &row) != nil {
+		return false
+	}
+	return (row.Kind == "qq_message" || row.Kind == "background_event") &&
+		(row.ChatType == "group" || row.ChatType == "private") &&
+		len(row.ChatID) > 0 && len(row.UserID) > 0 && row.Text != nil
 }

@@ -5,6 +5,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
@@ -83,6 +84,26 @@ func eventImageRefs(msgs []*evmsg.Message) []imageRef {
 	return refs
 }
 
+func eventSegments(msgs []*evmsg.Message) json.RawMessage {
+	segments := make([]contextSegment, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg == nil {
+			return nil
+		}
+		data := msg.Parsed
+		if len(data) == 0 && msg.Data != nil {
+			data, _ = json.Marshal(msg.Data)
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(data, &fields) != nil || fields == nil {
+			return nil
+		}
+		segments = append(segments, contextSegment{Type: msg.Type, Data: fields})
+	}
+	raw, _ := json.Marshal(segments)
+	return raw
+}
+
 func init() {
 	event.RegisterTyped("message.private", func(e *event.PrivateMessageEvent) {
 		m := getManager()
@@ -102,6 +123,7 @@ func init() {
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
+			Segments:   eventSegments(e.Message),
 			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("private", e.Message, int64(e.SelfID)),
@@ -123,6 +145,7 @@ func init() {
 			SenderID:   int64(e.UserID),
 			SenderName: e.Sender.Nickname,
 			Text:       bot.Text(e.Message),
+			Segments:   eventSegments(e.Message),
 			Images:     eventImageRefs(e.Message),
 			Time:       unixTime(e.Time),
 			Urgent:     urgentFromEvent("group", e.Message, int64(e.SelfID)),

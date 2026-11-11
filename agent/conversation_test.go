@@ -175,11 +175,11 @@ func TestContextDefaultBudgetFitsBundledPromptsAndTools(t *testing.T) {
 
 func TestContextWakeReviewExcludesFixedSchemaOverhead(t *testing.T) {
 	m, f, _ := newLiveManager(t, []string{toolCallResp("done", "finish", "{}")})
-	m.cfg.Context = config.AgentContext{MaxInputTokens: 6000, ReviewAfterWakes: 2,
+	m.cfg.Context = config.AgentContext{MaxInputTokens: 9000, ReviewAfterWakes: 2,
 		SummaryTokens: 128, KeepRecentMessages: 2}
 	m.registry = NewRegistry(module{name: "schema", tools: func(*ToolContext) []Tool {
 		return []Tool{{Name: "unused", Description: strings.Repeat("schema ", 1600),
-			Parameters: objectParams(nil, nil)}}
+			Parameters: objectParams(nil, nil)}, {Name: "finish", Parameters: objectParams(nil, nil)}}
 	}})
 	for i := 0; i < 8; i++ {
 		m.handleTurn(&Turn{SelfID: 999, Now: time.Now(), NewMessages: []TurnMessage{{Text: "small"}}})
@@ -209,7 +209,8 @@ func TestContextPollingWakeCountTracksOnlyActivity(t *testing.T) {
 		toolCallResp("idle", "finish", "{}"),
 		toolCallResp("query", "get_recent_messages", "{}"),
 		toolCallResp("pause", "finish", "{}"),
-		plainResp("hello"),
+		toolCallResp("mood", "update_mood", `{"mood":"hello"}`),
+		toolCallResp("pause2", "finish", "{}"),
 	})
 	startFakeNapCat(t)
 	poll := func() *Turn {
@@ -223,6 +224,6 @@ func TestContextPollingWakeCountTracksOnlyActivity(t *testing.T) {
 	m.handleTurn(poll())
 	m.handleTurn(poll())
 	if m.conversation.wakes != 2 {
-		t.Fatalf("tool work and plain-text activity should both count, got %d", m.conversation.wakes)
+		t.Fatalf("tool activity should count but idle polling should not, got %d", m.conversation.wakes)
 	}
 }

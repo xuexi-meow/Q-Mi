@@ -23,7 +23,7 @@ func TestCompactionUnreadResultsReachModelWithTriggerAndSendReceipt(t *testing.T
 	m.conversation.unreadStart = 2
 	m.registry = NewRegistry(module{name: "test", tools: func(*ToolContext) []Tool {
 		return []Tool{
-			{Name: "send_message", Parameters: objectParams(nil, nil), Run: func(json.RawMessage) (string, error) {
+			{Name: "send_message", Parameters: objectParams(map[string]any{"text": strProp("text")}, []string{"text"}), Run: func(json.RawMessage) (string, error) {
 				return `{"message_id":42}`, nil
 			}},
 			{Name: "get_recent_messages", Parameters: objectParams(nil, nil), Run: func(json.RawMessage) (string, error) {

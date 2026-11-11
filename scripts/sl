@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# sl —— SnowLuma 快速管理（up/down/restart/status/log/follow/vnc/enable/disable）
+# sl —— SnowLuma 快速管理
+#   up/down/restart/status/log/follow/vnc/enable/disable
+#   snapshot [目录] / restore <文件> / snapshots   （可用状态快照备份与回滚）
 set -u
 TARGET=snowluma.target
 CORE=snowluma.service
 UNITS="snowluma.service snowluma-qq.service snowluma-xvfb.service snowluma-wm.service snowluma-vnc.service snowluma-novnc.service"
+SNAP_DIR=/var/lib/snowluma/snapshots
+QQ_CFG=/var/lib/snowluma/qq/.config/QQ
 
 color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
 wsl_ip() { hostname -I | awk '{print $1}'; }
@@ -48,7 +52,63 @@ case "${1:-status}" in
     systemctl disable "$TARGET" 2>/dev/null
     color "1;33" "[SL] 已取消开机自启"
     ;;
+  snapshot|snap)
+    dest="${2:-$SNAP_DIR}"
+    mkdir -p "$dest" || { color "1;31" "无法创建目录 $dest"; exit 1; }
+    ts=$(date +%Y%m%d-%H%M%S)
+    out="$dest/snowluma-$ts.tar.gz"
+    manifest=$(mktemp /tmp/sl-manifest.XXXXXX)
+    {
+      echo "created: $(date -Is)"
+      echo "host: $(hostname)"
+      echo "qq_version: $(grep -o '"version"[^,]*' /opt/QQ/resources/app/package.json 2>/dev/null | head -1)"
+      echo "sl_release: $(head -c 300 /opt/snowluma/runtime/release.json 2>/dev/null)"
+      echo "versions_freeze: $(lsattr -d "$QQ_CFG/versions" 2>/dev/null | awk '{print $1}')"
+    } > "$manifest"
+    color "1;32" "[SL] 打包快照（QQ 客户端 + SL runtime + 配置 + QQ 登录态，排除缓存/媒体）..."
+    tar -czf "$out" \
+      --exclude='*/Cache' --exclude='*/Code Cache' --exclude='*/GPUCache' \
+      --exclude='*/blob_storage' --exclude='*/Crashpad' --exclude='*/crash_files' \
+      --exclude='*/log' --exclude='*/logs' \
+      --exclude='*/Pic' --exclude='*/Video' --exclude='*/File' --exclude='*/Ptt' \
+      /opt/QQ /opt/snowluma/runtime /opt/snowluma/data/config \
+      "$QQ_CFG" "$manifest" 2>/dev/null
+    rm -f "$manifest"
+    if [ -f "$out" ]; then
+      color "1;32" "[SL] 快照完成: $out  ($(du -h "$out" | awk '{print $1}'))"
+      color "1;36" "提示: 登录态以打包时刻为准；重新扫码登录后可再 sl snapshot 捕获在线状态"
+    else
+      color "1;31" "[SL] 快照失败"
+      exit 1
+    fi
+    ;;
+  snapshots|snaps)
+    dir="${2:-$SNAP_DIR}"
+    if [ -d "$dir" ]; then
+      ls -lh "$dir"/snowluma-*.tar.gz 2>/dev/null || echo "(无快照)"
+    else
+      echo "(快照目录不存在: $dir)"
+    fi
+    ;;
+  restore)
+    file="${2:-}"
+    if [ -z "$file" ] || [ ! -f "$file" ]; then
+      color "1;31" "用法: sl restore <快照.tar.gz>（sl snapshots 查看列表）"
+      exit 1
+    fi
+    color "1;33" "即将用快照覆盖 /opt/QQ、SL runtime、QQ 配置与登录态，并重启整栈。"
+    printf "确认继续? [y/N] "
+    read -r ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) color "1;33" "已取消"; exit 0;;
+    esac
+    systemctl stop "$TARGET"
+    tar -xzf "$file" -C / 2>/dev/null
+    systemctl start "$TARGET"
+    color "1;32" "[SL] 已回滚并重启。若 QQ 需重新登录: sl vnc"
+    ;;
   *)
-    echo "用法: sl {up|down|restart|status|log [N]|follow|vnc|enable|disable}"
+    echo "用法: sl {up|down|restart|status|log [N]|follow|vnc|enable|disable|snapshot [目录]|restore <文件>|snapshots}"
     ;;
 esac

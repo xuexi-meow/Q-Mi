@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# sl —— SnowLuma 快速管理（up/down/restart/status/log/follow/vnc/enable/disable）
+set -u
+TARGET=snowluma.target
+CORE=snowluma.service
+UNITS="snowluma.service snowluma-qq.service snowluma-xvfb.service snowluma-wm.service snowluma-vnc.service snowluma-novnc.service"
+
+color() { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
+wsl_ip() { hostname -I | awk '{print $1}'; }
+
+case "${1:-status}" in
+  up|start)
+    color "1;32" "[SL] 启动整栈..."
+    systemctl start "$TARGET"
+    sleep 2
+    systemctl --no-pager --lines=0 status $UNITS 2>/dev/null | grep -E "●|Active:"
+    color "1;32" "[SL] 完成。noVNC: http://$(wsl_ip):6081/vnc.html （密码 /var/lib/snowluma/vnc/password.txt，sl vnc 直接看）"
+    ;;
+  down|stop)
+    color "1;31" "[SL] 停止整栈..."
+    systemctl stop "$TARGET"
+    color "1;31" "[SL] 已停止"
+    ;;
+  restart|re)
+    systemctl restart "$TARGET"
+    color "1;32" "[SL] 已重启"
+    ;;
+  status|st)
+    systemctl --no-pager --lines=0 status $UNITS 2>/dev/null | grep -E "●|Active:"
+    echo "--- 端口 ---"
+    ss -tlnp 2>/dev/null | grep -E ":3000 |:3001 |:5099 |:6081 " | awk '{print $4}' | sort -u
+    ;;
+  log|logs)
+    journalctl -u "$CORE" -n "${2:-50}" --no-pager
+    ;;
+  follow|f)
+    journalctl -u "$CORE" -f
+    ;;
+  vnc)
+    color "1;36" "noVNC: http://$(wsl_ip):6081/vnc.html"
+    color "1;36" "密码: $(cat /var/lib/snowluma/vnc/password.txt 2>/dev/null)"
+    ;;
+  enable)
+    systemctl enable "$TARGET" 2>/dev/null
+    color "1;32" "[SL] 已设开机自启（WSL systemd 拉起）"
+    ;;
+  disable)
+    systemctl disable "$TARGET" 2>/dev/null
+    color "1;33" "[SL] 已取消开机自启"
+    ;;
+  *)
+    echo "用法: sl {up|down|restart|status|log [N]|follow|vnc|enable|disable}"
+    ;;
+esac

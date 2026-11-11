@@ -89,13 +89,18 @@ type Manager struct {
 	usageMu      sync.Mutex // 保护按候选用量统计
 	usageByModel map[string]*UsageSnapshot
 
-	mu           sync.Mutex // 保护账号收件箱
-	inbox        *accountInbox
-	runMu        sync.Mutex // 串行化活动与工作上下文
-	wakeMu       sync.Mutex // 保护轮询 goroutine（热重载换间隔时重启）
-	wakeStop     chan struct{}
-	conversation workingConversation
-	usage        UsageSnapshot
+	mu                sync.Mutex // 保护账号收件箱
+	inbox             *accountInbox
+	runMu             sync.Mutex // 串行化活动与工作上下文
+	wakeMu            sync.Mutex // 保护轮询 goroutine（热重载换间隔时重启）
+	wakeStop          chan struct{}
+	conversation      workingConversation
+	usage             UsageSnapshot
+	inspectionMu      sync.RWMutex
+	inspectionRuntime RuntimeInspection
+	inspectionRequest *ContextSnapshot
+	inspectionWorking *ContextSnapshot
+	inspectionVersion uint64
 }
 
 // NewManager 构造 Manager。store 可为 nil（无历史/查询工具报错）。
@@ -173,7 +178,7 @@ func (m *Manager) ApplyConfig(next config.AgentConfig) {
 
 	// 模型接入变更：重建候选池；顶层三件套变了就换 legacy 客户端。
 	endpointChanged := old.BaseURL != next.BaseURL || old.APIKey != next.APIKey
-	if endpointChanged || old.ToolChoice != next.ToolChoice || !reflect.DeepEqual(old.Models, next.Models) {
+	if endpointChanged || old.Model != next.Model || old.ToolChoice != next.ToolChoice || !reflect.DeepEqual(old.Models, next.Models) || !reflect.DeepEqual(old.WakeRoutes, next.WakeRoutes) {
 		m.poolMu.Lock()
 		if endpointChanged && next.BaseURL != "" {
 			m.legacyClient = NewClient(next.BaseURL, next.APIKey, llmRequestTimeout)
@@ -364,8 +369,17 @@ func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need mo
 			// 候选不支持视觉：图片降级为文字标注（不修改会话里的原消息）。
 			req.Messages = stripImageParts(req.Messages)
 		}
+		phase := "summarizing"
+		if len(req.Tools) > 0 {
+			phase = "requesting"
+			m.publishInspection("request", req.Messages, req.Tools)
+		}
+		m.setInspectionPhase(phase, 0, slot.name, slot.model, tier)
 		resp, chatErr := slot.client.Chat(ctx, req)
 		if chatErr == nil {
+			m.inspectionMu.Lock()
+			m.inspectionRuntime.LastUsage = resp.Usage
+			m.inspectionMu.Unlock()
 			slot.markSuccess()
 			return resp, slot, tier, nil
 		}
@@ -401,12 +415,19 @@ func (m *Manager) fireTimer(st ScheduledTimer) {
 // 加载笔记/情绪 → 组装上下文 → 循环调 LLM：
 //   - 响应含 tool_calls：逐个执行（finish 只标记不执行，同批其他工具先执行），
 //     assistant + tool 消息回填后继续下一轮
-//   - 纯文本响应：视为直接回复发出（兼容不会用工具的模型），结束
+//   - 纯文本响应：只保留为内部工作，反馈协议错误，不对外发送
 //   - finish：结束
 //   - 轮数耗尽 / LLM 错误：强制结束，记日志
 func (m *Manager) handleTurn(turn *Turn) {
 	m.runMu.Lock()
 	defer m.runMu.Unlock()
+	m.setInspectionPhase("preparing", 0, "", "", "")
+	var inspectionErr error
+	var inspectionDefs []ToolDef
+	defer func() {
+		m.publishInspection("working", m.conversation.messages, inspectionDefs)
+		m.finishInspection(inspectionErr)
+	}()
 	ctx := context.Background()
 	beforeUsage := m.usage
 	defer func() {
@@ -418,6 +439,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 	}()
 	defer func() {
 		if r := recover(); r != nil {
+			inspectionErr = fmt.Errorf("worker panic: %v", r)
 			m.conversation = workingConversation{}
 			slog.Error("agent worker panic，已恢复继续服务",
 				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "panic", r)
@@ -447,6 +469,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 
 	protocolFailures := 0
 	for round := 1; round <= maxRounds; round++ {
+		m.setInspectionPhase("preparing", round, "", "", "")
 		var toolCtx *ToolContext
 		var tools []Tool
 		var defs []ToolDef
@@ -460,8 +483,10 @@ func (m *Manager) handleTurn(turn *Turn) {
 			}
 			tools = m.toolRegistry().Build(toolCtx)
 			defs = toolDefs(tools)
+			inspectionDefs = defs
 			revision := m.conversation.compactions
 			if err := m.prepareContext(ctx, turn, defs); err != nil {
+				inspectionErr = err
 				m.events.Record(turn.ChatType, turn.ChatID, KindError, err.Error())
 				slog.Warn("上下文预算不足，暂停活动", "err", err)
 				return
@@ -489,6 +514,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 		need := needForMessages(msgs)
 		resp, slot, tier, chatErr := m.chat(ctx, turn, req, need, attempts)
 		if chatErr != nil {
+			inspectionErr = chatErr
 			if cfg.Debug {
 				m.dumpDebug(turn, req, round, nil, nil, chatErr, false)
 			}
@@ -541,8 +567,10 @@ func (m *Manager) handleTurn(turn *Turn) {
 			})
 			msgs = append(msgs, ChatMessage{Role: "user", Content: feedback})
 			m.conversation.messages = msgs
+			m.publishInspection("working", msgs, defs)
 			m.events.Record(turn.ChatType, turn.ChatID, KindError, "tool_call_required: 普通输出未发送")
 			if protocolFailures >= 3 {
+				inspectionErr = errors.New("连续三次工具调用协议错误")
 				return
 			}
 			continue
@@ -564,6 +592,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			ReasoningContent: resp.ReplayReasoning(),
 		})
 		finished := false
+		m.setInspectionPhase("tools", round, "", "", "")
 		type toolOutcome struct {
 			executed bool
 			id       string
@@ -625,6 +654,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 			m.dumpDebug(turn, req, round, resp, results, nil, false)
 		}
 		m.conversation.messages = msgs
+		m.publishInspection("working", msgs, defs)
 		if finished {
 			m.events.Record(turn.ChatType, turn.ChatID, KindFinish, "结束思考")
 			slog.Info("结束思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
@@ -633,6 +663,7 @@ func (m *Manager) handleTurn(turn *Turn) {
 	}
 
 	m.events.Record(turn.ChatType, turn.ChatID, KindError, "轮数上限")
+	inspectionErr = errors.New("轮数上限")
 	slog.Warn("思考轮数达到上限，强制结束本轮",
 		"chat_type", turn.ChatType, "chat_id", turn.ChatID, "max_tool_rounds", maxRounds)
 }

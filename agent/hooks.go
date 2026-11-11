@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"Q-Mi/app"
 )
 
 // 钩子的错误语义（导出供 webui 区分「agent 未启用」与请求参数问题）。
@@ -37,7 +39,7 @@ func SetManagerForTest(m *Manager) (restore func()) {
 // EventsAfter 返回思考链事件环形缓冲中 ID > after 的事件（按序）。
 // agent 未启用时返回 nil。
 func EventsAfter(after uint64) []Event {
-	m := getManager()
+	m := inspectionManager()
 	if m == nil {
 		return nil
 	}
@@ -137,11 +139,62 @@ func MoodSet(mood string) error {
 
 // TimerList 待触发计时器快照（按触发时间正序）；agent 未启用返回 nil。
 func TimerList() []ScheduledTimer {
-	m := getManager()
+	m := inspectionManager()
 	if m == nil || m.timerStore == nil {
 		return nil
 	}
 	return m.timerStore.List()
+}
+
+func inspectionManager() *Manager {
+	managerMu.Lock()
+	defer managerMu.Unlock()
+	return manager
+}
+
+func RuntimeInspect() RuntimeInspection {
+	if m := inspectionManager(); m != nil {
+		return m.InspectRuntime()
+	}
+	phase := "uninitialized"
+	if a := app.GetApp(); a != nil {
+		if cfg := a.Current(); cfg != nil && (cfg.Agent == nil || !cfg.Agent.Enable) {
+			phase = "disabled"
+		}
+	}
+	return RuntimeInspection{Phase: phase}
+}
+
+func ContextInspect(q ContextQuery) (ContextPage, error) {
+	m := inspectionManager()
+	if m == nil {
+		m = &Manager{}
+	}
+	return m.InspectContext(q)
+}
+
+func ContextEntryInspect(source string, version uint64, index int) (InspectionEntry, error) {
+	m := inspectionManager()
+	if m == nil {
+		return InspectionEntry{}, ErrInspectionIndex
+	}
+	return m.InspectEntry(source, version, index)
+}
+
+func TaskInspect(limit int) []TaskInspection {
+	out := []TaskInspection{}
+	m := inspectionManager()
+	if m == nil || m.tasks == nil {
+		return out
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	tasks := m.tasks.List("")
+	for i := len(tasks) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, taskInspection(tasks[i]))
+	}
+	return out
 }
 
 // TimerCount 在跑计时器数量（agent 未启用为 0）。

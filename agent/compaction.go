@@ -182,6 +182,7 @@ func (m *Manager) prepareContext(ctx context.Context, turn *Turn, defs []ToolDef
 			c.unreadStart = unreadStart
 			c.messages, c.wakes = messages, 0
 			c.compactions++
+			m.publishInspection("working", c.messages, defs)
 			slog.Info("工作上下文已压缩", "before_estimate", size,
 				"after_estimate", estimatedInputTokens(messages, defs), "removed_messages", len(prefix))
 		}
@@ -226,6 +227,7 @@ func (c *workingConversation) withSummary(head, cut int, summary string) ([]Chat
 }
 
 func (m *Manager) summarizeContext(ctx context.Context, turn *Turn, prefix []ChatMessage) string {
+	m.setInspectionPhase("summarizing", 0, "", "", "")
 	cfg := m.config()
 	policy := cfg.Context.WithDefaults()
 	transcript := summaryTranscript(prefix, policy.MaxInputTokens-textTokens(summaryInstructions)-64)

@@ -2,11 +2,54 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 	"unicode"
 )
+
+var ErrMessageAnchor = errors.New("消息不在指定会话中")
+
+// MessageWindow returns a stable window containing the scoped anchor, newest first.
+func (s *Store) MessageWindow(chatType string, chatID, messageID int64, limit int) ([]*MessageRecord, error) {
+	target, err := s.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil || target.Recalled || target.ChatType != chatType || target.ChatID != chatID {
+		return nil, ErrMessageAnchor
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.Query(`SELECT `+messageCols+` FROM messages WHERE message_id IN (
+		SELECT message_id FROM (SELECT message_id FROM messages
+			WHERE chat_type=? AND chat_id=? AND recalled=0 AND (time,message_id) <= (?,?)
+			ORDER BY time DESC,message_id DESC LIMIT ?)
+		UNION ALL SELECT message_id FROM (SELECT message_id FROM messages
+			WHERE chat_type=? AND chat_id=? AND recalled=0 AND (time,message_id) > (?,?)
+			ORDER BY time ASC,message_id ASC LIMIT ?))
+		ORDER BY time DESC,message_id DESC`,
+		chatType, chatID, target.Time, messageID, (limit+1)/2,
+		chatType, chatID, target.Time, messageID, limit/2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*MessageRecord{}
+	for rows.Next() {
+		r, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
 
 // MessageRecord messages 表的一行
 type MessageRecord struct {

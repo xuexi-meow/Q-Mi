@@ -103,6 +103,10 @@ func handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := restoreMaskedPatch(store, patch); err != nil {
+		http.Error(w, "配置序列化失败", http.StatusInternalServerError)
+		return
+	}
 	stripMasked(patch)
 	if err := store.ValidatePatch(patch); err != nil {
 		http.Error(w, "配置校验失败: "+err.Error(), http.StatusBadRequest)
@@ -131,6 +135,10 @@ func handleConfigValidate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := guardRestartFields(patch); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := restoreMaskedPatch(store, patch); err != nil {
+		http.Error(w, "配置序列化失败", http.StatusInternalServerError)
 		return
 	}
 	stripMasked(patch)
@@ -363,6 +371,64 @@ func stripMasked(value any) {
 	case []any:
 		for _, item := range v {
 			stripMasked(item)
+		}
+	}
+}
+
+func restoreMaskedPatch(store *config.Store, patch map[string]any) error {
+	effective, err := configToMap(store.Snapshot())
+	if err != nil {
+		return err
+	}
+	restoreMaskedSecrets(patch, effective, false)
+	return nil
+}
+
+func restoreMaskedSecrets(value, current any, candidate bool) {
+	switch incoming := value.(type) {
+	case map[string]any:
+		existing, _ := current.(map[string]any)
+		for key, item := range incoming {
+			if candidate {
+				if masked, ok := item.(string); ok && strings.Contains(masked, "****") {
+					if secret, ok := existing[key].(string); ok && secret != "" {
+						incoming[key] = secret
+					}
+					continue
+				}
+			}
+			restoreMaskedSecrets(item, existing[key], candidate || key == "candidates")
+		}
+	case []any:
+		existing, _ := current.([]any)
+		if !candidate {
+			for i, item := range incoming {
+				if i < len(existing) {
+					restoreMaskedSecrets(item, existing[i], false)
+				}
+			}
+			return
+		}
+		byName := make(map[string]any, len(existing))
+		for _, item := range existing {
+			if candidate, ok := item.(map[string]any); ok {
+				if name, ok := candidate["name"].(string); ok && name != "" {
+					byName[name] = candidate
+				}
+			}
+		}
+		for i, item := range incoming {
+			var prior any
+			if candidate, ok := item.(map[string]any); ok {
+				if name, ok := candidate["name"].(string); ok && name != "" {
+					prior = byName[name]
+				} else if i < len(existing) {
+					prior = existing[i]
+				}
+			} else if i < len(existing) {
+				prior = existing[i]
+			}
+			restoreMaskedSecrets(item, prior, true)
 		}
 	}
 }

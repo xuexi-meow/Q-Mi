@@ -55,12 +55,56 @@ agent:
           api_key: "sk-candidate-key-9999"
           model: "deepseek-flash"
           capabilities: [tools, vision]
+        - name: backup
+          base_url: "` + modelURL + `"
+          api_key: "sk-backup-key-8888"
+          model: "backup-model"
+          capabilities: [tools]
 webui:
   enable: false
   host: "127.0.0.1"
   port: 8848
   token: "webui-token-1234"
 `
+}
+
+func TestConfigMaskedCandidateSavePreservesKey(t *testing.T) {
+	store := newConfigStore(t, configYAML("http://127.0.0.1:1"))
+	body := `{"agent":{"models":{"chat":{"candidates":[{"name":"deepseek","model":"changed-model","base_url":"http://127.0.0.1:1","api_key":"sk-****9999","capabilities":["tools","vision"],"tool_choice":"required","context_window":128000,"weight":2,"cooldown":"3m"}]}}}}`
+	status, response := callConfig(t, handleConfigPut, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("save: %d %s", status, response)
+	}
+	c := store.Snapshot().Agent.Models["chat"].Candidates[0]
+	if c.APIKey != "sk-candidate-key-9999" {
+		t.Fatalf("masked array save lost real key: %q", c.APIKey)
+	}
+	if c.Model != "changed-model" || c.ToolChoice != "required" || c.ContextWindow != 128000 || c.Weight != 2 || c.Cooldown != "3m" {
+		t.Fatalf("candidate fields lost: %+v", c)
+	}
+}
+
+func TestConfigMaskedCandidateSaveMatchesKeysAfterReordering(t *testing.T) {
+	store := newConfigStore(t, configYAML("http://127.0.0.1:1"))
+	body := `{"agent":{"models":{"chat":{"candidates":[
+		{"name":"backup","model":"backup-v2","api_key":"sk-****8888"},
+		{"name":"deepseek","model":"deepseek-v2","api_key":"sk-****9999"}
+	]}}}}`
+	status, response := callConfig(t, handleConfigPut, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("save: %d %s", status, response)
+	}
+	candidates := store.Snapshot().Agent.Models["chat"].Candidates
+	if len(candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(candidates))
+	}
+	got := map[string]string{}
+	for _, candidate := range candidates {
+		got[candidate.Name] = candidate.APIKey
+	}
+	if got["backup"] != "sk-backup-key-8888" || got["deepseek"] != "sk-candidate-key-9999" {
+		t.Fatalf("masked keys were not matched by candidate name: %+v", got)
+	}
 }
 
 // newConfigStore 建临时配置仓库并把 webui 的取用接缝指向它。

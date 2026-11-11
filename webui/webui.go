@@ -82,6 +82,14 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/runtime":
+			handleRuntime(w, r)
+		case "/api/context":
+			handleContext(w, r)
+		case "/api/context/message":
+			handleContextEntry(w, r)
+		case "/api/tasks":
+			handleTasks(w, r)
 		case "/api/overview":
 			handleOverview(w, r)
 		case "/api/chats":
@@ -275,16 +283,20 @@ func probeNapcat(r *http.Request) napcatStatus {
 // messageJSON /api/messages 与 /api/search 响应的消息行形态（spec §4）。
 // direction/user_id 供前端 recv/sent 区分与「昵称(QQ号)」展示。
 type messageJSON struct {
-	MessageID  int64   `json:"message_id"`
-	ChatType   string  `json:"chat_type"`
-	ChatID     int64   `json:"chat_id"`
-	Direction  string  `json:"direction"`
-	UserID     int64   `json:"user_id"`
-	SenderName string  `json:"sender_name"`
-	Text       string  `json:"text"`
-	RawMessage string  `json:"raw_message"`
-	Time       float64 `json:"time"`
-	Recalled   bool    `json:"recalled"`
+	MessageID       int64            `json:"message_id"`
+	ChatType        string           `json:"chat_type"`
+	ChatID          int64            `json:"chat_id"`
+	Direction       string           `json:"direction"`
+	UserID          int64            `json:"user_id"`
+	SenderName      string           `json:"sender_name"`
+	Text            string           `json:"text"`
+	RawMessage      string           `json:"raw_message"`
+	Time            float64          `json:"time"`
+	Recalled        bool             `json:"recalled"`
+	Mentions        []string         `json:"mentions"`
+	AddressingKnown bool             `json:"addressing_known"`
+	Segments        []messageSegment `json:"segments"`
+	Reply           map[string]any   `json:"reply,omitempty"`
 }
 
 // cqImageRe 匹配 [CQ:image,...] 码（值内逗号转义为 &#44;，不含 ]）。
@@ -294,12 +306,14 @@ var cqImageRe = regexp.MustCompile(`\[CQ:image,[^\]]*\]`)
 // toMessageJSON MessageRecord 转 JSON 行；text 为展示文本（[CQ:image,...]
 // 码替换为 [图片]，其余 CQ 码原样），raw_message 保留原始内容。
 func toMessageJSON(r *storage.MessageRecord) messageJSON {
-	return messageJSON{
+	row := messageJSON{
 		MessageID: r.MessageID, ChatType: r.ChatType, ChatID: r.ChatID,
 		Direction: r.Direction, UserID: r.UserID,
 		SenderName: r.SenderName, Text: cqImageRe.ReplaceAllString(r.RawMessage, "[图片]"),
 		RawMessage: r.RawMessage, Time: r.Time, Recalled: r.Recalled,
 	}
+	addMessageMetadata(&row, r)
+	return row
 }
 
 // queryInt 解析整型查询参数：缺失/非法/非正数用默认值，超出上限截到 max。
@@ -371,7 +385,21 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, []messageJSON{})
 		return
 	}
-	rows, err := s.QueryMessages(f)
+	var rows []*storage.MessageRecord
+	if around := r.URL.Query().Get("around_message_id"); around != "" {
+		id, parseErr := strconv.ParseInt(around, 10, 64)
+		if parseErr != nil || id == 0 || r.URL.Query().Get("before_time") != "" {
+			http.Error(w, "around_message_id 无效或与 before_time 冲突", 400)
+			return
+		}
+		rows, err = s.MessageWindow(chatType, chatID, id, f.Limit)
+		if errors.Is(err, storage.ErrMessageAnchor) {
+			http.Error(w, "消息不在该会话中", 404)
+			return
+		}
+	} else {
+		rows, err = s.QueryMessages(f)
+	}
 	if err != nil {
 		slog.Warn("WebUI 消息查询失败", "err", err)
 		http.Error(w, "查询消息失败", http.StatusInternalServerError)
@@ -626,8 +654,8 @@ func handleFile(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		name := r.URL.Query().Get("name")
-		path, ok := fileWhitelist[name]
-		if !ok {
+		path, pathErr := promptFilePath(name)
+		if pathErr != nil {
 			http.Error(w, "name 仅支持 persona 或 guide", http.StatusBadRequest)
 			return
 		}
@@ -640,7 +668,7 @@ func handleFile(w http.ResponseWriter, r *http.Request) {
 			}
 			data = nil // 尚未创建过：编辑器从空白开始
 		}
-		writeJSON(w, map[string]string{"content": string(data)})
+		writeJSON(w, map[string]string{"content": string(data), "path": path})
 	case http.MethodPut:
 		var req struct {
 			Name    string `json:"name"`
@@ -650,8 +678,8 @@ func handleFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "请求体应为 JSON", http.StatusBadRequest)
 			return
 		}
-		path, ok := fileWhitelist[req.Name]
-		if !ok {
+		path, pathErr := promptFilePath(req.Name)
+		if pathErr != nil {
 			http.Error(w, "name 仅支持 persona 或 guide", http.StatusBadRequest)
 			return
 		}
@@ -665,7 +693,7 @@ func handleFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "写入文件失败", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true, "effect": "next_request"})
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}

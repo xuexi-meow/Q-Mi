@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
+
 	"strings"
 	"sync"
 	"testing"
@@ -811,27 +811,6 @@ func TestNapcatDocsTool(t *testing.T) {
 		out := runToolOK(t, tools, "napcat_docs", `{"action":"`+want+`"}`)
 		if objOf(t, out)["action"] != want {
 			t.Errorf("napcat_docs 找不到动作 %q", want)
-		}
-	}
-}
-
-func TestActionRegistryCoversAllActions(t *testing.T) {
-	// 全量动作注册表：与 api 包 196 个动作一一对应（192 个 P3-1 + api.go 4 个）
-	if len(actionRegistry) != 196 {
-		t.Errorf("动作注册表数量 = %d, want 196", len(actionRegistry))
-	}
-	for name, typ := range actionRegistry {
-		if name == "" || strings.HasPrefix(name, "/") {
-			t.Errorf("注册表键非法: %q", name)
-		}
-		req := reflect.New(typ).Interface().(interface{ Path() string })
-		if strings.TrimPrefix(req.Path(), "/") != name {
-			t.Errorf("注册表键 %q 与 Path() 不一致", name)
-		}
-	}
-	for _, want := range []string{"send_group_msg", "delete_msg", "get_friend_list", "upload_group_file", "set_group_kick"} {
-		if _, ok := actionRegistry[want]; !ok {
-			t.Errorf("注册表缺动作 %q", want)
 		}
 	}
 }

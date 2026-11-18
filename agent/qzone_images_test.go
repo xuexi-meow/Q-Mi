@@ -39,12 +39,13 @@ func TestQzoneImagesBrowseKeepsLinksWithoutDownloading(t *testing.T) {
 	if unknown := feeds[1].(map[string]any); unknown["image_count"] != nil {
 		t.Fatalf("unknown images must not be reported as zero: %#v", unknown)
 	}
-	if hits.Load() != 0 || len(turn.pendingImages) != 0 {
+	if hits.Load() != 0 || len(turn.PendingImages()) != 0 {
 		t.Fatal("browsing must not download or attach images without an explicit view")
 	}
 	args, _ := json.Marshal(map[string]any{"urls": []string{srv.URL + "/b.png"}})
 	runToolOK(t, tools, "view_qzone_images", string(args))
-	if hits.Load() != 1 || len(turn.pendingImages) != 1 || turn.pendingImages[0] != pngDataURL {
+	pending := turn.PendingImages()
+	if hits.Load() != 1 || len(pending) != 1 || pending[0] != pngDataURL {
 		t.Fatal("selected feed image did not reach the attachment queue")
 	}
 }
@@ -111,16 +112,17 @@ func TestQzoneImagesViewReportsFailuresWithoutAttachingURLs(t *testing.T) {
 			t.Fatalf("unidentified failed image: %#v", row)
 		}
 	}
-	if len(turn.pendingImages) != 1 || turn.pendingImages[0] != pngDataURL {
-		t.Fatalf("failed URL was attached as if it were an image: %#v", turn.pendingImages)
+	pending := turn.PendingImages()
+	if len(pending) != 1 || pending[0] != pngDataURL {
+		t.Fatalf("failed URL was attached as if it were an image: %#v", pending)
 	}
 	if strings.Contains(text, "base64,") {
 		t.Fatal("image bytes must not be embedded in the textual tool result")
 	}
-	turn.pendingImages = nil
+	turn.ClearPendingImages()
 	args, _ = json.Marshal(map[string]any{"urls": []string{srv.URL + "/dead"}})
 	out = objOf(t, runToolOK(t, tools, "view_qzone_images", string(args)))
-	if out["attached"] != float64(0) || len(turn.pendingImages) != 0 {
+	if out["attached"] != float64(0) || len(turn.PendingImages()) != 0 {
 		t.Fatalf("all-failed view claimed to attach images: %#v", out)
 	}
 }
@@ -144,7 +146,7 @@ func TestQzoneImagesViewValidatesBeforeDownloading(t *testing.T) {
 			runToolErr(t, tools, "view_qzone_images", args)
 		})
 	}
-	if hits.Load() != 0 || len(turn.pendingImages) != 0 {
+	if hits.Load() != 0 || len(turn.PendingImages()) != 0 {
 		t.Fatal("invalid request caused a partial download or attachment")
 	}
 	for _, ctx := range []*ToolContext{{}, {Turn: turn}, {Images: newImageStore(t.TempDir(), nil)}} {
@@ -161,9 +163,9 @@ func TestQzoneImagesViewLimitsEachCallAndReusesCache(t *testing.T) {
 	}
 	args, _ := json.Marshal(map[string]any{"urls": urls})
 	for i := 0; i < 2; i++ {
-		turn.pendingImages = nil
+		turn.ClearPendingImages()
 		out := objOf(t, runToolOK(t, tools, "view_qzone_images", string(args)))
-		if out["attached"] != float64(5) || len(turn.pendingImages) != 5 {
+		if out["attached"] != float64(5) || len(turn.PendingImages()) != 5 {
 			t.Fatalf("five selected images did not attach: %#v", out)
 		}
 	}
@@ -211,8 +213,8 @@ func TestQzoneImagesReachNextVisionRequest(t *testing.T) {
 			}
 		}
 	}
-	if images != 1 || len(turn.pendingImages) != 0 || napcat.count() != 0 {
+	if images != 1 || len(turn.PendingImages()) != 0 || napcat.count() != 0 {
 		t.Fatalf("attachment delivery/cleanup failed or sent to QQ: images=%d pending=%d QQ=%d",
-			images, len(turn.pendingImages), napcat.count())
+			images, len(turn.PendingImages()), napcat.count())
 	}
 }

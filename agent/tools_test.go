@@ -137,7 +137,7 @@ func runToolErr(t *testing.T, tools []Tool, name, args string) error {
 // qzone → admin → system；help 已由 PromptDocs 取代）。
 var wantToolNames = []string{
 	// core
-	"send_message", "think", "update_mood", "finish",
+	"send_message", "think", "update_mood", "finish", "sleep", "sleep_status",
 	// memory
 	"get_recent_messages", "search_messages", "get_message", "view_message_images", "chat_dnd",
 	// sticker
@@ -624,12 +624,7 @@ func TestScheduleToolSchedulesAndReturnsID(t *testing.T) {
 	}
 
 	// chat 上下文来自 turn：group/888/self=999
-	timer.mu.Lock()
-	recs := make([]ScheduledTimer, 0, len(timer.records))
-	for _, r := range timer.records {
-		recs = append(recs, r)
-	}
-	timer.mu.Unlock()
+	recs := timer.List()
 	if len(recs) != 1 || recs[0].ID != res.ID || recs[0].Note != "10分钟后看看他回了没" ||
 		recs[0].ChatType != "group" || recs[0].ChatID != 888 || recs[0].SelfID != 999 {
 		t.Errorf("落库记录应捕获 turn 会话上下文: %+v", recs)
@@ -1062,11 +1057,12 @@ func TestViewMessageImagesDirectSuccess(t *testing.T) {
 	if napcat.count() != 0 {
 		t.Errorf("直连成功不应调 NapCat, got %d 次", napcat.count())
 	}
-	if len(turn.pendingImages) != 1 {
-		t.Fatalf("pendingImages 应有 1 张, got %d", len(turn.pendingImages))
+	pending := turn.PendingImages()
+	if len(pending) != 1 {
+		t.Fatalf("pendingImages 应有 1 张, got %d", len(pending))
 	}
-	if !strings.HasPrefix(turn.pendingImages[0], "data:image/png;base64,") {
-		t.Errorf("pendingImages[0] 应为 png data URL: %q", turn.pendingImages[0][:40])
+	if !strings.HasPrefix(pending[0], "data:image/png;base64,") {
+		t.Errorf("pendingImages[0] 应为 png data URL: %q", pending[0][:40])
 	}
 }
 
@@ -1105,8 +1101,9 @@ func TestViewMessageImagesGetImageChainSwitch(t *testing.T) {
 	if napcat.count() != 1 || napcat.path(0) != "/get_image" {
 		t.Fatalf("应恰好调 1 次 /get_image, got %v", napcat.paths)
 	}
-	if len(turn.pendingImages) != 1 || !strings.HasPrefix(turn.pendingImages[0], "data:image/png;base64,") {
-		t.Fatalf("pendingImages 应有 1 张换链成功的 data URL, got %v", turn.pendingImages)
+	pending := turn.PendingImages()
+	if len(pending) != 1 || !strings.HasPrefix(pending[0], "data:image/png;base64,") {
+		t.Fatalf("pendingImages 应有 1 张换链成功的 data URL, got %v", pending)
 	}
 }
 
@@ -1138,8 +1135,8 @@ func TestViewMessageImagesDoubleFailureSkips(t *testing.T) {
 	if napcat.count() != 1 {
 		t.Errorf("应调 1 次 get_image 换链, got %d", napcat.count())
 	}
-	if len(turn.pendingImages) != 0 {
-		t.Errorf("双失败不应有 pendingImages, got %v", turn.pendingImages)
+	if len(turn.PendingImages()) != 0 {
+		t.Errorf("双失败不应有 pendingImages, got %v", turn.PendingImages())
 	}
 }
 
@@ -1199,8 +1196,9 @@ func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
 			t.Errorf("行 images = %v, want 2", row["images"])
 		}
 	}
-	if len(turn.pendingImages) != maxAutoAttachImages {
-		t.Fatalf("pendingImages 应封顶 %d 张, got %d", maxAutoAttachImages, len(turn.pendingImages))
+	pending := turn.PendingImages()
+	if len(pending) != 5 {
+		t.Fatalf("pendingImages 应封顶 5 张, got %d", len(pending))
 	}
 	// 最新一条（message_id=3）整行 2 张都附上；次新行 2 张；最旧行只附上第
 	// 5 张（封顶截断，6 张里只带 5）——三行都有 images_attached 标记
@@ -1213,7 +1211,7 @@ func TestQueryMessageRowsAutoAttachesImages(t *testing.T) {
 	if rows[0]["message_id"] != float64(1) || rows[0]["images_attached"] != true {
 		t.Errorf("最旧行应附第 5 张（封顶截断）: %v", rows[0])
 	}
-	for _, du := range turn.pendingImages {
+	for _, du := range pending {
 		if !strings.HasPrefix(du, "data:image/png;base64,") {
 			t.Errorf("pendingImages 应为 png data URL: %q", du[:40])
 		}

@@ -192,7 +192,7 @@ func TestApprovalFlowEndToEnd(t *testing.T) {
 	tool := Tool{
 		Name: "danger_op", Description: "测试", Parameters: objectParams(map[string]any{"x": intProp("x")}, nil),
 		Run: func(args json.RawMessage) (string, error) {
-			return "{}", approvalNeeded{"演示用危险操作"}
+			return "{}", approvalNeeded{Reason: "演示用危险操作"}
 		},
 	}
 	tools := []Tool{tool}
@@ -230,7 +230,7 @@ func TestApprovalFlowEndToEnd(t *testing.T) {
 	ran := make(chan string, 1)
 	id, err := approvals.Request(Approval{
 		Tool: "danger_op", Args: `{}`, Reason: "test",
-		run: func(bool) (string, error) { ran <- "executed"; return "{}", nil },
+		Run: func(bool) (string, error) { ran <- "executed"; return "{}", nil },
 	})
 	if err != nil {
 		t.Fatalf("登记失败: %v", err)

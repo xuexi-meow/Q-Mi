@@ -1,0 +1,46 @@
+.context-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 0 20px;
+  border-bottom: 2px solid var(--danger);
+  color: var(--danger);
+}
+.context-alert > svg { flex: 0 0 20px; margin-top: 2px; }
+.context-alert > div { min-width: 0; }
+.context-alert p { margin: 8px 0; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.context-budget-parts, .context-review-meta {
+  display: flex;
+  gap: 8px 20px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.context-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 0 0 20px; }
+.context-commands { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.context-commands button { font-size: 12px; }
+.context-editor { margin: 18px 0; }
+.context-textarea { min-height: 280px; max-height: 52dvh; font-size: 13px; }
+.context-check { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 16px 0; font-size: 12px; }
+.context-impact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 20px 0;
+  margin: 12px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.context-impact span { display: block; font-size: 12px; color: var(--muted); }
+.context-impact strong { display: block; font-size: 24px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.context-impact > svg { color: var(--muted); }
+.context-reset-warning { color: var(--danger); overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .context-commands { flex: 1 0 100%; margin-left: 0; }
+  .context-commands button { flex: 1 0 calc(50% - 8px); padding: 8px; }
+  .context-impact { gap: 10px; }
+  .context-impact strong { font-size: 21px; }
+  .context-budget-parts { display: grid; gap: 4px; }
+  .context-textarea { min-height: 220px; }
+}

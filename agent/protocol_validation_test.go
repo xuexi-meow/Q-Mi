@@ -103,16 +103,15 @@ func TestOversizeToolResultRemainsValidJSON(t *testing.T) {
 		toolCallResp("large", "get_recent_messages", `{}`),
 		toolCallResp("done", "finish", `{}`),
 	})
-	m.registry = NewRegistry()
 	// Use the normal registry interface with a deterministic local tool.
-	m.registry.modules = []ToolModule{module{name: "large", tools: func(*ToolContext) []Tool {
+	m.registry = NewRegistry(module{name: "large", tools: func(*ToolContext) []Tool {
 		return []Tool{
 			{Name: "get_recent_messages", Parameters: objectParams(nil, nil), Run: func(json.RawMessage) (string, error) {
 				return `{"data":"` + strings.Repeat(`\"`, maxContentRunes) + `"}`, nil
 			}},
 			{Name: "finish", Parameters: objectParams(nil, nil)},
 		}
-	}}}
+	}})
 	m.handleTurn(&Turn{SelfID: 999})
 	if f.count() != 2 {
 		t.Fatalf("requests=%d, want 2", f.count())

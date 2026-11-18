@@ -82,12 +82,20 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/sleep":
+			handleSleep(w, r)
+		case "/api/sleep/wake":
+			handleSleepWake(w, r)
 		case "/api/runtime":
 			handleRuntime(w, r)
 		case "/api/context":
 			handleContext(w, r)
 		case "/api/context/message":
 			handleContextEntry(w, r)
+		case "/api/context/edit":
+			handleContextEdit(w, r)
+		case "/api/context/action":
+			handleContextAction(w, r)
 		case "/api/tasks":
 			handleTasks(w, r)
 		case "/api/overview":
@@ -100,6 +108,8 @@ func Start(cfg config.WebUIConfig) (*http.Server, error) {
 			handleSearch(w, r)
 		case "/api/events":
 			handleEvents(w, r)
+		case "/api/events/wait":
+			handleEventsWait(w, r)
 		case "/api/notes":
 			handleNotes(w, r)
 		case "/api/mood":
@@ -468,6 +478,32 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]agent.Event, 0, len(events))
 	out = append(out, events...)
 	writeJSON(w, out)
+}
+
+func handleEventsWait(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	after := uint64(0)
+	if value := query.Get("after"); value != "" {
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			http.Error(w, "after must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		after = parsed
+	}
+	timeout := 20000
+	if value := query.Get("timeout_ms"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 30000 {
+			http.Error(w, "timeout_ms must be between 0 and 30000", http.StatusBadRequest)
+			return
+		}
+		timeout = parsed
+	}
+	events, cursor, reset := agent.EventsWaitAfter(r.Context(), after, time.Duration(timeout)*time.Millisecond)
+	out := make([]agent.Event, 0, len(events))
+	out = append(out, events...)
+	writeJSON(w, map[string]any{"events": out, "cursor": cursor, "reset": reset})
 }
 
 // ================= W3 agent 控制页（spec §3.2/§4） =================

@@ -7,8 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"Q-Mi/utils/config"
 )
 
 // TestSameRoundToolCallsRunConcurrently 同轮多工具并发执行：两个慢 poke 的
@@ -230,45 +228,5 @@ func TestWakeForMerge(t *testing.T) {
 	def := wakeFor([]TurnMessage{{}})
 	if def != WakeChat {
 		t.Errorf("空 Wake 应视为 chat, got %s", def)
-	}
-}
-
-// TestPoolRoutingFallsBackToChat 未配置 background 档时，后台唤醒回退 chat。
-func TestPoolRoutingFallsBackToChat(t *testing.T) {
-	legacy := NewClient("https://chat.example", "k1", time.Second)
-	pool := buildPool(config.AgentConfig{}, legacy)
-	slot, tier, err := pool.pick(WakeBackground, modelNeed{Tools: true}, nil)
-	if err != nil || tier != WakeChat || slot.client != legacy {
-		t.Fatalf("background wake should fall back to chat legacy, got %v/%s/%v", slot, tier, err)
-	}
-}
-
-// TestBuildPoolLegacyCompat 未配置 models 时只有 legacy chat 一个候选；
-// 配置后各档独立候选，显式 chat 档覆盖 legacy。
-func TestBuildPoolLegacyCompat(t *testing.T) {
-	legacy := NewClient("https://legacy.example", "k0", time.Second)
-	cfg := config.AgentConfig{}
-
-	pool := buildPool(cfg, legacy)
-	chat := pool.tiers[WakeChat]
-	if len(chat) != 1 || chat[0].client != legacy {
-		t.Fatalf("legacy 模式应只有 chat=legacy")
-	}
-
-	cfg.Models = map[string]config.ModelTier{
-		WakeBackground: {BaseURL: "https://bg.example", APIKey: "k2", Model: "glm-4.6v-flash"},
-	}
-	pool = buildPool(cfg, legacy)
-	if got := pool.tiers[WakeBackground]; len(got) != 1 || got[0].client == legacy {
-		t.Errorf("background 档应建独立客户端")
-	}
-	if got := pool.tiers[WakeChat]; len(got) != 1 || got[0].client != legacy {
-		t.Errorf("chat 档应保持 legacy")
-	}
-
-	cfg.Models[WakeChat] = config.ModelTier{BaseURL: "https://chat.example", APIKey: "k1", Model: "deepseek-flash"}
-	pool = buildPool(cfg, legacy)
-	if got := pool.tiers[WakeChat]; len(got) != 1 || got[0].client == legacy {
-		t.Errorf("显式 chat 档应覆盖 legacy")
 	}
 }

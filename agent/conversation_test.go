@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	agentcontext "Q-Mi/agent/context"
 	"Q-Mi/utils/config"
 )
 
@@ -55,13 +56,13 @@ func TestCompactionCanCompressReadWorkWithinOneWake(t *testing.T) {
 
 func TestCompactionPreservesCurrentStateOutsideSummary(t *testing.T) {
 	m, _ := seedCompaction(t, plainResp("old material summarized"))
-	m.conversation.state = "[当前状态快照]\ncurrent-note-must-remain\n[/当前状态快照]"
-	m.conversation.messages[5] = ChatMessage{Role: "user", Content: m.conversation.state}
-	m.conversation.unreadStart = len(m.conversation.messages)
+	m.conversation.State = "[当前状态快照]\ncurrent-note-must-remain\n[/当前状态快照]"
+	m.conversation.Messages[5] = agentcontext.FromWire(ChatMessage{Role: "user", Content: m.conversation.State}, agentcontext.KindState)
+	m.conversation.UnreadStart = len(m.conversation.Messages)
 	if err := m.prepareContext(context.Background(), &Turn{SelfID: 999}, nil); err != nil {
 		t.Fatal(err)
 	}
-	text := requestText(ChatRequest{Messages: m.conversation.messages})
+	text := requestText(ChatRequest{Messages: agentcontext.ToWireMessages(m.conversation.Messages)})
 	if !strings.Contains(text, "current-note-must-remain") {
 		t.Fatal("compaction delegated the current live state to a lossy summary")
 	}
@@ -76,7 +77,7 @@ func seedCompaction(t *testing.T, summaryResponse string) (*Manager, *fakeLLM) {
 	m.cfg.Context = config.AgentContext{
 		MaxInputTokens: 5000, SummaryTokens: 256, KeepRecentMessages: 3,
 	}
-	m.conversation.messages = []ChatMessage{
+	m.conversation.Messages = agentcontext.FromWireMessages([]ChatMessage{
 		{Role: "system", Content: "initial"},
 		{Role: "user", Content: "pending-goal " + strings.Repeat("archived-data ", 1500)},
 		{Role: "assistant", ToolCalls: []ToolCall{
@@ -92,8 +93,8 @@ func seedCompaction(t *testing.T, summaryResponse string) (*Manager, *fakeLLM) {
 		}},
 		{Role: "tool", ToolCallID: "recent1", Content: "recent-evidence-one"},
 		{Role: "tool", ToolCallID: "recent2", Content: "recent-evidence-two"},
-	}
-	m.conversation.unreadStart = len(m.conversation.messages)
+	})
+	m.conversation.UnreadStart = len(m.conversation.Messages)
 	return m, f
 }
 
@@ -191,7 +192,7 @@ func TestContextWakeReviewExcludesFixedSchemaOverhead(t *testing.T) {
 
 func TestCompactionArrivalsEnterNextActionRequest(t *testing.T) {
 	m, f := seedCompaction(t, plainResp("old material summarized"))
-	m.inbox = &accountInbox{ready: make(chan struct{}, 1)}
+	m.inbox = newCapturedInbox(t)
 	f.hook = func(idx int, _ *http.Request) {
 		if idx == 0 {
 			m.Enqueue(msg("private", 222, "arrived-during-summary"))
@@ -218,12 +219,12 @@ func TestContextPollingWakeCountTracksOnlyActivity(t *testing.T) {
 			NewMessages: []TurnMessage{{Wake: WakeBackground, SenderName: "轮询", Text: "[定时轮询]"}}}
 	}
 	m.handleTurn(poll())
-	if m.conversation.wakes != 0 {
+	if m.conversation.Wakes != 0 {
 		t.Fatal("idle polling counted as a meaningful wake")
 	}
 	m.handleTurn(poll())
 	m.handleTurn(poll())
-	if m.conversation.wakes != 2 {
-		t.Fatalf("tool activity should count but idle polling should not, got %d", m.conversation.wakes)
+	if m.conversation.Wakes != 2 {
+		t.Fatalf("tool activity should count but idle polling should not, got %d", m.conversation.Wakes)
 	}
 }

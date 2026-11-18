@@ -1,154 +1,182 @@
-# Agent Package Architecture Design
+# Agent 包结构设计
 
-Date: 2026-11-12
-Status: Draft for user review
+日期：2026-11-12
 
-## 1. Context
+状态：用户已确认；结构迁移与短测验收完成，真实 Chrome 集成验收受环境权限限制。
 
-The `agent` implementation currently lives in one Go package and one directory. It contains orchestration, context construction, model protocol/client code, tool registration and execution, individual tool capabilities, event wiring, browser automation, and supporting state services. This makes the package easy to extend locally, but broadens the implicit dependency surface: every file can access every unexported symbol in the package.
+## 1. 现状与目标
 
-The current inventory has 86 Go files including tests. `manager.go` is about 31 KB and `tools.go` is about 101 KB. Existing tool modules are registered in-process through `ToolModule` and `ToolRegistry`; they are statically assembled and do not provide runtime hot loading.
+目前 `agent` 的实现都放在同一个 Go 包和目录中，职责包括：事件接入、会话编排、上下文构建、模型协议与客户端、工具注册和执行、各类工具实现、浏览器自动化及运行状态管理。由于所有文件属于同一个包，彼此可以直接访问私有类型和函数，依赖关系不够显式，也不容易独立理解和测试。
 
-The change is intended to make responsibilities and dependencies easier to understand and test while preserving current behavior. Future additions may include custom tool modules and context contributors. Those should have stable compile-time interfaces, without committing to a dynamic plugin runtime now.
+初步盘点共有 86 个 Go 文件（包含测试）；`manager.go` 约 31 KB，`tools.go` 约 101 KB。现有工具通过 `ToolModule` 和 `ToolRegistry` 在进程内静态注册，没有运行时热加载能力。
 
-## 2. Goals
+本次目标是改善职责边界和依赖方向，同时保持现有行为。未来可能增加自定义工具和上下文扩展，因此需要清晰的编译期 Go 接口；这不等于现在就建设动态插件系统。
 
-- Introduce real Go package boundaries for agent responsibilities instead of only renaming or regrouping files.
-- Keep the existing `Q-Mi/agent` import path and user-visible behavior stable during migration.
-- Make orchestration, context construction, model access, tool contracts, and tool implementations independently understandable and testable.
-- Define extension contracts for tools and context contributors that can support future in-tree extensions.
-- Ensure dependencies point toward stable contracts and do not form import cycles.
-- Migrate incrementally, with behavior-preserving tests at every extraction.
+## 2. 目标
 
-## 3. Non-Goals
+- 用真正的 Go 子包建立职责边界，而不只是重命名文件或目录。
+- 迁移期间保持 `Q-Mi/agent` 导入路径及用户可见行为稳定。
+- 让会话编排、上下文、模型访问、工具契约和工具实现更容易独立理解与测试。
+- 为内置工具和上下文扩展定义清晰的编译期接口。
+- 让依赖指向稳定契约，避免循环依赖。
+- 分阶段迁移，每次拆分都用测试保护现有行为。
 
-- No rewrite of agent behavior, prompts, message protocol, tool semantics, or model selection.
-- No dynamic Go plugin loading, runtime hot swapping, third-party plugin sandbox, or MCP integration.
-- No broad restructuring of unrelated packages such as `event`, `storage`, `api`, or `webui`.
-- No one-shot migration of all files or speculative generic framework for arbitrary extensions.
-- No requirement to split every internal service into its own package; components remain together until an independent boundary is demonstrated.
+## 3. 本次不做
 
-## 4. Target Package Boundaries
+- 不重写 Agent 行为、提示词、消息协议、工具语义或模型选择。
+- 不做 Go 动态插件加载、运行时热切换、第三方插件沙箱或 MCP 集成。
+- 不大范围重构 `event`、`storage`、`api`、`webui` 等无关包。
+- 不一次性迁移所有文件，也不为尚未出现的扩展需求搭建通用框架。
+- 不要求每个内部服务都单独成包；只有形成独立且合理的边界时才拆分。
 
-The target is a dependency-oriented structure. Names below describe responsibilities; exact file assignment is decided during implementation after checking symbol references.
+## 4. 目标包边界
 
-```text
-agent/                       Public facade, compatibility API, event wiring, composition root
-agent/runtime/               Session lifecycle, inbox processing, conversation/tool loop
-agent/context/               Turn/context contracts, context assembly, compaction, inspection views
-agent/context/providers/      Built-in context contributors, registered by the composition root
-agent/model/                 Chat protocol types, provider client, model routing/pool, usage
-agent/tool/                  Tool and module contracts, execution contracts, narrow dependency ports
-agent/tools/<capability>/    Built-in tool implementations grouped by capability
-```
-
-Candidate tool capability packages include QQ messaging and administration, memory and message lookup, browser, computer, QZone, stickers, and system utilities. These packages are extracted only where their dependency surface can be made explicit. Closely coupled implementations may remain together until a safe boundary is established.
-
-`agent` remains the compatibility facade and composition root. It constructs runtime services, supplies built-in tool modules and context contributors, and connects external events. Existing callers should not need to import internal packages. The `Manager` is not moved as an initial mechanical step; orchestration is extracted after shared contracts and dependency directions are stable.
-
-The `agent/tool` package owns contracts and registry/execution abstractions only. Capability packages implement those contracts. The composition root imports both the contract package and concrete capabilities and assembles the registry. The registry must not import concrete capability packages, preventing parent/child package cycles.
-
-Similarly, `agent/context` defines context-contribution contracts and assembly behavior. Built-in contributors are provided by the composition root; the context package does not import its `providers` subpackage.
-
-## 5. Dependency Rules
-
-The intended dependency direction is:
+下面是按职责划分的目标结构。具体文件归属要在实施时检查符号引用后确定。
 
 ```text
-external callers
-       |
-       v
-agent facade / composition root
-       |
-       +------> runtime ------> context contracts/assembly
-       |          |             model contracts/client
-       |          |             tool contracts/execution
-       |          +-----------> storage and external ports
-       |
-       +------> built-in context providers
-       +------> built-in tool capability packages
+agent/                         对外门面、兼容 API、事件接线和依赖组装
+agent/runtime/                 会话生命周期、收件队列、对话与工具循环
+agent/context/                 Turn/上下文契约、上下文组装、压缩和检查视图
+agent/model/                   聊天协议类型、模型客户端、路由/候选池和用量
+agent/tool/                    工具与模块契约、执行契约、精简依赖接口
+agent/tools/<能力>/             按能力划分的内置工具实现
+agent/workspacepath/           工作区路径围栏与 NapCat/WSL 路径转换
 ```
 
-Rules:
+候选工具能力包括 QQ 消息与管理、记忆和消息查询、浏览器、电脑操作、QQ 空间、表情和系统工具。只有依赖能够明确表达的能力才会拆成独立包；耦合较强的实现可以暂时留在一起。
 
-- Internal packages do not import `Q-Mi/agent`; the facade may import internal packages.
-- `runtime` depends on context, model, and tool abstractions, not on concrete tool capability packages.
-- Tool capability packages depend on `agent/tool` contracts and narrow service interfaces. They do not receive or import the runtime manager.
-- Context contributors depend on `agent/context` contracts and receive an immutable, scoped input for one turn.
-- Packages do not depend on sibling implementation details through exported global variables or package-level singleton state.
-- Shared types are placed with the responsibility that owns their invariants. A catch-all `common` package is explicitly avoided.
-- If a proposed extraction creates an import cycle, the boundary must be revised by moving the smallest stable contract to the owning abstraction package, not by adding broad bidirectional callbacks.
+`agent` 保留为兼容门面和依赖组装层，负责构造运行时、提供内置工具模块和上下文提供器，并接入外部事件。初期不机械地搬走 `Manager`；等共享契约和依赖方向稳定后，再抽取编排职责。
 
-## 6. Extension Contracts
+`agent/tool` 只放契约、注册和执行抽象。具体能力包实现这些契约；组装层同时导入契约包和具体能力包，创建工具注册表。注册表不能反向导入具体能力包，以免形成父子包循环依赖。
 
-### Tool modules
+类似地，`agent/context` 定义上下文贡献契约和组装行为，提供器由组装层传入；`agent/context` 不得反向导入具体提供器。当前笔记、情绪和聊天习惯仍是核心状态，不为它们新增没有实际必要的 `providers` 目录。
 
-Tool implementations are registered through Go interfaces at process composition time. Each module declares its stable identity and returns its tools using a scoped dependency object composed from narrow interfaces. Tool metadata, schemas, ordering, and execution results remain behaviorally identical during the refactor.
+## 5. 依赖规则
 
-The current static module list remains the source of built-in tools. Configuration continues to enable or disable supported modules using existing semantics. Runtime discovery, dynamic loading, and hot replacement are outside scope.
+预期依赖方向：
 
-### Context contributors
+```text
+外部调用方
+    |
+    v
+agent 门面 / 依赖组装层
+    |
+    +----> runtime ----> context 契约与组装
+    |        |           model 契约与客户端
+    |        |           tool 契约与执行
+    |        +---------> storage 和外部接口
+    |
+    +----> 内置上下文提供器
+    +----> 内置工具能力包
+```
 
-Context assembly may accept multiple contributors. Each contributor returns explicitly identified context material for the current turn; the assembly layer controls deterministic ordering and inclusion in the final request. A contributor cannot mutate prior conversation history or replace the complete prompt.
+具体规则：
 
-Contributor inputs must be scoped to the current conversation/turn and treated as immutable. Contributor failures are logged with their identity and isolated where omission is safe. Required core context remains owned by the builder and cannot be silently omitted because an optional contributor failed.
+- 内部包不得导入 `Q-Mi/agent`；`agent` 门面可以导入内部包。
+- `runtime` 依赖上下文、模型和工具抽象，不依赖具体工具能力包。
+- 工具能力包依赖 `agent/tool` 契约和精简服务接口，不接收或导入运行时 `Manager`。
+- 上下文提供器依赖 `agent/context` 契约，并且只能接收当前会话/轮次范围内的只读输入。
+- 不通过导出全局变量或包级单例，让一个包依赖另一个包的内部实现。
+- 共享类型放在真正负责其约束的包中，不创建无明确职责的 `common` 包。
+- 如果拆分导致循环依赖，应重新审视边界，把最小稳定契约放到合适的抽象包，而不是增加宽泛的双向回调。
 
-The first implementation only defines and uses in-process Go interfaces for existing built-in context construction. It does not add a user-facing plugin configuration surface unless needed by an existing configuration behavior.
+## 6. 扩展接口
 
-## 7. Runtime Data Flow
+### 工具模块
 
-1. The `agent` facade receives or registers an external event and converts it into the existing incoming-message contract.
-2. `runtime` routes the message to the correct conversation queue and owns wake-up, serialization, cancellation, and turn completion.
-3. `context` builds a request from the current turn, bounded conversation history, built-in context contributors, and inspection metadata.
-4. `model` sends the request through the currently configured candidate/routing behavior.
-5. If the response includes tool calls, `runtime` resolves them through the tool registry and executes the selected capability with scoped dependencies and the current turn.
-6. Tool results return to the same turn; the loop either continues or completes according to existing protocol behavior.
-7. The facade delivers the final output through existing QQ/NapCat integrations.
+工具通过 Go 接口在进程组装时注册。每个模块声明稳定标识，并使用由精简接口组成的依赖对象提供工具。重构期间必须保持工具元数据、参数结构、顺序和执行结果行为一致。
 
-At each step, conversation identity (`chat_type`, `chat_id`, account/self ID) remains explicit. No context, tool execution, or result may be shared across chats unless existing behavior explicitly requires it.
+当前静态工具清单仍是内置工具的来源，现有配置启停语义保持不变。不做运行时发现、动态加载或热替换。
 
-## 8. Migration Strategy
+### 上下文提供器
 
-Migration is incremental and behavior-preserving. Each phase is independently buildable and testable.
+上下文组装层可以接收多个提供器。每个提供器只能为当前轮次返回带明确来源标识的上下文片段；最终顺序和是否纳入请求由组装层统一控制。提供器不能改写历史消息，也不能替换整份提示词。
 
-1. **Baseline and ownership map:** Record package tests and key behavioral invariants. Map references for large and highly connected files before moving code. Establish a dependency check using Go package tooling.
-2. **Model boundary:** Extract protocol/client and model-pool responsibilities into `agent/model`. Keep adapters in `agent` where needed to preserve existing API usage.
-3. **Contract boundaries:** Establish the smallest stable tool and context contracts. Replace broad concrete dependencies with narrow interfaces only where required for extraction.
-4. **Context boundary:** Move context building, compaction, and inspection-related data shaping into `agent/context`, while keeping orchestration decisions in runtime.
-5. **Tool capabilities:** Split tool implementations by coherent capability. Migrate one capability at a time, preserving tool names, schemas, order, error results, permissions, and async behavior.
-6. **Runtime boundary:** Move queue and conversation lifecycle into `agent/runtime` once it can depend only on the preceding abstractions. Keep the facade as the compatibility and composition layer.
-7. **Cleanup:** Remove obsolete adapters only after all callers use the new boundaries; update architecture documentation and verify the final import graph.
+提供器输入限定在当前会话和轮次内，并按只读数据处理。提供器失败时要记录其身份；只有在安全的情况下，才允许仅省略该提供器的内容。核心上下文仍由构建器负责，不能因为可选提供器失败而静默丢失。
 
-The sequence may be adjusted if reference analysis shows a lower-risk extraction order, but the dependency rules and behavior-preservation requirements do not change. No phase combines unrelated event, storage, or WebUI restructuring.
+首次实现只为现有内置上下文整理进程内 Go 接口，不新增用户可见的插件配置，除非现有配置行为确实需要。
 
-## 9. Compatibility and Error Behavior
+实际接口为 `StateProvider.Name()` 与 `State(ProviderInput) (StateFragment, error)`，通过 `DefaultBuilder.SetStateProviders` 固定顺序注入。输入只含账号、会话身份和轮次时间，不持有可变 Turn、消息或工具。返回片段须与输入身份完全一致，作为 `references` 放入状态快照，不能改写系统提示或历史。混合会话/身份不完整时不调用可选提供器；失败具名记录并仅省略自身内容。单片段有长度上限。默认不注册提供器，旧状态 JSON 不增加字段，笔记、情绪和聊天习惯行为保持不变。
 
-- Preserve the `Q-Mi/agent` package path and currently used public hooks during the migration.
-- Preserve event names, wake semantics, message IDs, chat/account scoping, tool schemas and ordering, approval behavior, async task behavior, context message order, and model routing.
-- Keep existing configuration keys and defaults. A new extension interface does not imply a new configuration setting.
-- Tool and context failures must remain observable through existing error/logging paths. Optional context contributor failures may omit only that contributor's material; they may not cause another chat's content to be inserted.
-- Do not convert recoverable optional capability failures into process-wide startup failures. Required dependency failures retain current startup semantics.
+## 7. 运行时数据流
 
-## 10. Verification
+1. `agent` 门面接收或注册外部事件，并转成现有的入站消息结构。
+2. `runtime` 将消息路由到对应会话队列，负责唤醒、串行执行、取消和轮次结束。
+3. `context` 根据当前轮次、受限长度的历史、内置上下文提供器和检查信息构造模型请求。
+4. `model` 按当前配置的候选和路由行为发送请求。
+5. 如果模型返回工具调用，`runtime` 通过工具注册表找到对应能力，并以当前轮次和精简依赖执行。
+6. 工具结果回到同一轮次；对话循环按当前协议继续思考或结束。
+7. `agent` 门面通过现有 QQ/NapCat 集成发送最终输出。
 
-For each extraction:
+每个步骤都必须显式保留会话身份（`chat_type`、`chat_id`、账号/机器人 ID）。除现有行为明确要求外，不得跨群或跨会话共享上下文、工具执行或结果。
 
-- Run focused tests for the extracted package and the importing facade/runtime packages.
-- Run `go test ./...` to catch repository-wide behavior and import errors.
-- Run `go vet ./...` after package boundaries settle.
-- Verify package import direction and absence of import cycles.
-- Compare tool names, schemas, descriptions, and registry ordering against the pre-extraction behavior.
-- Keep or add tests for chat isolation, context assembly order, tool dispatch/permissions, approvals, async completion, and facade compatibility where the moved code affects those contracts.
+## 8. 迁移顺序
 
-The final refactor is accepted only when the complete Go test suite passes and the package graph follows the dependency rules above. If environment restrictions prevent a verification command from running, report that explicitly rather than treating it as a pass.
+迁移采取小步、保持行为的方式；每个阶段都应能单独构建和测试。
 
-## 11. Open Implementation Decisions
+1. **建立基线与归属图**：记录测试现状和关键行为约束；先分析大文件和高耦合文件的引用关系；建立 Go 包依赖检查。
+2. **抽取模型边界**：将协议、客户端和模型池职责移到 `agent/model`；必要时在 `agent` 留兼容适配层。
+3. **建立契约边界**：明确最小工具与上下文接口；仅在抽取需要时，把宽泛的具体依赖替换成小接口。
+4. **抽取上下文边界**：将上下文构建、压缩及检查数据整理移入 `agent/context`，把编排决策留在 runtime。
+5. **拆分工具能力**：按职责逐个迁移工具模块，并保持工具名称、参数结构、顺序、错误结果、权限和异步语义。
+6. **抽取运行时边界**：仅当队列和对话生命周期可以依赖上述抽象时，才移入 `agent/runtime`；`agent` 保留兼容入口和组装职责。
+7. **清理与复核**：所有调用方迁移后再删旧适配器；更新架构文档并复核最终依赖图。
 
-These decisions are intentionally deferred until symbol/reference analysis for each extraction:
+具体先后可根据符号引用分析调整，但依赖规则和行为保持要求不变。任何阶段都不顺带重构无关的事件、存储或 WebUI 代码。
 
-- Exact public names and method signatures for context contributors and tool dependency ports.
-- Whether the model protocol DTOs and provider client should share one package or use an internal protocol subpackage.
-- Which tool capabilities have enough independent dependencies to become separate packages in the first migration.
-- Which inspection types belong in context versus runtime; ownership follows the data invariants discovered during extraction.
+## 9. 兼容性与错误处理
 
-These are implementation-level choices and do not change the approved target boundaries, dependency rules, or non-goals.
+- 迁移期间保持 `Q-Mi/agent` 包路径和当前使用的公开钩子。
+- 保持事件名、唤醒语义、消息 ID、群聊/账号隔离、工具参数结构和顺序、审批行为、异步任务行为、上下文消息顺序及模型路由。
+- 保持现有配置键和默认值。增加扩展接口不意味着必须增加新配置项。
+- 工具和上下文错误必须沿用可观察的错误/日志路径。可选上下文提供器失败时，只能省略自身内容，不能串入其它群的内容。
+- 可选能力的可恢复错误不能升级为整个进程的启动失败；必需依赖仍遵守现有启动语义。
+
+## 10. 验证方式
+
+每次拆分都应：
+
+- 运行新包及其调用方（门面/runtime）的定向测试。
+- 运行 `go test ./...`，检查全仓行为和包依赖。
+- 包边界稳定后运行 `go vet ./...`。
+- 检查依赖方向和循环依赖。
+- 对比拆分前后的工具名称、参数结构、说明文本和注册顺序。
+- 按受影响范围补充或保留群聊隔离、上下文组装顺序、工具分派/权限、审批、异步完成及门面兼容测试。
+
+最终验收要求是完整 Go 测试通过，且依赖图符合上述规则。如果环境权限或依赖问题导致命令无法执行，必须明确报告，不能把未运行当作通过。
+
+## 11. 实施时再定的细节
+
+下列事项要等每次拆分时完成符号/引用分析后再定：
+
+- 上下文提供器和工具依赖接口的准确命名与方法签名。
+- 模型协议 DTO 和服务商客户端是放在同一个包，还是拆出内部协议包。
+- 哪些工具能力依赖足够独立，适合第一批分包。
+- 检查视图相关类型归属 `context` 还是 `runtime`；按数据约束的实际所有者决定。
+
+这些是实施层面的选择，不改变已确认的目标包边界、依赖规则和本次不做事项。
+
+## 12. 最终落地与验收
+
+验收日期：2026-11-13。
+
+- `agent/model` 已承接 wire DTO、HTTP/SSE、候选路由与图片降级；根包通过类型别名和薄适配保持旧入口。
+- `agent/context` 已承接消息元数据、Turn、构建器、图片缓存、预算算法、持久笔记/情绪、检查视图和可选状态提供器契约。
+- `agent/tool` 已承接工具契约、泛型静态注册、参数校验和审批信号。具体能力使用各自的 `Dependencies`，而不是一个不断膨胀的通用工具上下文。
+- 七个具体能力包为 `memory`、`sticker`、`qzone`、`qq`、`system`、`browser`、`computer`。根包保留模块元信息、固定注册顺序及依赖组装。
+- `agent/runtime` 已承接账号收件箱、工作会话、活动循环、工具执行、压缩策略、审批、后台任务、定时器和事件日志。根 `Manager` 保留配置热更新、模型请求接线、外部投递与检查发布；没有为了换目录再造一个重复的运行时 Manager。
+- 保持账号级串行活动与混合输入语义，每条消息携带其原始会话身份；不是按群新建独立 worker。
+- 运行数据已有 `agent/workspace` 目录且被忽略，因此路径代码使用 `agent/workspacepath`，不与运行数据混放。
+- 删除无调用的旧私有实现；测试专用辅助符号移入 `_test.go`。公开兼容入口仍保留。
+- 同时修复经回归测试确认的审批旧闭包问题：审批通过后重建带批准状态的工具，不再重复执行未批准的旧闭包。工具已不可用时明确报错，不回退执行。
+
+验证结果：
+
+- `go test -short ./... -count=1`：通过，包含工具协议快照、会话来源、审批、异步、流式及 WebUI 回归。
+- `go vet ./...`、`go build ./...`、`go list ./...`：通过。
+- 基于 `go list` 实际导入的依赖检查：内部包不依赖门面，runtime 不依赖具体工具，context 不反向依赖提供器。
+- `node --test --test-isolation=none webui/console-events.test.cjs webui/config-editor.test.cjs`：两组通过。默认进程隔离被当前沙箱以 `spawn EPERM` 拒绝，未修改产品代码绕过该限制。
+- `git diff --check`：通过。
+- 完整 `go test ./... -count=1`：除 9 项真实 Chrome 集成测试外均通过。这 9 项均在 Chrome 启动阶段因 Crashpad/mojo `拒绝访问 (0x5)` 失败，与迁移前基线一致，不能标为完整验收通过。
+
+未自动提交、重启程序或清除运行缓存。动态插件加载、用户插件配置和第三方沙箱不属于本轮范围。

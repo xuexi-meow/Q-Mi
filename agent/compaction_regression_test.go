@@ -10,17 +10,18 @@ import (
 	"testing"
 	"time"
 
+	agentcontext "Q-Mi/agent/context"
 	"Q-Mi/utils/config"
 )
 
 func TestCompactionUnreadResultsReachModelWithTriggerAndSendReceipt(t *testing.T) {
 	m, f, _ := newLiveManager(t, nil)
 	m.cfg.Context = config.AgentContext{MaxInputTokens: 8000, SummaryTokens: 256, KeepRecentMessages: 4}
-	m.conversation.messages = []ChatMessage{
+	m.conversation.Messages = agentcontext.FromWireMessages([]ChatMessage{
 		{Role: "system", Content: "initial"},
 		{Role: "user", Content: strings.Repeat("old record ", 1300)},
-	}
-	m.conversation.unreadStart = 2
+	})
+	m.conversation.UnreadStart = 2
 	m.registry = NewRegistry(module{name: "test", tools: func(*ToolContext) []Tool {
 		return []Tool{
 			{Name: "send_message", Parameters: objectParams(map[string]any{"text": strProp("text")}, []string{"text"}), Run: func(json.RawMessage) (string, error) {
@@ -135,12 +136,12 @@ func TestCompactionNeverSummarizesPromptsOrLearnedState(t *testing.T) {
 func TestCompactionSkipsSummaryWhenProtectedTailCannotFit(t *testing.T) {
 	m, f := seedCompaction(t, plainResp("not worth requesting"))
 	m.cfg.Context.KeepRecentMessages = 2
-	m.conversation.messages = append(m.conversation.messages,
-		ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: "unseen", Type: "function",
-			Function: ToolFunction{Name: "read_file", Arguments: "{}"}}}},
-		ChatMessage{Role: "tool", ToolCallID: "unseen", Content: strings.Repeat("unread evidence ", 1400)})
-	m.conversation.unreadStart = len(m.conversation.messages) - 2
-	before := append([]ChatMessage(nil), m.conversation.messages...)
+	m.conversation.Messages = append(m.conversation.Messages,
+		agentcontext.FromWire(ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: "unseen", Type: "function",
+			Function: ToolFunction{Name: "read_file", Arguments: "{}"}}}}, agentcontext.KindWork),
+		agentcontext.FromWire(ChatMessage{Role: "tool", ToolCallID: "unseen", Content: strings.Repeat("unread evidence ", 1400)}, agentcontext.KindWork))
+	m.conversation.UnreadStart = len(m.conversation.Messages) - 2
+	before := append([]agentcontext.Message(nil), m.conversation.Messages...)
 	err := m.prepareContext(context.Background(), &Turn{SelfID: 999}, nil)
 	if err == nil {
 		t.Fatal("oversized protected result must report budget error")
@@ -148,26 +149,27 @@ func TestCompactionSkipsSummaryWhenProtectedTailCannotFit(t *testing.T) {
 	if got := f.count(); got != 0 {
 		t.Errorf("summary cannot make protected tail fit; wasted %d requests", got)
 	}
-	if !reflect.DeepEqual(before, m.conversation.messages) {
+	if !reflect.DeepEqual(before, m.conversation.Messages) {
 		t.Fatal("an unsuccessful budget check destructively rewrote the working context")
 	}
 }
 
-func TestCompactionDoesNotOverrideRecentWindowToMeetBudget(t *testing.T) {
-	m, f, _ := newLiveManager(t, []string{plainResp("must not be requested")})
+func TestCompactionRelaxesRecentWindowOnlyWhenNeededToMeetBudget(t *testing.T) {
+	m, f, _ := newLiveManager(t, []string{plainResp("recent evidence summarized")})
 	m.cfg.Context = config.AgentContext{MaxInputTokens: 5000, SummaryTokens: 256, KeepRecentMessages: 12}
-	m.conversation.messages = []ChatMessage{
+	m.conversation.Messages = agentcontext.FromWireMessages([]ChatMessage{
 		{Role: "system", Content: "original system"},
 		{Role: "user", Content: strings.Repeat("recent-evidence ", 1500)},
 		{Role: "user", Content: "recent-event"},
+	})
+	m.conversation.UnreadStart = 3
+	if err := m.prepareContext(context.Background(), &Turn{SelfID: 999}, nil); err != nil {
+		t.Fatal(err)
 	}
-	m.conversation.unreadStart = 3
-	before := append([]ChatMessage(nil), m.conversation.messages...)
-	if err := m.prepareContext(context.Background(), &Turn{SelfID: 999}, nil); err == nil {
-		t.Fatal("cannot fit without deleting the configured recent window; want a budget error")
-	}
-	if f.count() != 0 || !reflect.DeepEqual(before, m.conversation.messages) {
-		t.Fatal("recent window was sacrificed to fit the budget")
+	text := requestText(ChatRequest{Messages: agentcontext.ToWireMessages(m.conversation.Messages)})
+	if f.count() != 1 || !strings.Contains(text, "recent evidence summarized") ||
+		!strings.Contains(text, "recent-event") || strings.Count(text, "recent-evidence") > 10 {
+		t.Fatal("hard-limit recovery did not summarize old work and retain the latest event")
 	}
 }
 

@@ -85,6 +85,8 @@ func run(ctx context.Context) error {
 	if err := c.StartCore(); err != nil {
 		return err
 	}
+	agent.Initialize()
+	defer agent.StopBackground()
 
 	// W1 WebUI：agent 启用且 webui.enable 时启动控制台（独立端口）。
 	// Start 非阻塞；退出时与其他服务一并 Shutdown。
@@ -100,6 +102,7 @@ func run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
+	agent.StopBackground()
 	slog.Info("收到退出信号，正在等待事件处理完成...")
 	if webuiServer != nil {
 		if err := webuiServer.Shutdown(context.Background()); err != nil {

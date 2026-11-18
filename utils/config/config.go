@@ -202,6 +202,7 @@ type AgentConfig struct {
 	MaxToolRounds int          `yaml:"max_tool_rounds" mapstructure:"max_tool_rounds"`
 	History       AgentHistory `yaml:"history" mapstructure:"history"`
 	Context       AgentContext `yaml:"context" mapstructure:"context"`
+	Sleep         AgentSleep   `yaml:"sleep" mapstructure:"sleep"`
 }
 
 // WakeChat 内置 chat 档名：唤醒路由与回退链的终点。
@@ -470,7 +471,7 @@ func validateAgentConfig(agent *AgentConfig) error {
 	if policy.MaxInputTokens < 2048 || policy.SummaryTokens >= policy.MaxInputTokens/2 || policy.KeepRecentMessages < 2 {
 		return fmt.Errorf("agent.context requires max_input_tokens >= 2048, summary_tokens < half the input budget, and keep_recent_messages >= 2")
 	}
-	return nil
+	return agent.Sleep.Validate()
 }
 
 func validateToolChoice(label, value string) error {

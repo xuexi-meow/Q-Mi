@@ -149,21 +149,23 @@ func TestChatDNDPendingMessagesRecheckedAtInsertion(t *testing.T) {
 	setDNDTestConfig(t)
 	store := openTestStore(t)
 	tools := buildTools(&ToolContext{Store: store})
-	m := &Manager{store: store, inbox: &accountInbox{selfID: 999, pending: []TurnMessage{
+	m := &Manager{store: store, cfg: testCfg(time.Hour), inbox: newCapturedInbox(t)}
+	for _, msg := range []IncomingMessage{
 		{ChatType: "group", ChatID: 888, SenderID: 123, Text: "queued-before-muted"},
 		{ChatType: "group", ChatID: 888, SenderID: 555, Text: "admin"},
 		{ChatType: "group", ChatID: 888, Wake: WakeBackground, Text: "task-result"},
-	}}}
+	} {
+		msg.SelfID = 999
+		m.Enqueue(msg)
+	}
 	runToolOK(t, tools, "chat_dnd", `{"action":"add","chat_type":"group","chat_id":888}`)
 	turn := m.takePending()
 	if turn == nil || len(turn.NewMessages) != 2 || turn.NewMessages[0].Text != "admin" ||
 		turn.NewMessages[1].Text != "task-result" {
 		t.Fatalf("pending messages bypassed current rules: %+v", turn)
 	}
-	m.inbox.pending = []TurnMessage{
-		{ChatType: "group", ChatID: 888, SenderID: 123, Text: "all-filtered"},
-	}
-	if turn := m.takePending(); turn != nil || len(m.inbox.pending) != 0 {
+	m.inbox.Enqueue(IncomingMessage{ChatType: "group", ChatID: 888, SenderID: 123, Text: "all-filtered"}, time.Hour)
+	if turn := m.takePending(); turn != nil || m.inbox.Len() != 0 {
 		t.Fatalf("filtered batch was not drained: %+v", turn)
 	}
 }
@@ -235,14 +237,7 @@ func TestChatDNDEventWiringPassesOnlyAdminSelfAndAllMentions(t *testing.T) {
 	cfg.Enable = true
 	m := &Manager{store: store, cfg: cfg}
 	// A precreated inbox captures delivery without running a model/worker.
-	m.inbox = &accountInbox{ready: make(chan struct{}, 1)}
-	defer func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.inbox.timer != nil {
-			m.inbox.timer.Stop()
-		}
-	}()
+	m.inbox = newCapturedInbox(t)
 	managerMu.Lock()
 	old, initialized := manager, managerInited
 	manager, managerInited = m, true

@@ -142,7 +142,12 @@ func TestSearchMessagesHistoryBoundsAndEvidence(t *testing.T) {
 			t.Fatalf("invalid timestamp %q: %v", ts, err)
 		}
 		if len(rows) < tc.count {
-			var result messageQueryResult
+			var result struct {
+				Messages  []map[string]any `json:"messages"`
+				Returned  int              `json:"returned"`
+				Omitted   int              `json:"omitted"`
+				Truncated bool             `json:"truncated"`
+			}
 			if err := json.Unmarshal([]byte(out), &result); err != nil || !result.Truncated || result.Omitted != tc.count-len(rows) {
 				t.Fatalf("budget trimming must report omitted records: %s", out)
 			}

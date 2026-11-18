@@ -29,7 +29,7 @@ var (
 	newManagerFunc = defaultNewManager
 )
 
-// defaultNewManager 用真实配置组装默认实现:DefaultBuilder + OpenAI 客户端(120s 超时)。
+// defaultNewManager 用真实配置组装默认实现:上下文构造器 + OpenAI 客户端(120s 超时)。
 // P3.6：把 bot.qq_number 注入 Manager（定时轮询以自己为会话），并按
 // agent.self_wake 启动定时轮询兜底唤醒（空串=默认 10 分钟，"off"/"0" 跳过）。
 // 工具文档（PromptDocs）在此注入 builder 的 system 静态区。
@@ -40,10 +40,14 @@ func defaultNewManager(cfg config.AgentConfig, store *storage.Store) *Manager {
 			cfgQQ = int64(cur.Bot.QQ_Number)
 		}
 	}
-	b := NewDefaultBuilder(store, cfg)
+	b := newDefaultContextBuilder(store, cfg)
 	m := NewManager(b, NewClient(cfg.BaseURL, cfg.APIKey, 120*time.Second), cfg, store, cfgQQ)
+	b.SetStateProviders(sleepMemoryProvider{manager: m})
 	b.SetToolDocs(m.toolRegistry().PromptDocs())
 	globalBrowser = m.browser
+	if err := m.RestoreSleep(); err != nil {
+		slog.Error("恢复睡眠状态失败", "err", err)
+	}
 	m.StartSelfWake(selfWakeInterval(cfg))
 	// 订阅配置热重载：模型/提示词/阈值热生效，需重启字段只告警。
 	if a := app.GetApp(); a != nil && a.ConfigStore != nil {
@@ -260,6 +264,21 @@ func getManager() *Manager {
 		manager = newManagerFunc(*cur.Agent, a.Store)
 	}
 	return manager
+}
+
+// Initialize restores scheduled sleep even when QQ has no incoming traffic.
+func Initialize() {
+	getManager()
+}
+
+func StopBackground() {
+	managerMu.Lock()
+	m := manager
+	managerMu.Unlock()
+	if m != nil {
+		m.StartSelfWake(0)
+		m.stopSleep()
+	}
 }
 
 // unixTime NapCat 上报的 unix 秒(浮点)转 time.Time。

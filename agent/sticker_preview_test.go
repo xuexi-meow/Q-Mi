@@ -41,8 +41,8 @@ func TestSaveStickerCachesPreviewAndNote(t *testing.T) {
 	if out["note"] != "打招呼用" || out["summary"] != "猫猫" {
 		t.Fatalf("回执字段不对: %s", out)
 	}
-	if len(turn.pendingImages) != 0 {
-		t.Fatalf("收藏不应附图，pending=%d", len(turn.pendingImages))
+	if len(turn.PendingImages()) != 0 {
+		t.Fatalf("收藏不应附图，pending=%d", len(turn.PendingImages()))
 	}
 	id := int64(out["sticker_id"].(float64))
 	st, err := s.GetSticker(id)
@@ -76,8 +76,9 @@ func TestViewStickerAttachesPreview(t *testing.T) {
 	if out["attached"] != float64(1) {
 		t.Fatalf("attached = %v, want 1 (%s)", out["attached"], out)
 	}
-	if len(turn.pendingImages) != 1 || !strings.HasPrefix(turn.pendingImages[0], "data:image/png;base64,") {
-		t.Fatalf("应附图到下一轮，pending=%v", turn.pendingImages)
+	pending := turn.PendingImages()
+	if len(pending) != 1 || !strings.HasPrefix(pending[0], "data:image/png;base64,") {
+		t.Fatalf("应附图到下一轮，pending=%v", pending)
 	}
 }
 
@@ -97,7 +98,7 @@ func TestViewStickerReportsMissingPreview(t *testing.T) {
 	if len(missing) != 1 {
 		t.Fatalf("missing = %v", out["missing"])
 	}
-	if len(turn.pendingImages) != 0 {
+	if len(turn.PendingImages()) != 0 {
 		t.Fatal("无预览时不应附图")
 	}
 }

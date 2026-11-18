@@ -6,10 +6,12 @@ Q-Mi.zip
 npm_install_log.txt
 .continue/
 .vscode/
+.tools/
 agent/debug/
 agent/notes.json
 agent/state.json
 agent/timers.json
+agent/sleep.json
 Config.yaml
 Config.webui.yaml
 agent/images/

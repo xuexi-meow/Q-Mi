@@ -6,6 +6,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +47,16 @@ func EventsAfter(after uint64) []Event {
 	return m.events.After(after)
 }
 
+// EventsWaitAfter waits for event mutations after cursor. If agent is not
+// initialized, it returns an empty snapshot immediately.
+func EventsWaitAfter(ctx context.Context, after uint64, timeout time.Duration) ([]Event, uint64, bool) {
+	m := inspectionManager()
+	if m == nil || m.events == nil {
+		return []Event{}, 0, false
+	}
+	return m.events.WaitAfter(ctx, after, timeout)
+}
+
 // Wake 把一条 [WebUI] 前缀消息注入 agent 的 self 队列（私聊自己、紧急）。
 // agent 未启用或 selfID 未配置（qq_number=0）时返回错误。
 func Wake(text string) error {
@@ -55,6 +66,9 @@ func Wake(text string) error {
 	}
 	if m.selfID <= 0 {
 		return ErrSelfIDMissing
+	}
+	if _, err := m.ForceWake(); err != nil {
+		return err
 	}
 	m.Enqueue(IncomingMessage{
 		ChatType:   "private",
@@ -179,6 +193,20 @@ func ContextEntryInspect(source string, version uint64, index int) (InspectionEn
 		return InspectionEntry{}, ErrInspectionIndex
 	}
 	return m.InspectEntry(source, version, index)
+}
+
+func ContextEntryEdit(version uint64, index int) (ContextEditEntry, error) {
+	if m := inspectionManager(); m != nil {
+		return m.EditableContextEntry(version, index)
+	}
+	return ContextEditEntry{}, ErrAgentNotEnabled
+}
+
+func ContextControl(ctx context.Context, action ContextAction) (ContextActionResult, error) {
+	if m := inspectionManager(); m != nil {
+		return m.ControlContext(ctx, action)
+	}
+	return ContextActionResult{}, ErrAgentNotEnabled
 }
 
 func TaskInspect(limit int) []TaskInspection {

@@ -285,7 +285,7 @@ func TestBuildHybridHistoryFormatAndRoles(t *testing.T) {
 	putRecord(t, s, 4, "recv", "group", 928952016, 10086, "", "旧库没存昵称", t4.Unix())
 	putRecord(t, s, 5, "recv", "group", 928952016, 10002, "路人", "[CQ:face,id=1]哈哈", t5.Unix())
 
-	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: t5.Add(time.Minute)})
+	msgs := b.Build(&Turn{SelfID: 9527, Now: t5.Add(time.Minute)})
 
 	assertContextRows(t, msgs[1:], []map[string]any{
 		{"message_id": float64(1), "chat_type": "group", "chat_id": float64(928952016), "user_id": float64(3929930584), "sender_name": "香菜不吃屿烬燃", "text": "这个我不背锅！！！！"},
@@ -370,7 +370,7 @@ func TestBuildTrimsHistoryAcrossChatsInBlocks(t *testing.T) {
 			fmt.Sprintf("m%d", i), base.Add(time.Duration(i)*time.Second).Unix())
 	}
 
-	msgs := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(7 * time.Second)})
+	msgs := b.Build(&Turn{SelfID: 9527, Now: base.Add(7 * time.Second)})
 
 	if len(msgs) != 5 {
 		t.Fatalf("裁剪后消息条数 = %d, want 5 (system+4): %+v", len(msgs), msgs)
@@ -405,13 +405,13 @@ func TestBuildHistoryPrefixStableAcrossCalls(t *testing.T) {
 			fmt.Sprintf("m%02d", i), base.Add(time.Duration(i)*time.Second).Unix())
 	}
 
-	first := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
+	first := b.Build(&Turn{SelfID: 9527, Now: base.Add(time.Minute)})
 	if len(first) != 22 {
 		t.Fatalf("41 条历史裁剪后应剩 21 条 (共 22), got %d", len(first))
 	}
 
 	putRecord(t, s, 42, "recv", "group", 928952016, 10001, "群友A", "m42", base.Add(42*time.Second).Unix())
-	second := b.Build(&Turn{ChatType: "group", ChatID: 928952016, SelfID: 9527, Now: base.Add(time.Minute)})
+	second := b.Build(&Turn{SelfID: 9527, Now: base.Add(time.Minute)})
 
 	if len(second) != 23 {
 		t.Fatalf("42 条历史裁剪后应剩 22 条 (共 23), got %d", len(second))
@@ -455,11 +455,11 @@ func TestBuildHistoryPrefixStableBeyondQueryCap(t *testing.T) {
 					t.Fatalf("i=%d 未裁剪轮历史前缀被破坏 at %d:\nprev: %+v\ncur:  %+v", i, j, histPrev[j], histCur[j])
 				}
 			}
-		case len(histCur) == len(histPrev)-b.trim+1: // 裁剪：砍头部 trim 块再追加
+		case len(histCur) == len(histPrev)-cfg.History.Trim+1: // 裁剪：砍头部 trim 块再追加
 			evictions++
 			for j := range histCur[:len(histCur)-1] {
-				if !reflect.DeepEqual(histPrev[b.trim+j], histCur[j]) {
-					t.Fatalf("i=%d 裁剪轮保留段与上轮尾部不对齐 at %d:\nprev: %+v\ncur:  %+v", i, b.trim+j, histPrev[b.trim+j], histCur[j])
+				if !reflect.DeepEqual(histPrev[cfg.History.Trim+j], histCur[j]) {
+					t.Fatalf("i=%d 裁剪轮保留段与上轮尾部不对齐 at %d:\nprev: %+v\ncur:  %+v", i, cfg.History.Trim+j, histPrev[cfg.History.Trim+j], histCur[j])
 				}
 			}
 		default:
@@ -1087,8 +1087,8 @@ func TestMultimodalDropsFailedImages(t *testing.T) {
 		ImageDir:    t.TempDir(),
 	}
 	b := NewDefaultBuilder(s, cfg)
-	b.multimodal = true
-	b.images = newImageStoreWithClient(t.TempDir(), s, srv.Client())
+	images := newImageStoreWithClient(t.TempDir(), s, srv.Client())
+	b.SetImageResolver(images.dataURLFor)
 
 	good := srv.URL + "/good.png"
 	bad := srv.URL + "/bad.jpg"

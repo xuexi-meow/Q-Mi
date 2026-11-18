@@ -1,11 +1,17 @@
 package agent
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"Q-Mi/agent/model"
+	"Q-Mi/storage"
 	"Q-Mi/utils/config"
 )
 
@@ -93,23 +99,30 @@ func TestApplyConfigRebuildsToolRegistry(t *testing.T) {
 }
 
 func TestApplyConfigRebuildsModelPool(t *testing.T) {
+	requests := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(okCompletion))
+	}))
+	t.Cleanup(server.Close)
 	cfg := testCfg(time.Millisecond)
 	m, _ := newTestManager(t, cfg, &stubBuilder{})
 
 	next := cfg
-	next.BaseURL = "http://127.0.0.1:2"
+	next.BaseURL = server.URL
 	next.APIKey = "new-key"
 	m.ApplyConfig(next)
 
-	slot, tier, err := m.modelPool().pick(WakeChat, modelNeed{Tools: true}, nil)
+	resp, slot, tier, err := m.chat(context.Background(), &Turn{},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, model.Need{Tools: true}, 1)
 	if err != nil {
 		t.Fatalf("pick after rebuild: %v", err)
 	}
-	if tier != WakeChat || slot.client == nil {
+	if tier != WakeChat || slot.Client() == nil || resp.TextContent() != "ok" {
 		t.Fatalf("chat tier unusable after rebuild: tier=%s slot=%+v", tier, slot)
 	}
-	if slot.client.baseURL != "http://127.0.0.1:2" {
-		t.Fatalf("chat client baseURL = %q, want rebuilt endpoint", slot.client.baseURL)
+	if got := <-requests; got != "Bearer new-key" {
+		t.Fatalf("new endpoint authorization = %q, want Bearer new-key", got)
 	}
 }
 
@@ -166,22 +179,39 @@ func TestAttachConfigStoreAppliesOverlayChange(t *testing.T) {
 
 func TestBuilderApplyUpdatesHistoryAndMultimodal(t *testing.T) {
 	cfg := testCfg(time.Millisecond)
-	b := NewDefaultBuilder(nil, cfg)
+	store := openTestStore(t)
+	b := NewDefaultBuilder(store, cfg)
 
 	off := false
 	next := cfg
 	next.History = config.AgentHistory{Max: 7, Trim: 3}
 	next.Multimodal = &off
 	next.WorkspaceDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(next.WorkspaceDir, "chat_style.md"), []byte("new style"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(1); i <= 10; i++ {
+		putRecordFull(t, store, &storage.MessageRecord{
+			MessageID: i, ChatType: "group", ChatID: 8, Direction: "recv",
+			UserID: 7, Time: float64(i), RawMessage: "history",
+		})
+	}
 	b.Apply(next)
 
-	if b.max != 7 || b.trim != 3 {
-		t.Fatalf("history = %d/%d, want 7/3", b.max, b.trim)
+	b.SetImageResolver(func(int64, int, string) string {
+		t.Fatal("disabled multimodal resolved an image")
+		return ""
+	})
+	turn := &Turn{ChatType: "group", ChatID: 8, SelfID: 99, Now: time.Now(),
+		NewMessages: []TurnMessage{{Text: "incoming", Images: []imageRef{{URL: "https://invalid/image"}}}}}
+	messages := b.Build(turn)
+	if len(messages) != 9 {
+		t.Fatalf("history window = %d messages, want system + 7 history + incoming", len(messages))
 	}
-	if b.multimodal {
-		t.Fatal("multimodal must be disabled after Apply")
+	if _, ok := messages[len(messages)-1].Content.(string); !ok {
+		t.Fatal("disabled multimodal emitted image parts")
 	}
-	if b.workspace != next.WorkspaceDir {
-		t.Fatalf("workspace = %q, want %q", b.workspace, next.WorkspaceDir)
+	if !strings.Contains(b.StateText(turn), "new style") {
+		t.Fatal("Apply did not update the chat style workspace")
 	}
 }

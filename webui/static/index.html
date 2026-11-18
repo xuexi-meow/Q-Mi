@@ -4,6 +4,8 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Q-Mi · 运行控制台</title><link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/console.css">
+  <link rel="stylesheet" href="/static/context.css">
+  <link rel="stylesheet" href="/static/sleep.css">
   <script src="/static/lucide.min.js" defer></script><script src="/static/config-editor.js" defer></script>
   <script src="/static/console.js" defer></script><script src="/static/alpine.min.js" defer></script>
 </head>
@@ -49,7 +51,20 @@
           <section class="section"><div class="section-heading"><h2>近期活动</h2><button class="text-button" @click="navigate('activity')">全部日志 <i data-lucide="arrow-right"></i></button></div><template x-for="e in events.slice(-5).reverse()" :key="e.id"><div class="event-row"><span class="event-time" x-text="time(e.time)"></span><span class="badge" :class="e.kind==='error'?'danger':'info'" x-text="kindLabel(e.kind)"></span><span class="event-preview" x-text="e.text"></span></div></template><p class="empty" x-show="!events.length">暂无活动</p></section>
         </section>
         <section x-show="page==='context'" aria-label="当前上下文">
+          <div class="context-alert" role="status" x-show="runtime.phase==='blocked'">
+            <i data-lucide="circle-alert"></i><div><strong>上下文已超限，活动暂停</strong><p x-text="runtime.last_error"></p><div class="context-budget-parts"><span x-text="'固定内容约 '+number(runtime.metrics?.fixed_tokens)+' tokens'"></span><span x-text="'含当前输入、未读结果的受保护内容约 '+number(runtime.metrics?.protected_tokens)+' tokens'"></span></div></div>
+          </div>
           <div class="compact-metrics"><span>版本 <strong x-text="'v'+(contextPage.version||0)"></strong></span><span>估算 <strong x-text="number(contextPage.metrics?.estimated_tokens)"></strong> tokens</span><span>预算 <strong x-text="number(contextPage.metrics?.budget)"></strong></span><span>消息 <strong x-text="contextPage.metrics?.message_count||0"></strong></span><span>工具 <strong x-text="contextPage.metrics?.tool_count||0"></strong></span><button class="icon-button push-right" @click="downloadContextPage()" aria-label="下载展示数据" title="下载展示数据"><i data-lucide="download"></i></button></div>
+          <div class="context-toolbar">
+            <span class="badge" :class="runtime.phase==='blocked'?'danger':'info'" x-text="phaseLabel(runtime.phase)"></span>
+            <span class="muted" x-show="contextPage.source==='request'">请求快照 · 只读</span>
+            <div class="context-commands" x-show="contextPage.source==='working'">
+              <button @click="previewContextAction('compact')" :disabled="!contextWritable"><i data-lucide="minimize-2"></i>立即压缩</button>
+              <button @click="previewContextAction('clean')" :disabled="!contextWritable"><i data-lucide="brush"></i>清理旧记录</button>
+              <button class="danger-button" @click="previewContextAction('reset')" :disabled="!contextWritable"><i data-lucide="rotate-ccw"></i>重置</button>
+              <button class="primary" @click="previewContextAction('resume')" :disabled="!contextWritable"><i data-lucide="play"></i>恢复活动</button>
+            </div>
+          </div>
           <form class="filterbar" @submit.prevent="loadContext(true)"><label>快照来源<select x-model="contextQuery.source" @change="loadContext(true)"><option value="working">工作记录</option><option value="request">实际请求输入</option></select></label><label>类型<select x-model="contextQuery.kind" @change="loadContext(true)"><option value="">全部类型</option><template x-for="k in ['prompt','input','state','summary','output','tool_result','tool_definition']"><option :value="k" x-text="kindLabel(k)"></option></template></select></label><label>会话<select x-model="contextQuery.scope" @change="loadContext(true)"><option value="">全部会话</option><template x-for="c in chats" :key="c.chat_type+':'+c.chat_id"><option :value="c.chat_type+':'+c.chat_id" x-text="chatName(c)"></option></template></select></label><label class="grow">搜索<input aria-label="搜索上下文" x-model="contextQuery.q" @input.debounce.350ms="loadContext(true)" placeholder="正文、工具名、来源…"></label><button type="button" class="icon-button" @click="resetContext()" title="清除筛选" aria-label="清除上下文筛选"><i data-lucide="filter-x"></i></button></form>
           <div class="inline-notice" x-show="contextConflict"><i data-lucide="info"></i><span x-text="contextConflict"></span><button @click="loadContext(true)">刷新列表</button></div>
           <div class="context-list"><template x-for="e in contextPage.entries||[]" :key="contextPage.version+':'+e.index"><button class="context-row" @click="openContextEntry(e)" :aria-label="'查看消息详情 '+e.index"><span class="entry-index" x-text="String(e.index+1).padStart(2,'0')"></span><div class="entry-body"><div class="entry-meta"><span class="badge" :class="kindClass(e.kind)" x-text="kindLabel(e.kind)"></span><code x-text="e.role"></code><span class="source" x-text="e.chat_type ? e.chat_type+':'+e.chat_id : '来源未知'"></span><span class="muted" x-text="e.origin||''"></span><span class="badge warning" x-show="e.images" x-text="e.images+' 张图片'"></span></div><p x-text="e.text || (e.tool_calls?.length ? e.tool_calls.map(c=>c.function.name).join(', ') : '空内容')"></p><small x-show="e.truncated">预览已截断</small></div><span class="entry-tokens" x-text="'≈ '+number(e.estimated_tokens)"></span><i data-lucide="chevron-right"></i></button></template><div class="empty large" x-show="!(contextPage.entries||[]).length"><i data-lucide="layers"></i><h3>暂无匹配的上下文</h3><p>等待 Agent 发布快照</p></div></div>
@@ -61,11 +76,57 @@
           <div class="message-workspace" :class="selectedChat && 'chat-selected'"><aside class="chat-list"><label class="chat-filter"><i data-lucide="search"></i><input x-model="chatFilter" aria-label="筛选会话" placeholder="筛选会话"></label><template x-for="c in filteredChats" :key="c.chat_type+':'+c.chat_id"><button class="chat-row" :class="selectedChat?.chat_id==c.chat_id && selectedChat?.chat_type===c.chat_type && 'selected'" @click="selectChat(c)"><span class="avatar" x-text="c.chat_type==='group'?'群':'私'"></span><div><strong x-text="chatName(c)"></strong><p x-text="c.last_text"></p><small x-text="time(c.last_time)"></small></div><small x-text="c.count"></small></button></template><p class="empty" x-show="!filteredChats.length">暂无会话</p></aside><div class="chat-panel"><div class="chat-heading"><button class="icon-button mobile-only" aria-label="返回会话列表" @click="selectedChat=null"><i data-lucide="arrow-left"></i></button><h2 x-text="selectedChat ? chatName(selectedChat) : '选择会话'"></h2><span class="muted" x-text="selectedChat ? selectedChat.chat_type+':'+selectedChat.chat_id : ''"></span></div><div class="chat-messages" x-ref="messageBox"><div class="empty large" x-show="!selectedChat"><i data-lucide="messages-square"></i><p>选择左侧会话</p></div><button class="load-older" x-show="selectedChat && hasOlder" @click="loadOlderMessages()" :disabled="busy.messages"><i data-lucide="history"></i>加载更早消息</button><template x-for="m in messages" :key="m.message_id"><article class="message" :class="{sent:m.direction==='sent',highlight:String(m.message_id)===String(highlightMessageID)}" :data-message-id="m.message_id"><div class="message-avatar" x-text="(m.sender_name||'?').slice(0,1)"></div><div class="message-content"><div class="message-meta"><strong x-text="m.sender_name||m.user_id"></strong><small x-text="m.user_id"></small><time x-text="time(m.time)"></time><code x-text="'#'+m.message_id"></code></div><div class="quote" x-show="m.reply"><i data-lucide="reply"></i><span x-text="m.reply ? '引用 #'+m.reply.message_id+' · '+(m.reply.sender_name||'来源未知') : ''"></span></div><p x-text="m.text"></p><small class="muted" x-show="m.mentions?.length" x-text="'@ '+(m.mentions||[]).join(' · ')"></small><small class="muted" x-show="!m.addressing_known">指向信息未知</small></div></article></template></div></div></div>
         </section>
         <section x-show="page==='activity'" aria-label="活动日志">
-          <div class="filterbar"><label>类型<select x-model="eventFilters.kind"><option value="">全部事件</option><template x-for="k in ['turn_start','reasoning','output','tool_call','tool_result','reply','usage','finish','error','config']"><option :value="k" x-text="kindLabel(k)"></option></template></select></label><label>来源<input x-model="eventFilters.source" placeholder="group:888"></label><label class="grow">关键词<input x-model="eventFilters.q" aria-label="搜索活动日志" placeholder="筛选日志"></label><button @click="toggleFollow()"><i data-lucide="pause"></i><span x-text="followEvents?'暂停跟随':'继续跟随'+(newEventCount?' ('+newEventCount+')':'')"></span></button></div>
-          <div class="log-heading"><span class="muted" x-text="'已载入 '+events.length+' 条'"></span><span class="badge" :class="followEvents?'success':'warning'" x-text="followEvents?'实时跟随':'已暂停跟随'"></span></div><div class="activity-stream" x-ref="activityBox"><template x-for="e in filteredEvents" :key="e.id"><article class="log-row"><div class="log-line"><time x-text="time(e.time)"></time><span class="badge" :class="e.kind==='error'?'danger':kindClass(e.kind)" x-text="kindLabel(e.kind)"></span><code x-text="e.chat_type ? e.chat_type+':'+e.chat_id : '系统'"></code><button class="icon-button push-right" @click="copyText(e.text)" aria-label="复制日志" title="复制日志"><i data-lucide="copy"></i></button></div><details><summary x-text="e.text.slice(0,180)"></summary><pre x-text="e.text"></pre></details></article></template><p class="empty large" x-show="!filteredEvents.length">暂无匹配事件</p></div>
+          <div class="filterbar"><label>类型<select x-model="eventFilters.kind"><option value="">全部事件</option><template x-for="k in ['turn_start','model_stream','reasoning','output','tool_call','tool_result','reply','usage','finish','error','config']"><option :value="k" x-text="kindLabel(k)"></option></template></select></label><label>来源<input x-model="eventFilters.source" placeholder="group:888"></label><label class="grow">关键词<input x-model="eventFilters.q" aria-label="搜索活动日志" placeholder="筛选日志"></label><button @click="toggleFollow()"><i data-lucide="pause"></i><span x-text="followEvents?'暂停跟随':'继续跟随'+(newEventCount?' ('+newEventCount+')':'')"></span></button></div>
+          <div class="log-heading"><span class="muted" x-text="'已载入 '+events.length+' 条"></span><span class="badge" :class="followEvents?'success':'warning'" x-text="followEvents?'实时跟随':'已暂停跟随'"></span></div>
+          <div class="activity-stream" x-ref="activityBox">
+            <template x-for="e in filteredEvents" :key="e.id">
+              <article class="log-row">
+                <div class="log-line">
+                  <time x-text="time(e.updated_at||e.time)"></time>
+                  <span class="badge" :class="e.kind==='error'||e.state==='failed'?'danger':kindClass(e.kind)" x-text="kindLabel(e.kind)"></span>
+                  <code x-text="e.chat_type ? e.chat_type+':'+e.chat_id : '系统'"></code>
+                  <button class="icon-button push-right" @click="copyText(e.kind==='model_stream'?JSON.stringify(e,null,2):e.text)" aria-label="复制日志" title="复制日志"><i data-lucide="copy"></i></button>
+                </div>
+                <details>
+                  <summary x-text="e.kind==='model_stream'?(e.candidate+' · '+runStateLabel(e.state)+' · '+(e.model||'')):e.text.slice(0,180)"></summary>
+                  <template x-if="e.kind==='model_stream'">
+                    <div class="stream-detail">
+                      <p class="muted" x-show="e.state==='generating'">工具参数仍在接收，尚未执行</p>
+                      <section x-show="e.reasoning"><h4>思考链</h4><pre x-text="e.reasoning"></pre></section>
+                      <section x-show="e.content"><h4>模型输出</h4><pre x-text="e.content"></pre></section>
+                      <template x-for="call in e.tool_calls||[]" :key="call.index">
+                        <section><h4 x-text="'工具 · '+(call.name||'等待名称')"></h4><pre x-text="call.arguments"></pre></section>
+                      </template>
+                      <p class="error-text" x-show="e.state==='failed'" x-text="e.text"></p>
+                    </div>
+                  </template>
+                  <pre x-show="e.kind!=='model_stream'" x-text="e.text"></pre>
+                </details>
+              </article>
+            </template>
+            <p class="empty large" x-show="!filteredEvents.length">暂无匹配事件</p>
+          </div>
         </section>
         <section x-show="page==='agent'" aria-label="Agent 管理">
           <div class="tabs" role="tablist"><button role="tab" :aria-selected="agentTab==='state'" @click="agentTab='state'">状态与笔记</button><button role="tab" :aria-selected="agentTab==='timers'" @click="agentTab='timers'">计时器</button><button role="tab" :aria-selected="agentTab==='prompts'" @click="agentTab='prompts';loadPrompt()">提示词</button><button role="tab" :aria-selected="agentTab==='tasks'" @click="agentTab='tasks';loadTasks()">后台任务</button></div>
+          <section class="section sleep-section" x-show="agentTab==='state'" aria-label="作息与记忆整理">
+            <div class="section-heading"><h2>作息与记忆整理</h2><button class="icon-button" @click="configTab='behavior';navigate('config')" title="作息设置" aria-label="作息设置"><i data-lucide="settings-2"></i></button></div>
+            <div class="sleep-header">
+              <i data-lucide="moon" class="sleep-symbol" x-show="runtime.sleep?.sleeping"></i>
+              <i data-lucide="sun" class="sleep-symbol" x-show="!runtime.sleep?.sleeping"></i>
+              <div class="grow"><strong x-text="sleepStatusLabel()"></strong><p class="muted" x-show="runtime.sleep?.sleeping" x-text="'预计 '+time(runtime.sleep?.wake_at)+' 醒来 · '+sleepRemaining()"></p></div>
+              <button class="primary" @click="forceSleepWake()" :disabled="busy.sleepWake||!(runtime.sleep?.sleeping||runtime.sleep?.pending_wake)"><i data-lucide="bell-ring"></i><span x-text="busy.sleepWake?'唤醒中':'立即唤醒'"></span></button>
+            </div>
+            <dl class="sleep-facts">
+              <div><dt>休息开始</dt><dd x-text="time(runtime.sleep?.started_at)"></dd></div>
+              <div><dt>指向消息</dt><dd><span x-text="(runtime.sleep?.directed_count||0)+' / '+(runtime.sleep?.threshold||5)"></span><small x-text="'最近 '+(runtime.sleep?.window_seconds||30)+' 秒'"></small></dd></div>
+              <div><dt>记忆整理</dt><dd x-text="sleepConsolidationLabel(runtime.sleep?.consolidation)"></dd></div>
+              <div><dt>本次 / 累计会话记忆</dt><dd x-text="(runtime.sleep?.consolidated||0)+' / '+(runtime.sleep?.memory_count||0)"></dd></div>
+            </dl>
+            <p class="muted sleep-reason" x-show="runtime.sleep?.reason" x-text="'休息原因：'+runtime.sleep?.reason"></p>
+            <p class="muted sleep-reason" x-show="runtime.sleep?.wake_reason" x-text="'上次醒来：'+time(runtime.sleep?.woke_at)+' · '+sleepWakeLabel(runtime.sleep?.wake_reason)"></p>
+            <p class="error-text" role="alert" x-show="runtime.sleep?.last_error" x-text="runtime.sleep?.last_error"></p>
+          </section>
           <div x-show="agentTab==='state'"><section class="section"><h2>当前情绪</h2><form class="inline-form" @submit.prevent="saveMood()"><label class="grow">情绪<input x-model="moodDraft"></label><button type="submit" class="primary" :disabled="busy.mood"><i data-lucide="save"></i>保存情绪</button></form></section><section class="section"><div class="section-heading"><h2>持久笔记</h2><span class="muted" x-text="notes.length+' 条'"></span></div><form class="inline-form" @submit.prevent="addNote()"><label class="grow">新笔记<input x-model="noteDraft" placeholder="记录一条值得记住的事" required></label><button class="primary" :disabled="busy.note"><i data-lucide="plus"></i>添加</button></form><template x-for="n in notes" :key="n.index"><div class="note-row"><i data-lucide="file-text"></i><div><p x-text="n.text"></p><small x-text="time(n.time)"></small></div><button class="icon-button" @click="deleteNote(n)" :disabled="busy.note" title="删除笔记" aria-label="删除笔记"><i data-lucide="trash-2"></i></button></div></template></section><section class="section"><h2>手动唤醒</h2><form class="inline-form" @submit.prevent="wakeAgent()"><label class="grow">唤醒内容<input x-model="wakeDraft" placeholder="给 Agent 一条新信息" required></label><button :disabled="busy.wake"><i data-lucide="bell-ring"></i>发送唤醒</button></form></section></div>
           <div x-show="agentTab==='timers'"><section class="section"><h2>新建计时器</h2><form class="inline-form" @submit.prevent="addTimer()"><label>延迟（秒）<input type="number" min="1" max="604800" x-model.number="timerDelay" required></label><label class="grow">提醒内容<input x-model="timerNote" required></label><button class="primary" :disabled="busy.timer"><i data-lucide="plus"></i>添加计时器</button></form></section><template x-for="t in timers" :key="t.id"><div class="note-row"><i data-lucide="alarm-clock"></i><div><p x-text="t.note"></p><small x-text="time(t.fire_at||t.at||t.due_at)"></small></div><button class="icon-button" @click="cancelTimer(t)" :disabled="busy.timer" title="取消计时器" aria-label="取消计时器"><i data-lucide="x"></i></button></div></template><p class="empty" x-show="!timers.length">没有待触发计时器</p></div>
           <div x-show="agentTab==='prompts'"><div class="filterbar"><label>文件<select x-model="promptName" @change="loadPrompt()"><option value="persona">人格 · persona</option><option value="guide">行为指南 · guide</option></select></label><code class="muted grow" x-text="promptPath"></code><span class="badge warning" x-show="promptDirty">未保存</span><button class="primary" @click="savePrompt()" :disabled="busy.prompt||!promptLoaded||!promptDirty"><i data-lucide="save"></i>保存提示词</button></div><label>提示词正文<textarea class="prompt-editor" x-model="promptDraft" :disabled="!promptLoaded||busy.prompt" spellcheck="false" aria-label="提示词正文"></textarea></label><div class="editor-footer"><span x-text="promptDraft.length+' 字符'"></span><span>保存后于下一次请求读取</span></div></div>
@@ -88,6 +149,15 @@
               <div class="inline-form"><label>新档位名称<input x-model="newTier" placeholder="例如 background"></label><button @click="addTier()"><i data-lucide="plus"></i>添加档位</button></div><section class="section"><h2>唤醒路由</h2><div class="form-grid"><label>聊天唤醒<input x-model="configDraft.models.wake_routes.chat"></label><label>后台唤醒<input x-model="configDraft.models.wake_routes.background"></label></div></section>
             </div>
             <div x-show="configTab==='behavior'"><section class="section"><h2>活动参数</h2><div class="form-grid"><label>温度<input type="number" step="0.1" min="0" max="2" x-model.number="configDraft.behavior.temperature"></label><label>最大工具轮数<input type="number" min="0" x-model.number="configDraft.behavior.max_tool_rounds"></label><label>防抖间隔<input x-model="configDraft.behavior.debounce" placeholder="3s"></label><label>自主唤醒间隔<input x-model="configDraft.behavior.self_wake" placeholder="10m / off"></label><label>人格文件<input x-model="configDraft.behavior.persona_file"></label><label>指南文件<input x-model="configDraft.behavior.guide_file"></label></div><div class="checkbox-group"><label class="checkbox"><input type="checkbox" x-model="configDraft.behavior.multimodal">多模态输入</label><label class="checkbox"><input type="checkbox" x-model="configDraft.behavior.debug">请求调试记录</label></div></section><section class="section"><h2>工作上下文</h2><div class="form-grid"><label>最大输入预算（估算 tokens）<input type="number" min="1" x-model.number="configDraft.behavior.context.max_input_tokens"></label><label>复查唤醒次数<input type="number" min="1" x-model.number="configDraft.behavior.context.review_after_wakes"></label><label>保留近期消息<input type="number" min="1" x-model.number="configDraft.behavior.context.keep_recent_messages"></label><label>摘要输出预算<input type="number" min="1" x-model.number="configDraft.behavior.context.summary_tokens"></label><label>历史条数<input type="number" min="1" x-model.number="configDraft.behavior.history.max"></label><label>历史裁剪条数<input type="number" min="1" x-model.number="configDraft.behavior.history.trim"></label></div></section></div>
+            <section class="section" x-show="configTab==='behavior'">
+              <div class="section-heading"><h2>自主休息</h2><label class="checkbox"><input type="checkbox" x-model="configDraft.behavior.sleep.enabled">启用</label></div>
+              <div class="form-grid">
+                <label>最短休息（秒）<input type="number" min="1" max="3600" x-model.number="configDraft.behavior.sleep.min_seconds"></label>
+                <label>最长休息（秒）<input type="number" min="1" max="3600" x-model.number="configDraft.behavior.sleep.max_seconds"></label>
+                <label>指向消息统计窗口（秒）<input type="number" min="1" max="600" x-model.number="configDraft.behavior.sleep.window_seconds"></label>
+                <label>提前唤醒消息数<input type="number" min="2" max="100" x-model.number="configDraft.behavior.sleep.threshold"></label>
+              </div>
+            </section>
             <section class="section" x-show="configTab==='modules'"><h2>工具板块</h2><div class="module-grid"><template x-for="name in moduleNames" :key="name"><label class="module-row"><div><strong x-text="name"></strong><small x-text="moduleLabel(name)"></small></div><input type="checkbox" :checked="configDraft.modules.modules[name]!==false" @change="configDraft.modules.modules[name]=$event.target.checked"></label></template></div></section>
             <section class="section" x-show="configTab==='readonly'"><h2>部署信息</h2><dl class="detail-list"><div><dt>基础配置</dt><dd x-text="configView.paths?.base"></dd></div><div><dt>覆盖层</dt><dd x-text="configView.paths?.overlay"></dd></div></dl><pre x-text="JSON.stringify(readonlyConfig,null,2)"></pre><span class="badge warning">部署字段修改后需重启</span></section>
             <div class="savebar" x-show="configTab!=='readonly'"><span class="muted" x-text="configDirty(configTab)?'有尚未保存的变更':'已与生效配置同步'"></span><button @click="discardConfig(configTab)" :disabled="!configDirty(configTab)||busy.config"><i data-lucide="undo-2"></i>撤销变更</button><button class="primary" @click="reviewConfig(configTab)" :disabled="!configDirty(configTab)||busy.config"><i data-lucide="check"></i>检查并保存</button></div>
@@ -96,7 +166,57 @@
       </div>
     </main>
   </div>
-  <div class="modal-backdrop" x-show="contextDetail" x-cloak @click.self="contextDetail=null"><section class="modal detail-modal" role="dialog" aria-modal="true" aria-label="上下文详情"><header><div><span class="eyebrow">CONTEXT ENTRY</span><h2>上下文详情 <code x-text="'#'+(contextDetail?.index??'')"></code></h2></div><button class="icon-button" @click="contextDetail=null" aria-label="关闭详情" title="关闭"><i data-lucide="x"></i></button></header><div class="modal-body"><div class="entry-meta"><span class="badge info" x-text="kindLabel(contextDetail?.kind)"></span><code x-text="contextDetail?.role"></code><span x-text="contextDetail?.chat_type ? contextDetail.chat_type+':'+contextDetail.chat_id : '来源未知'"></span><code x-text="contextDetail?.message_id ? '消息 #'+contextDetail.message_id : ''"></code></div><div class="inline-notice" x-show="contextDetail?.truncated" x-text="'正文已截断，原始 '+contextDetail?.original_runes+' 字符'"></div><h3>正文</h3><pre x-text="contextDetail?.text||'（空）'"></pre><p class="badge warning" x-show="contextDetail?.images" x-text="contextDetail?.images+' 张图片 · 未加载原图'"></p><details x-show="contextDetail?.reasoning"><summary>随请求回传的推理内容 <span x-show="contextDetail?.reasoning_truncated">（已截断）</span></summary><pre x-text="contextDetail?.reasoning"></pre></details><template x-for="(c,i) in contextDetail?.tool_calls||[]" :key="c.id"><details><summary><span x-text="c.function.name"></span><code x-text="c.id"></code><span x-show="contextDetail?.arguments_truncated?.[i]">（参数已截断）</span></summary><pre x-text="c.function.arguments"></pre></details></template><p class="muted" x-text="contextDetail?.tool_call_id ? '工具调用 ID：'+contextDetail.tool_call_id : ''"></p></div><footer><small class="muted">仅包含有界、脱敏后的展示数据</small><button @click="copyContextEntry()"><i data-lucide="copy"></i>复制展示数据</button></footer></section></div>
+  <div class="modal-backdrop" x-show="contextDetail&&!contextReview" x-cloak @click.self="closeContextDetail()">
+    <section class="modal detail-modal" role="dialog" aria-modal="true" aria-label="上下文详情">
+      <header><div><span class="eyebrow" x-text="'版本 v'+contextDetailVersion"></span><h2>上下文详情 <code x-text="'#'+(contextDetail?.index??'')"></code></h2></div><button class="icon-button" @click="closeContextDetail()" :disabled="busy.contextAction||busy.detail" aria-label="关闭详情" title="关闭"><i data-lucide="x"></i></button></header>
+      <div class="modal-body">
+        <div class="entry-meta"><span class="badge info" x-text="kindLabel(contextDetail?.kind)"></span><code x-text="contextDetail?.role"></code><span x-text="contextDetail?.chat_type ? contextDetail.chat_type+':'+contextDetail.chat_id : '来源未知'"></span><code x-text="contextDetail?.message_id ? '消息 #'+contextDetail.message_id : ''"></code></div>
+        <div class="error-banner" role="alert" x-show="contextActionError"><span x-text="contextActionError"></span></div>
+        <div class="inline-notice" x-show="contextConflict" x-text="contextConflict"></div>
+        <div class="inline-notice" x-show="contextDetail?.truncated&&!contextEditor" x-text="'展示正文已截断，原始 '+contextDetail?.original_runes+' 字符'"></div>
+        <div x-show="!contextEditor?.editable"><h3>正文</h3><pre x-text="contextDetail?.text||'（空）'"></pre></div>
+        <template x-if="contextEditor">
+          <div class="context-editor">
+            <label x-show="contextEditor.editable">正文原文<textarea class="code-editor context-textarea" aria-label="上下文正文" x-model="contextEditor.draft" :disabled="busy.contextAction" spellcheck="false"></textarea></label>
+            <div class="editor-footer" x-show="contextEditor.editable"><span x-text="number(contextEditor.draft.length)+' 字符'"></span><span class="badge warning" x-show="contextDirty">未保存</span></div>
+            <label class="context-check" x-show="contextEditor.clear_reasoning"><input type="checkbox" x-model="contextEditor.clearReasoning" :disabled="busy.contextAction">清除此条记录的推理内容</label>
+            <p class="muted" x-show="contextEditor.reason" x-text="contextEditor.reason"></p>
+            <p class="muted" x-show="contextEditor.delete_indices?.length>1" x-text="'删除范围：同批工具调用与回执，共 '+contextEditor.delete_indices?.length+' 条'"></p>
+          </div>
+        </template>
+        <p class="badge warning" x-show="contextDetail?.images" x-text="contextDetail?.images+' 张图片 · 原图保留'"></p>
+        <details x-show="contextDetail?.reasoning"><summary>随请求回传的推理内容 <span x-show="contextDetail?.reasoning_truncated">（已截断）</span></summary><pre x-text="contextDetail?.reasoning"></pre></details>
+        <template x-for="(c,i) in contextDetail?.tool_calls||[]" :key="c.id"><details><summary><span x-text="c.function.name"></span><code x-text="c.id"></code><span x-show="contextDetail?.arguments_truncated?.[i]">（参数已截断）</span></summary><pre x-text="c.function.arguments"></pre></details></template>
+        <p class="muted" x-text="contextDetail?.tool_call_id ? '工具调用 ID：'+contextDetail.tool_call_id : ''"></p>
+      </div>
+      <footer>
+        <small class="muted" x-text="contextEditor?'工作上下文 · 原文编辑':contextDetailSource==='request'?'请求快照 · 只读':'展示数据已脱敏'"></small>
+        <button class="icon-button" @click="copyContextEntry()" title="复制展示数据" aria-label="复制展示数据"><i data-lucide="copy"></i></button>
+        <button x-show="!contextEditor&&contextDetailSource==='working'&&!['prompt','state','tool_definition'].includes(contextDetail?.kind)" @click="editContextEntry()" :disabled="!contextWritable||busy.detail"><i data-lucide="pencil"></i>编辑</button>
+        <button x-show="contextEditor?.deletable" class="danger-button" @click="deleteContextEntry()" :disabled="!contextWritable"><i data-lucide="trash-2"></i>删除</button>
+        <button x-show="contextEditor" class="primary" @click="saveContextEntry()" :disabled="!contextWritable||!contextDirty"><i data-lucide="save"></i>检查并保存</button>
+      </footer>
+    </section>
+  </div>
+  <div class="modal-backdrop" x-show="contextReview" x-cloak @click.self="closeContextReview()">
+    <section class="modal" role="dialog" aria-modal="true" aria-label="确认上下文变更">
+      <header><h2 x-text="contextActionLabel(contextReview?.request.action)"></h2><button class="icon-button" @click="closeContextReview()" :disabled="busy.contextAction" aria-label="关闭上下文预览" title="关闭"><i data-lucide="x"></i></button></header>
+      <div class="modal-body">
+        <div class="error-banner" role="alert" x-show="contextActionError"><span x-text="contextActionError"></span></div>
+        <p class="context-reset-warning" x-show="contextReview?.request.action==='reset'">将清空工作记录和当前输入。提示词、当前状态、持久笔记与聊天存档保留。</p>
+        <p x-show="contextReview?.request.action==='resume'">沿用当前工作记录继续活动。</p>
+        <p x-show="contextReview?.request.action==='delete'">将删除以下记录；同批工具调用与回执一起移除。</p>
+        <div class="context-impact"><div><span>操作前估算</span><strong x-text="number(contextReview?.result.before)"></strong></div><i data-lucide="arrow-right"></i><div><span>操作后估算</span><strong x-text="number(contextReview?.result.after)"></strong></div></div>
+        <div class="context-review-meta"><span x-text="'预算 '+number(contextReview?.result.budget)+' tokens'"></span><span x-text="'影响 '+(contextReview?.result.affected?.length||0)+' 条记录'"></span><span x-text="'版本 v'+contextReview?.request.version"></span></div>
+        <p class="inline-notice" x-show="contextReview?.request.action==='compact'">压缩后的大小为估算值，实际以摘要结果为准。</p>
+        <p class="context-reset-warning" x-show="contextReview?.result.blocked">操作后仍超出预算，需要继续编辑、清理或调整配置。</p>
+        <details x-show="contextReview?.result.affected?.length"><summary>受影响的记录</summary><pre x-text="(contextReview?.result.affected||[]).map(i=>'#'+i).join('、')"></pre></details>
+        <details x-show="contextReview?.request.text!==undefined"><summary>修改后的正文</summary><pre x-text="contextReview?.request.text?.slice(0,12000)"></pre></details>
+        <p x-show="contextReview?.request.clear_reasoning">此条记录的推理内容将被清除。</p>
+      </div>
+      <footer><button @click="closeContextReview()" :disabled="busy.contextAction">返回</button><button :class="['reset','delete'].includes(contextReview?.request.action)?'danger-button':'primary'" @click="commitContextAction()" :disabled="busy.contextAction||(contextReview?.request.action==='resume'&&contextReview?.result.blocked)"><i data-lucide="check" x-show="!busy.contextAction"></i><i data-lucide="loader-circle" class="spin" x-show="busy.contextAction"></i><span x-text="busy.contextAction?'处理中':'确认'+contextActionLabel(contextReview?.request.action)"></span></button></footer>
+    </section>
+  </div>
   <div class="modal-backdrop" x-show="configReview" x-cloak @click.self="configReview=null"><section class="modal" role="dialog" aria-modal="true" aria-label="确认配置变更"><header><h2>确认配置变更</h2><button class="icon-button" aria-label="关闭变更预览" @click="configReview=null"><i data-lucide="x"></i></button></header><div class="modal-body"><p class="muted">校验通过 · 连接密钥已隐藏</p><template x-for="d in configReview?.diff||[]" :key="d.path"><div class="diff-row"><code x-text="d.path"></code><del x-text="d.before"></del><ins x-text="d.after"></ins></div></template></div><footer><button @click="configReview=null">返回编辑</button><button class="primary" @click="commitConfig()" :disabled="busy.config"><i data-lucide="save"></i>确认保存</button></footer></section></div>
   <div class="toast" role="status" x-show="toast" x-transition x-text="toast" x-cloak></div>
 </body>

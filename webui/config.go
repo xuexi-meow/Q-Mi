@@ -45,7 +45,7 @@ var restartFields = []string{
 var hotFields = []string{
 	"agent.models", "agent.wake_routes", "agent.max_attempts", "agent.modules",
 	"agent.temperature", "agent.max_tool_rounds", "agent.debounce", "agent.self_wake",
-	"agent.context", "agent.history", "agent.persona_file", "agent.guide_file",
+	"agent.context", "agent.history", "agent.persona_file", "agent.guide_file", "agent.sleep",
 	"bot.admin_number",
 }
 

@@ -2,7 +2,7 @@
   const clone = value => JSON.parse(JSON.stringify(value));
   const fields = {
     models: ['models', 'model', 'base_url', 'api_key', 'tool_choice', 'max_attempts', 'wake_routes'],
-    behavior: ['temperature', 'max_tool_rounds', 'debounce', 'self_wake', 'context', 'history', 'persona_file', 'guide_file', 'multimodal', 'debug'],
+    behavior: ['temperature', 'max_tool_rounds', 'debounce', 'self_wake', 'context', 'history', 'persona_file', 'guide_file', 'multimodal', 'debug', 'sleep'],
     modules: ['modules'],
   };
   const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);

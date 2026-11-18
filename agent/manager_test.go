@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	agentcontext "Q-Mi/agent/context"
+	"Q-Mi/agent/model"
 	"Q-Mi/utils/config"
 	"Q-Mi/utils/request"
 )
@@ -38,6 +41,29 @@ func (b *stubBuilder) Build(turn *Turn) []ChatMessage {
 		return fn(turn)
 	}
 	return []ChatMessage{{Role: "user", Content: "hi"}}
+}
+
+type attentionAwareBuilder struct {
+	stubBuilder
+	attention agentcontext.HistoryAttention
+}
+
+func (b *attentionAwareBuilder) SetHistoryAttention(attention agentcontext.HistoryAttention) {
+	b.attention = attention
+}
+
+func TestManagerInjectsCurrentHistoryAttentionPolicy(t *testing.T) {
+	setDNDTestConfig(t)
+	builder := &attentionAwareBuilder{}
+	_ = NewManager(builder, nil, testCfg(time.Hour), nil, 0)
+
+	if builder.attention == nil {
+		t.Fatal("manager did not inject the history attention policy")
+	}
+	filter := builder.attention(&Turn{SelfID: 998})
+	if filter.SelfID != 998 || len(filter.AdminIDs) != 1 || filter.AdminIDs[0] != 555 {
+		t.Fatalf("history attention = %+v, want event self ID and current admins", filter)
+	}
 }
 
 func (b *stubBuilder) callCount() int {
@@ -251,6 +277,115 @@ func TestEnqueueDebouncesIntoSingleTurn(t *testing.T) {
 	time.Sleep(150 * time.Millisecond) // 等过第二个防抖窗口
 	if got := f.count(); got != 1 {
 		t.Errorf("防抖后 LLM 请求应仍为 1 次,得到 %d", got)
+	}
+}
+
+func TestChatWithWorkingPublishesPartialStreamBeforeCompletion(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte(
+			`data: {"choices":[{"index":0,"delta":{"reasoning_content":"先查群记录","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"query\":"}}]}}]}` + "\n\n",
+		))
+		flusher.Flush()
+		close(entered)
+		<-release
+		_, _ = w.Write([]byte(
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"猫\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+				"data: [DONE]\n\n",
+		))
+		flusher.Flush()
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	m := NewManager(&stubBuilder{}, NewClient(server.URL, "key", 5*time.Second), testCfg(time.Hour), nil, 999)
+	m.events = NewEventLog()
+	turn := &Turn{ChatType: "group", ChatID: 7788}
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := m.chatWithWorking(context.Background(), turn, ChatRequest{
+			Model: "test-model", Messages: []ChatMessage{{Role: "user", Content: "刚才发生什么"}},
+			Tools: []ToolDef{{Type: "function", Function: ToolSchema{Name: "lookup"}}},
+		}, nil, model.Need{Tools: true}, 1, 1)
+		done <- err
+	}()
+
+	<-entered
+	_, cursor, reset := m.events.WaitAfter(context.Background(), 0, 0)
+	if reset {
+		t.Fatal("unexpected event reset")
+	}
+	events, cursor, reset := m.events.WaitAfter(context.Background(), cursor, time.Second)
+	if reset || len(events) != 1 {
+		t.Fatalf("partial events = %+v, cursor=%d reset=%v", events, cursor, reset)
+	}
+	run := events[0]
+	if run.Kind != KindModelStream || run.ChatType != "group" || run.ChatID != 7788 ||
+		run.State != "generating" || run.Reasoning != "先查群记录" ||
+		len(run.ToolCalls) != 1 || run.ToolCalls[0].Arguments != `{"query":` {
+		t.Fatalf("partial run = %+v", run)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("request returned before stream completed: %v", err)
+	default:
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	if err := <-done; err != nil {
+		t.Fatalf("chatWithWorking: %v", err)
+	}
+	final, _, _ := m.events.WaitAfter(context.Background(), cursor, 0)
+	if len(final) != 1 || final[0].RunID != run.RunID || final[0].State != "completed" ||
+		final[0].ToolCalls[0].Arguments != `{"query":"猫"}` {
+		t.Fatalf("final run = %+v", final)
+	}
+}
+
+func TestChatWithWorkingKeepsCandidateAttemptsIsolated(t *testing.T) {
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"temporary failure"}`))
+	}))
+	defer failed.Close()
+	succeeded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"second candidate only"},"finish_reason":"stop"}]}`))
+	}))
+	defer succeeded.Close()
+
+	cfg := testCfg(time.Hour)
+	cfg.Models = map[string]config.ModelTier{"chat": {Candidates: []config.ModelCandidate{
+		{Name: "first", BaseURL: failed.URL, APIKey: "key", Model: "one", Cooldown: "0"},
+		{Name: "second", BaseURL: succeeded.URL, APIKey: "key", Model: "two", Cooldown: "0"},
+	}}}
+	m := NewManager(&stubBuilder{}, nil, cfg, nil, 999)
+	m.events = NewEventLog()
+
+	response, slot, _, err := m.chatWithWorking(context.Background(), &Turn{ChatType: "group", ChatID: 912},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hello"}}}, nil, model.Need{}, 2, 3)
+	if err != nil {
+		t.Fatalf("chatWithWorking: %v", err)
+	}
+	if slot == nil || slot.Name() != "second" || response.TextContent() != "second candidate only" {
+		t.Fatalf("slot=%v response=%q", slot, response.TextContent())
+	}
+
+	events, _, _ := m.events.WaitAfter(context.Background(), 0, 0)
+	if len(events) != 2 {
+		t.Fatalf("attempt events = %+v, want two independent runs", events)
+	}
+	if events[0].Candidate != "first" || events[0].Model != "one" || events[0].State != "failed" ||
+		events[0].Content != "" || events[0].RunID == events[1].RunID {
+		t.Fatalf("first attempt = %+v; second = %+v", events[0], events[1])
+	}
+	if events[1].Candidate != "second" || events[1].Model != "two" ||
+		events[1].State != "completed" || events[1].Content != "second candidate only" {
+		t.Fatalf("second attempt = %+v", events[1])
 	}
 }
 
@@ -476,7 +611,7 @@ func TestHandleTurnAttachesPendingImagesAfterTools(t *testing.T) {
 	}
 
 	// pendingImages 已清空
-	if got := len(b.turn(0).pendingImages); got != 0 {
+	if got := len(b.turn(0).PendingImages()); got != 0 {
 		t.Errorf("pendingImages 应已清空, got %d", got)
 	}
 }

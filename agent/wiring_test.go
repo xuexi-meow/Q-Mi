@@ -45,15 +45,8 @@ func TestEventImageRefsPrefilledDataAndNil(t *testing.T) {
 
 func TestGroupEventPreservesAddressingThroughInbox(t *testing.T) {
 	m := NewManager(&stubBuilder{}, nil, config.AgentConfig{Debounce: time.Hour}, nil, 999)
-	m.inbox = &accountInbox{ready: make(chan struct{}, 1)}
+	m.inbox = newCapturedInbox(t)
 	withHookManager(t, m)
-	t.Cleanup(func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.inbox.timer != nil {
-			m.inbox.timer.Stop()
-		}
-	})
 	event.Dispatch([]byte(`{
 		"post_type":"message","message_type":"group","message_id":80,
 		"group_id":888,"user_id":111,"self_id":999,"time":100,

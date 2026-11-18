@@ -1,26 +1,29 @@
 package agent
 
 import (
+	"fmt"
 	"log/slog"
-	"reflect"
+	"strings"
+
+	agentcontext "Q-Mi/agent/context"
+	agentruntime "Q-Mi/agent/runtime"
 )
 
-type contextKind uint8
-
-const (
-	contextWork contextKind = iota
-	contextState
-	contextSummary
-	contextActiveInput
-)
-
-type workingConversation struct {
-	messages    []ChatMessage
-	state       string
-	wakes       int
-	unreadStart int
-	compactions uint64
+func turnSummary(ms []TurnMessage) string {
+	if len(ms) == 0 {
+		return ""
+	}
+	summary := fmt.Sprintf("%s: %s", ms[0].SenderName, ms[0].Text)
+	if len(ms) > 1 {
+		summary = fmt.Sprintf("%s 等%d条消息", summary, len(ms))
+	}
+	if len([]rune(summary)) > 200 {
+		summary = string([]rune(summary)[:200])
+	}
+	return strings.TrimSpace(summary)
 }
+
+type workingConversation = agentruntime.Conversation
 
 func (m *Manager) loadTurnState(turn *Turn) {
 	notes, err := LoadNotes(m.notesPath)
@@ -32,51 +35,32 @@ func (m *Manager) loadTurnState(turn *Turn) {
 	turn.Mood = m.loadMood()
 }
 
-func (m *Manager) beginTurn(turn *Turn) []ChatMessage {
+func (m *Manager) beginTurn(turn *Turn) []agentcontext.Message {
 	m.events.Record(turn.ChatType, turn.ChatID, KindTurnStart, turnSummary(turn.NewMessages))
-	var fresh []ChatMessage
-	if builder, ok := m.builder.(interface{ BuildContinuation(*Turn) []ChatMessage }); ok && len(m.conversation.messages) > 0 {
-		fresh = builder.BuildContinuation(turn)
-	} else if builder, ok := m.builder.(interface{ BuildWorking(*Turn) []ChatMessage }); ok && len(m.conversation.messages) == 0 {
-		fresh = builder.BuildWorking(turn)
+	var fresh []agentcontext.Message
+	if builder, ok := m.builder.(interface{ BuildContinuation(*Turn) []ChatMessage }); ok && len(m.conversation.Messages) > 0 {
+		fresh = agentcontext.FromWireMessages(builder.BuildContinuation(turn))
+	} else if builder, ok := m.builder.(interface {
+		BuildWorkingMessages(*Turn) []agentcontext.Message
+	}); ok && len(m.conversation.Messages) == 0 {
+		fresh = builder.BuildWorkingMessages(turn)
+	} else if builder, ok := m.builder.(interface{ BuildWorking(*Turn) []ChatMessage }); ok && len(m.conversation.Messages) == 0 {
+		fresh = agentcontext.FromWireMessages(builder.BuildWorking(turn))
 	} else {
-		fresh = m.builder.Build(turn)
+		fresh = agentcontext.FromWireMessages(m.builder.Build(turn))
 	}
 	incomingStart := len(fresh) - len(turn.NewMessages)
 	if incomingStart < 0 {
 		incomingStart = 0
 	}
-	for i := incomingStart; i < len(fresh); i++ {
-		if fresh[i].Role == "user" && fresh[i].kind != contextState {
-			fresh[i].kind = contextActiveInput
-		}
-	}
-	if len(m.conversation.messages) == 0 {
-		m.conversation.messages = fresh
-		m.conversation.unreadStart = incomingStart
+	state := ""
+	if len(m.conversation.Messages) == 0 {
 		if builder, ok := m.builder.(interface{ StateText(*Turn) string }); ok {
-			m.conversation.state = builder.StateText(turn)
-		}
-	} else {
-		for _, message := range fresh {
-			if message.Role != "system" {
-				m.conversation.messages = append(m.conversation.messages, message)
-			}
+			state = builder.StateText(turn)
 		}
 	}
-	if meaningfulTurn(turn) {
-		m.conversation.wakes++
-	}
-	return m.conversation.messages
-}
-
-func meaningfulTurn(turn *Turn) bool {
-	for _, msg := range turn.NewMessages {
-		if msg.Wake != WakeBackground || msg.SenderName != "轮询" {
-			return true
-		}
-	}
-	return false
+	m.conversation.Begin(fresh, incomingStart, state, agentruntime.MeaningfulTurn(turn))
+	return m.conversation.Messages
 }
 
 func (m *Manager) refreshLiveContext(turn *Turn) *Turn {
@@ -91,17 +75,8 @@ func (m *Manager) refreshLiveContext(turn *Turn) *Turn {
 		SystemMessage(*Turn) ChatMessage
 		StateText(*Turn) string
 	}); ok {
-		c := &m.conversation
-		system := builder.SystemMessage(live)
-		if len(c.messages) > 0 && c.messages[0].Role == "system" && !reflect.DeepEqual(c.messages[0], system) {
-			c.messages = append([]ChatMessage(nil), c.messages...)
-			c.messages[0] = system
-		}
-		state := builder.StateText(live)
-		if state != c.state {
-			c.messages = append(c.messages, ChatMessage{Role: "user", Content: state, kind: contextState})
-			c.state = state
-		}
+		system := agentcontext.FromWire(builder.SystemMessage(live), agentcontext.KindWork)
+		m.conversation.Refresh(system, builder.StateText(live))
 	}
 	return live
 }

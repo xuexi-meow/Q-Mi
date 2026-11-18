@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maxActive = 32
+
 // fireRecorder 计数并记录 fire 回调入参的测试桩（并发安全）。
 type fireRecorder struct {
 	mu  sync.Mutex
@@ -209,8 +211,9 @@ func TestLoadPendingMissingAndCorruptFile(t *testing.T) {
 		t.Errorf("文件缺失不应有计时, Active = %d", missing.Active())
 	}
 
-	corrupt := NewTimerStore(filepath.Join(t.TempDir(), "broken.json"), func(ScheduledTimer) {})
-	if err := os.WriteFile(corrupt.path, []byte("not json {{{"), 0o600); err != nil {
+	corruptPath := filepath.Join(t.TempDir(), "broken.json")
+	corrupt := NewTimerStore(corruptPath, func(ScheduledTimer) {})
+	if err := os.WriteFile(corruptPath, []byte("not json {{{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if n := corrupt.LoadPending(); n != 0 {

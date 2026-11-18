@@ -106,7 +106,7 @@ func TestMessageQueryOnlyAttachesImagesFromReturnedMessages(t *testing.T) {
 	if len(rows) != 1 || rows[0]["message_id"] != float64(10) {
 		t.Fatalf("unexpected bounded result: %s", out)
 	}
-	if hits.Load() != 0 || len(turn.pendingImages) != 0 {
+	if hits.Load() != 0 || len(turn.PendingImages()) != 0 {
 		t.Fatal("omitted message image was downloaded or attached")
 	}
 }

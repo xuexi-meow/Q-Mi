@@ -1,0 +1,1946 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "send_message",
+      "description": "给指定会话发送一条消息：text 纯文本，或 segments 富消息段数组（at/reply/face/mface/sticker/dice/rps/json/image），两者二选一。正文只写给对方看的话，不要附上下文的时间/会话/发送者前缀或内部标签。通常合并为一条；不想发言就调用 finish。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "会话 ID：群号；私聊 = 对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "会话类型：private / group",
+            "type": "string"
+          },
+          "segments": {
+            "description": "富消息段数组（与 text 二选一），按顺序发送。段类型白名单：text/at/reply/face/mface/sticker/dice/rps/json/image",
+            "items": {
+              "properties": {
+                "data": {
+                  "description": "段参数：text{text} / at{qq} / reply{id} / face{id} / mface{emoji_id, emoji_package_id, key, summary?} / sticker{id}（发自己收藏的表情，列表见 list_stickers） / dice{result} / rps{result} / json{data} / image{file, summary?}；image 的 file 只支持 http/https/base64:// 图片链接",
+                  "type": "object"
+                },
+                "type": {
+                  "description": "段类型：text / at / reply / face / mface / sticker / dice / rps / json / image",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "data"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "text": {
+            "description": "要发送的纯文本内容（与 segments 二选一）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chat_type",
+          "chat_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "think",
+      "description": "记一条思考笔记，持久化后下次模型请求前即注入最新状态快照，用于保持研究与活动连贯。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "note": {
+            "description": "笔记内容",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_mood",
+      "description": "更新自己的当前情绪状态，会注入到之后的对话开头；只在情绪真的变化时调用。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "mood": {
+            "description": "新的情绪状态，如 开心 / 无聊 / 有点生气",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mood"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "finish",
+      "description": "结束本轮思考。可以发了消息再结束，也可以什么都不发直接结束；调用后本轮终止。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sleep",
+      "description": "自主短时休息。程序随机安排醒来时间；睡眠期间消息存档但不参与聊天，密集的真实指向消息或 WebUI 可提前叫醒。成功后立即结束本次活动。必须单独调用；需要道晚安请先在上一轮 send_message，不与其他工具同批。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "description": "可选，简短的休息原因，不是对外消息",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sleep_status",
+      "description": "查看自己的作息状态、上次睡眠与唤醒原因；不会对外发言。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_recent_messages",
+      "description": "查询指定会话最近 N 条，旧到新返回限长 JSON；省略会话时仅使用本轮单一会话，混合来源必须明确指定。遵循 chat_dnd 勿扰；完整存档用 search_messages。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "可选，按会话 ID 过滤：群号；私聊 = 对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "可选，按会话类型过滤：private / group",
+            "type": "string"
+          },
+          "limit": {
+            "description": "可选，返回条数，默认 50，最大 100",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_messages",
+      "description": "查证历史：按私聊/群聊、会话、发送者 QQ、时间和可选关键词查询。含勿扰存档，排除撤回；取最近匹配记录按旧到新返回。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "可选，群号或私聊对象 QQ；需同时传 chat_type",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "可选，会话类型 private / group；传 chat_id 时必填，防止群号与私聊 QQ 混淆",
+            "type": "string"
+          },
+          "limit": {
+            "description": "可选，最近匹配条数，默认 20，最大 50",
+            "type": "integer"
+          },
+          "query": {
+            "description": "可选，全文搜索关键词；省略或空白时按其他条件查聊天记录",
+            "type": "string"
+          },
+          "since": {
+            "description": "可选，起始时间（包含）：RFC3339 带时区，或服务器本地时间 YYYY-MM-DD HH:MM[:SS] / YYYY-MM-DD",
+            "type": "string"
+          },
+          "until": {
+            "description": "可选，截止时间（不包含），格式同 since；单独日期表示当天零点，不是当天结束",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "可选，发送者 QQ；群内查某人的发言用此项，不是群号",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_message",
+      "description": "按消息 ID 精确查询同一会话的原消息，核对引用、发送者和 @ 对象。必须指定原会话；查不到不代表引用的是自己。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "原消息所在群号；私聊为对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "原消息会话类型：group / private",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "原消息 ID，例如 reply.message_id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "chat_type",
+          "chat_id",
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "view_message_images",
+      "description": "查看一条消息里的图片内容，取到的图片会附在你的下一条消息里（多模态直送）。查询工具的结果会自动附带最新几条消息的图片，单条消息的图或自动附带跳过的图用这个工具补看。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "description": "消息 ID（从聊天记录或上下文里拿）",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "chat_dnd",
+      "description": "自主添加、取消或查看会话勿扰。普通消息不唤醒、不插入思考、不进入最近消息；管理员、@自己、@全体照常进入。记录仍完整存档，可主动搜索。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "add 开启勿扰，remove 取消，list 查看列表",
+            "enum": [
+              "add",
+              "remove",
+              "list"
+            ],
+            "type": "string"
+          },
+          "chat_id": {
+            "description": "add/remove 必填：群号或私聊对方 QQ，正数",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "add/remove 必填：private / group",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_sticker",
+      "description": "把一条消息里的表情/图片收藏起来（face/mface/image），并默认顺手加入 QQ 账号收藏表情（协议端 SnowLuma 扩展），之后可用 send_message 的 sticker 段或 send_qq_face 发出。seg_index 是该消息里第几个消息段（从 0 开始，默认 0）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "description": "消息 ID（从聊天记录或上下文里拿）",
+            "type": "integer"
+          },
+          "note": {
+            "description": "可选备注：给这个表情起的名字或使用场景，会同步到 QQ 收藏表情的备注",
+            "type": "string"
+          },
+          "qq": {
+            "description": "是否加入 QQ 账号收藏表情，默认 true；填 false 只存本地",
+            "type": "boolean"
+          },
+          "seg_index": {
+            "description": "可选，消息段下标（从 0 开始），默认 0",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_stickers",
+      "description": "列出收藏的表情：id/kind/summary/note/has_preview。发的时候用 sticker 段的 id；不确定长相用 view_sticker 看预览，备注用 update_sticker 补。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_sticker",
+      "description": "删除一条收藏的表情（传 list_stickers 里的 id）。收藏错了用它清理。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "sticker_id": {
+            "description": "收藏表情的 id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sticker_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "view_sticker",
+      "description": "查看收藏表情的预览图（附图到下一轮），一次 1-4 个。确认长相后再决定发哪个；没有预览的会列在 missing 里。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "sticker_id": {
+            "description": "单个收藏 id（与 sticker_ids 二选一）",
+            "type": "integer"
+          },
+          "sticker_ids": {
+            "description": "要查看的收藏 id 列表（1-4 个）",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_sticker",
+      "description": "给收藏表情补备注或改名：note 是你自己的叫法/使用场景；name 会覆盖展示名（商城表情默认 summary 可能只是「动画表情」）。两个都不传则报错。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "覆盖展示名（同时作为发送时的 summary），传空串表示清空",
+            "type": "string"
+          },
+          "note": {
+            "description": "备注（叫法、风格、适合什么场景），传空串表示清空",
+            "type": "string"
+          },
+          "qq": {
+            "description": "可选：把这张老收藏补录进 QQ 收藏表情（已加入则忽略）",
+            "type": "boolean"
+          },
+          "sticker_id": {
+            "description": "收藏 id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sticker_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "send_qq_face",
+      "description": "把 QQ 账号收藏表情以真正的表情样式发给指定会话（协议端 SnowLuma 扩展）。表情只能单独一条：需要配文字时用 text 参数先发文字，再发这条表情。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "会话 ID：群号；私聊 = 对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "会话类型：private / group",
+            "type": "string"
+          },
+          "emoji_id": {
+            "description": "收藏表情的 emoji_id 或 32 位 md5（list_qq_faces / list_stickers 里拿）",
+            "type": "string"
+          },
+          "reply_to": {
+            "description": "可选：要引用的消息 ID",
+            "type": "integer"
+          },
+          "text": {
+            "description": "可选：先发一条文字，再发表情",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chat_type",
+          "chat_id",
+          "emoji_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_qq_faces",
+      "description": "列出 QQ 账号收藏表情（协议端 SnowLuma 扩展）：emoji_id / md5 / 备注。按备注挑好后用 send_qq_face 发；要看图片先用 sync_qq_faces 导入本地再 view_sticker。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "description": "可选：拉取条数，默认 48",
+            "type": "integer"
+          },
+          "query": {
+            "description": "可选：按备注或 emoji_id 过滤",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sync_qq_faces",
+      "description": "把 QQ 账号收藏表情导入本地收藏（带备注和预览），之后可用 list_stickers/view_sticker 统一管理、用 sticker 段或 send_qq_face 发。已导入的按 emoji_id 跳过。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "description": "可选：拉取条数，默认 48",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "collect_qq_sticker",
+      "description": "把一个网络图片（http/https 链接）下载并加入 QQ 的收藏表情（QQ 账号自带的收藏夹，不是本列表）：先让 NapCat 下载到本地，再加入收藏。适合把好看的图变成账号级表情。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "description": "图片链接（http/https）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "post_qzone",
+      "description": "在自己的 QQ 空间发一条说说：text 必填；images 可选，传图片链接数组（http/https/file/base64 均可，NapCat 自动上传）。空间是公开内容，发布前想清楚。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "images": {
+            "description": "可选，配图链接数组（http/https/file/base64，NapCat 自动上传）",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "text": {
+            "description": "说说文字内容（不能为空）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browse_qzone_feeds",
+      "description": "刷好友空间动态（每页最多 10 条：uin/author/time/summary/images/image_count/tid，has_more 表示可翻页）。只返回图片链接，不自动看图；选 images 中感兴趣的链接用 view_qzone_images。细看文字或互动用 read_qzone_post / qzone_like / comment_qzone。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "page_num": {
+            "description": "可选，页码，默认 1",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_qzone_post",
+      "description": "读空间说说正文与首批评论（正文限 200 字、评论限 10 条、单条限 100 字）。tid 来自 browse_qzone_feeds；target_uin 是作者 QQ，默认自己。接口若提供 images 则保留链接；为 null 时不代表无图，可用浏览列表中的链接调用 view_qzone_images。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "target_uin": {
+            "description": "可选，说说作者的 QQ 号，默认自己的空间",
+            "type": "integer"
+          },
+          "tid": {
+            "description": "说说 tid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tid"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "view_qzone_images",
+      "description": "按需查看 QQ 空间图片：传入动态 images 中选中的图片链接，最多 5 张；成功下载的图片会作为多模态附件进入下一次模型请求。仅拿到链接不等于看过图片，失败项会明确列出。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "urls": {
+            "description": "从 browse_qzone_feeds/read_qzone_post 或 napcat_api 空间结果中选取的 http(s) 图片链接，按希望查看的顺序传入",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "urls"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "qzone_like",
+      "description": "给一条空间说说点赞 / 取消点赞（enable 默认 true 点赞，false 取消）。tid 来自 browse_qzone_feeds；target_uin 是说说作者的 QQ 号，默认自己的空间。点赞要自然：真有感触才点，别批量刷。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "enable": {
+            "description": "true 点赞（默认），false 取消点赞",
+            "type": "boolean"
+          },
+          "target_uin": {
+            "description": "可选，说说作者的 QQ 号，默认自己的空间",
+            "type": "integer"
+          },
+          "tid": {
+            "description": "说说 tid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tid"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "comment_qzone",
+      "description": "给一条空间说说发一级评论。content 必填；target_uin 是说说作者的 QQ 号，默认自己的空间。楼中楼回复暂不支持（可经 napcat_api 调 comment_qzone 的回复参数）。评论对内容说话，别复制粘贴同一句到处刷。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "评论文本（不能为空）",
+            "type": "string"
+          },
+          "target_uin": {
+            "description": "可选，说说作者的 QQ 号，默认自己的空间",
+            "type": "integer"
+          },
+          "tid": {
+            "description": "说说 tid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tid",
+          "content"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "qzone_profile",
+      "description": "查看自己 QQ 空间的名称与说明。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_qzone",
+      "description": "删除自己发的一条空间说说（危险操作，需要管理员权限，删前想清楚）。tid 来自 browse_qzone_feeds / read_qzone_post。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "tid": {
+            "description": "要删除的说说 tid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tid"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "recall_message",
+      "description": "撤回一条消息（群消息需要自己是管理员或发送者）。传消息的 message_id。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "description": "要撤回的消息 ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_friend_list",
+      "description": "获取好友列表（user_id/nickname/remark）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lookup_user",
+      "description": "查一个 QQ 的资料（昵称、年龄、等级等）。传对方 QQ 号。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "qq": {
+            "description": "对方 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "qq"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lookup_groups",
+      "description": "获取自己加入的群列表（group_id/group_name/member_count）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lookup_group",
+      "description": "查一个群的详细信息（基本信息 + 扩展信息合并）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lookup_members",
+      "description": "获取群成员列表（user_id/nickname/card/role），最多返回 100 条并注明是否截断。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lookup_member",
+      "description": "查群成员的详细资料（名片、角色、等级、入群时间等）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_group_card",
+      "description": "设置群成员的群名片（管理员能力）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "card": {
+            "description": "新群名片（空串表示清除）",
+            "type": "string"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_group_special_title",
+      "description": "设置群成员的专属头衔（管理员能力）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "title": {
+            "description": "专属头衔（空串表示清除）",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id",
+          "title"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "group_ban",
+      "description": "禁言群成员一段时间（管理员能力）。duration 单位秒，最长 30 天。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "duration": {
+            "description": "禁言时长（秒），0 表示解除禁言，上限 2592000",
+            "type": "integer"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id",
+          "duration"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "group_whole_ban",
+      "description": "开启/关闭群全员禁言（管理员能力）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "enable": {
+            "description": "true 开启全员禁言，false 关闭",
+            "type": "boolean"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "enable"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "kick_member",
+      "description": "把成员踢出群聊（管理员能力，危险操作，需要管理员权限）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "reject_add_request": {
+            "description": "是否拒绝此人再次加群，默认 false",
+            "type": "boolean"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_group_admin",
+      "description": "设置/取消群管理员（危险操作，需要管理员权限）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "enable": {
+            "description": "true 设为管理员，false 取消",
+            "type": "boolean"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "成员 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id",
+          "user_id",
+          "enable"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_group_name",
+      "description": "修改群名称，需要管理员权限。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "name": {
+            "description": "新群名称",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_id",
+          "name"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "leave_group",
+      "description": "退出指定群聊（危险操作，需要管理员权限；群主解散群请通过逃生舱 is_dismiss）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "description": "要退出的群号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "send_group_notice",
+      "description": "在群里发布一条公告，需要管理员权限。content（文字）与 image（图片 URL/路径）至少提供一个。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "公告文字内容",
+            "type": "string"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "image": {
+            "description": "可选，公告图片（路径或 URL）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_essence",
+      "description": "把一条群消息设为精华消息。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "description": "消息 ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "remove_essence",
+      "description": "把一条消息移出群精华消息。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "message_id": {
+            "description": "消息 ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "poke",
+      "description": "戳一戳对方（群聊戳群成员，私聊戳好友）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "群号（group 时）；私聊可传对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "会话类型：private / group",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "要戳的人的 QQ 号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "chat_type",
+          "user_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "send_like",
+      "description": "给指定 QQ 点赞（每天最多 10 个赞）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "qq": {
+            "description": "对方 QQ 号",
+            "type": "integer"
+          },
+          "times": {
+            "description": "点赞次数，默认 1，最大 10",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "qq"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "handle_friend_request",
+      "description": "同意或拒绝加好友请求。flag 从好友申请事件/系统消息里拿到。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "approve": {
+            "description": "是否同意",
+            "type": "boolean"
+          },
+          "flag": {
+            "description": "请求 flag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "flag"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "handle_group_request",
+      "description": "同意或拒绝加群请求/邀请。flag 从群系统消息里拿到；sub_type 为 add（申请）或 invite（邀请）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "approve": {
+            "description": "是否同意",
+            "type": "boolean"
+          },
+          "flag": {
+            "description": "请求 flag",
+            "type": "string"
+          },
+          "sub_type": {
+            "description": "add（加群申请）或 invite（邀请）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "flag",
+          "sub_type"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_msg_history",
+      "description": "拉取某个会话在 NapCat 侧的历史消息（不受本地记忆库上限约束），返回 messages 数组。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "群号；私聊 = 对方 QQ",
+            "type": "integer"
+          },
+          "chat_type": {
+            "description": "会话类型：private / group",
+            "type": "string"
+          },
+          "count": {
+            "description": "可选，条数，默认 20，最大 20",
+            "type": "integer"
+          },
+          "message_seq": {
+            "description": "可选，起始消息序号（翻页用）",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "chat_type",
+          "chat_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_forward_detail",
+      "description": "查看一条合并转发消息的具体内容。forward_id 从消息段/发送结果里拿到。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "forward_id": {
+            "description": "合并转发消息的 ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "forward_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "upload_group_file",
+      "description": "上传本地文件到群文件系统。file 仅支持本地路径，且文件必须与 NapCat 在同一台机器上（不支持 http/base64）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "_async": {
+            "description": "可选，true 表示后台执行，完成后自动回填结果",
+            "type": "boolean"
+          },
+          "file": {
+            "description": "本地文件绝对路径",
+            "type": "string"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          },
+          "name": {
+            "description": "上传后显示的文件名",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_id",
+          "file",
+          "name"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_group_files",
+      "description": "查看群文件列表：不传 folder_id 列根目录，传 folder_id 列该文件夹内容。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "folder_id": {
+            "description": "可选，文件夹 ID（不传则列根目录）",
+            "type": "string"
+          },
+          "group_id": {
+            "description": "群号",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "napcat_api",
+      "description": "按需调用已开放的 SnowLuma/NapCat 动作。优先已有封装工具；先用 napcat_docs 搜索并查具体参数。权限、参数与发言校验不可绕过。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "NapCat 动作名，如 get_group_honor_info（可带 / 前缀）",
+            "type": "string"
+          },
+          "params": {
+            "description": "动作参数对象，键为文档里的参数名；无参动作可省略",
+            "type": "object"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "napcat_docs",
+      "description": "按需查完整 SnowLuma API 目录：query 搜索，category 分类，action 查参数/返回结构/示例/本地权限。空参返回分类和首屏，列表分页。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "可选，精确动作名；返回详情而非列表，可带 / 前缀",
+            "type": "string"
+          },
+          "category": {
+            "description": "可选，空参返回的分类名，如 空间、群管理、消息、群文件",
+            "type": "string"
+          },
+          "limit": {
+            "description": "可选，每页条数，默认 12，上限 25",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "可选，列表偏移量，默认 0；接上页 next_offset",
+            "type": "integer"
+          },
+          "query": {
+            "description": "可选，中英文动作名或用途关键词，如 qzone、群荣誉、表情",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "读工作区里的一个文本文件（默认上限 64KB，超出截断）。二进制文件（图片/视频等）会拒绝——媒体走 save_message_media / view_message_images。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "description": "可选，读取上限字节，默认 65536",
+            "type": "integer"
+          },
+          "path": {
+            "description": "文件路径（相对工作区，或工作区内绝对路径）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "把文本内容写到工作区里的一个文件（覆盖写，目录自动创建；上限 2MB）。需要生成脚本、配置、笔记文件时用。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "要写入的文本内容",
+            "type": "string"
+          },
+          "path": {
+            "description": "文件路径（相对工作区，或工作区内绝对路径）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_dir",
+      "description": "列工作区里某个目录的内容（名字/类型/大小）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "目录路径（相对工作区，空 = 工作区根）",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_file",
+      "description": "删除工作区里的一个文件（不递归目录）。清理下载/生成的临时文件用。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "文件路径（相对工作区）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_file",
+      "description": "把一个 http/https 链接下载到工作区（单文件上限 200MB），返回本地路径与 NapCat 侧路径——后者可直接给 send_message 的 image/video/file 段或 upload_group_file 使用。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "_async": {
+            "description": "可选，true 表示后台执行，完成后自动回填结果",
+            "type": "boolean"
+          },
+          "filename": {
+            "description": "可选，保存的文件名（缺省从 URL 推断）",
+            "type": "string"
+          },
+          "url": {
+            "description": "下载链接（http/https）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_command",
+      "description": "在电脑上执行一条命令（Windows 走 PowerShell，超时后强制结束），返回 stdout+stderr（上限 4KB）。全部命令进审计日志；命中危险黑名单或工作目录在工作区外会转管理员审批。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "_async": {
+            "description": "可选，true 表示后台执行，完成后自动回填结果",
+            "type": "boolean"
+          },
+          "command": {
+            "description": "要执行的命令",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "可选，工作目录（默认工作区；工作区外需管理员审批）",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "description": "可选，超时秒数，默认 30，最大 600",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_message_media",
+      "description": "把一条消息里的媒体（图片/视频/文件/语音）保存到工作区。图片走本地缓存直接落盘；视频/文件经 NapCat 下载后拷贝（跨 WSL 需要几秒）。返回路径与 NapCat 侧路径，之后可转发/上传/用工具处理。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "_async": {
+            "description": "可选，true 表示后台执行，完成后自动回填结果",
+            "type": "boolean"
+          },
+          "filename": {
+            "description": "可选，保存的文件名",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "消息 ID",
+            "type": "integer"
+          },
+          "seg_index": {
+            "description": "可选，该消息内媒体段序号（从 0 开始，默认第一个媒体段）",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_navigate",
+      "description": "当前页打开 URL，或前进/后退/刷新。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "默认 open；back/forward/reload 时不传 url",
+            "type": "string"
+          },
+          "url": {
+            "description": "http/https URL",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_read_page",
+      "description": "读当前页正文（最多 8KB）及控件 idx，供 click/type 使用。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_click",
+      "description": "点击 read_page 返回的控件 idx。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "idx": {
+            "description": "控件 idx",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "idx"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_type",
+      "description": "填写控件 idx；submit=true 提交。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "idx": {
+            "description": "控件 idx",
+            "type": "integer"
+          },
+          "submit": {
+            "description": "输入后提交",
+            "type": "boolean"
+          },
+          "text": {
+            "description": "文本",
+            "type": "string"
+          }
+        },
+        "required": [
+          "idx",
+          "text"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_scroll",
+      "description": "滚动顶层页面；正数向下，负数向上。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "pixels": {
+            "description": "滚动像素，正下负上",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pixels"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_screenshot",
+      "description": "截图并附图，返回尺寸、CSS 视口坐标、tab_id/snapshot_id。只看不留存时用它；要存文件用 browser_save_screenshot。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "full_page": {
+            "description": "整页图仅查看，不能用于坐标操作；默认视口图",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_save_screenshot",
+      "description": "把当前页面截图保存为 PNG 文件（默认写工作区，可指定路径；工作区外需管理员审批）。不附图、不消耗视觉上下文，返回本地路径和 napcat_path（可直接给 send_message 的 image 段或 upload_group_file）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "full_page": {
+            "description": "整页截图；默认只截当前视口",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "保存路径：相对工作区；以 / 结尾或指向已存在目录时自动命名 browser-时间戳.png；无扩展名自动补 .png；工作区外需审批",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_mouse",
+      "description": "视口坐标鼠标操作，动作后旧图失效。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "click/double_click/right_click/move/drag/wheel",
+            "type": "string"
+          },
+          "delta_x": {
+            "description": "wheel 横移，-2000..2000",
+            "type": "number"
+          },
+          "delta_y": {
+            "description": "wheel 纵移，正下负上，-2000..2000",
+            "type": "number"
+          },
+          "snapshot_id": {
+            "description": "视口图 ID，2 分钟有效",
+            "type": "string"
+          },
+          "tab_id": {
+            "description": "截图页 ID",
+            "type": "string"
+          },
+          "to_x": {
+            "description": "drag 终点 x",
+            "type": "number"
+          },
+          "to_y": {
+            "description": "drag 终点 y",
+            "type": "number"
+          },
+          "x": {
+            "description": "CSS x",
+            "type": "number"
+          },
+          "y": {
+            "description": "CSS y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "action",
+          "tab_id",
+          "snapshot_id",
+          "x",
+          "y"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_keyboard",
+      "description": "焦点输入：text 或 key，二选一。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "description": "如 CTRL+A、Enter、SHIFT+Tab；修饰键 CTRL/ALT/SHIFT/META",
+            "type": "string"
+          },
+          "text": {
+            "description": "最多 10000 字符",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_tabs",
+      "description": "列出标签页与弹窗，或新建、切换、关闭；最多 20 页。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "list/new/switch/close",
+            "type": "string"
+          },
+          "tab_id": {
+            "description": "switch/close 目标",
+            "type": "string"
+          },
+          "url": {
+            "description": "new 可选 http/https URL，省略为空白页",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "browser_dialog",
+      "description": "查看或处理网页对话框，不自动接受。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "get/accept/dismiss",
+            "type": "string"
+          },
+          "text": {
+            "description": "accept prompt 的文本，最多 10000 字符",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "schedule",
+      "description": "定一个一次性闹钟：delay_seconds 秒后你会收到一条 [定时提醒] 开头的消息（note 原样带给你）。提醒走正常消息队列排队，不会打断你正在做的思考。适合控制发言节奏、延时跟进（如「10分钟后看看他回了没」）、定时打卡；循环任务到点后自己再 schedule 一次。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "delay_seconds": {
+            "description": "多少秒后提醒，1 ~ 604800（最长 7 天）",
+            "type": "integer"
+          },
+          "note": {
+            "description": "到点提醒内容：写清楚到时要做什么、发给谁（会话与内容）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delay_seconds",
+          "note"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "cancel_timer",
+      "description": "取消一个还没到点的定时提醒（传 schedule 返回的 id）。已触发或已取消的 id 会报错。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "timer_id": {
+            "description": "schedule 返回的定时器 id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timer_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "task_list",
+      "description": "查看你的后台任务列表（_async 发起的任务）：id/工具/状态/耗时/参数摘要。结果全文用 task_get。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "description": "可选，按状态过滤：running / done / failed / cancelled / all，缺省 all",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "task_get",
+      "description": "查一个后台任务的详情（含完成结果全文）。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "description": "task_list 里的任务 id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "task_cancel",
+      "description": "停止一个还在运行的后台任务（结果不再投递）。已完成/已取消的任务会报错。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "description": "task_list 里的任务 id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "self_events",
+      "description": "回溯你自己的近期行为流（思考/工具调用/输出/回复，按时间倒序）。用于回忆上一轮做了什么、为什么没回、调过什么工具，防止前后割裂。只覆盖最近几百条事件，更早的靠消息库与思考笔记。",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chat_id": {
+            "description": "可选，按会话 ID 过滤",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "可选，按类型过滤：turn_start / reasoning / output / tool_call / tool_result / reply / finish / usage / interrupted / error",
+            "type": "string"
+          },
+          "limit": {
+            "description": "可选，返回条数，默认 50，最大 200",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    }
+  }
+]

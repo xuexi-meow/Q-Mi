@@ -1,0 +1,21 @@
+.sleep-header {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-height: 72px;
+  padding-bottom: 22px;
+}
+.sleep-symbol { width: 30px; height: 30px; flex: 0 0 30px; color: var(--accent); }
+.sleep-header strong { display: block; font-size: 19px; font-weight: 600; }
+.sleep-header p { margin-top: 5px; font-size: 12px; overflow-wrap: anywhere; }
+.sleep-facts { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 20px; margin: 0; }
+.sleep-facts dt { font-size: 11px; color: var(--muted); }
+.sleep-facts dd { margin: 6px 0 0; font-size: 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.sleep-facts small { display: block; font-size: 11px; margin-top: 3px; color: var(--muted); }
+.sleep-reason { font-size: 12px; margin-top: 16px; overflow-wrap: anywhere; }
+@media (max-width:760px) {
+  .sleep-header { gap: 12px; flex-wrap: wrap; }
+  .sleep-header .grow { flex-basis: calc(100% - 44px); }
+  .sleep-header button { margin-left: 42px; }
+  .sleep-facts { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px 12px; }
+}

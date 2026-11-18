@@ -11,9 +11,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	agentcontext "Q-Mi/agent/context"
+	"Q-Mi/agent/model"
+	agentruntime "Q-Mi/agent/runtime"
 	"Q-Mi/app"
 	"Q-Mi/bot"
 	"Q-Mi/chain"
@@ -22,27 +26,13 @@ import (
 )
 
 // IncomingMessage 事件接线层投给 Manager 的一条原始消息。
-type IncomingMessage struct {
-	MessageID  int64  // OneBot 消息 ID（图片锚定用）
-	Wake       string // 唤醒类型：WakeChat / WakeBackground（空 = chat）
-	ChatType   string // "private" / "group"
-	ChatID     int64  // 群号；私聊 = 对方 QQ
-	SelfID     int64  // 机器人自身 QQ
-	SenderID   int64
-	SenderName string
-	Text       string
-	Segments   json.RawMessage // 原始消息段，保留 @ 和 reply 的明确指向
-	Images     []imageRef      // 消息里的图片段（P2.7 多模态，wiring 提取）
-	Time       time.Time
-	Urgent     bool // 私聊/群@标记；不再取消正在进行的请求
-	Mentioned  bool // 真实 @自己/@全体消息段，勿扰例外
-}
+type IncomingMessage = agentruntime.IncomingMessage
 
 // defaultDebounce 防抖窗口默认值（cfg.Debounce 非正时兜底）。
 const defaultDebounce = 3 * time.Second
 
-// defaultMaxToolRounds 思考轮数上限默认值（cfg.MaxToolRounds 非正时兜底，spec §4）。
-const defaultMaxToolRounds = 10
+// defaultMaxAttempts 单次请求最多尝试的候选数（含首个）。
+const defaultMaxAttempts = 2
 
 // 默认思考状态文件路径（相对工作目录，已进 .gitignore）。
 const (
@@ -85,7 +75,7 @@ type Manager struct {
 	cfgMu        sync.RWMutex // 保护 cfg（热重载整体替换）
 	registryMu   sync.RWMutex // 保护 registry（模块启停重建）
 	poolMu       sync.RWMutex // 保护 pool（候选选择/failover）
-	pool         *modelPool
+	pool         *model.Pool
 	usageMu      sync.Mutex // 保护按候选用量统计
 	usageByModel map[string]*UsageSnapshot
 
@@ -95,12 +85,19 @@ type Manager struct {
 	wakeMu            sync.Mutex // 保护轮询 goroutine（热重载换间隔时重启）
 	wakeStop          chan struct{}
 	conversation      workingConversation
+	contextTurn       *Turn // 仅由 runMu 保护，恢复活动时不重新插入入站消息。
 	usage             UsageSnapshot
 	inspectionMu      sync.RWMutex
 	inspectionRuntime RuntimeInspection
 	inspectionRequest *ContextSnapshot
 	inspectionWorking *ContextSnapshot
 	inspectionVersion uint64
+	sleepMu           sync.Mutex
+	sleepStore        *agentruntime.SleepStore
+	sleepTimer        *time.Timer
+	sleepCancel       context.CancelFunc
+	sleepWakeID       string
+	sleepStopped      bool
 }
 
 // NewManager 构造 Manager。store 可为 nil（无历史/查询工具报错）。
@@ -119,10 +116,14 @@ func NewManager(builder ContextBuilder, client *Client, cfg config.AgentConfig, 
 		statePath:    defaultStatePath,
 		events:       NewEventLog(),
 	}
-	// 图片缓存：优先复用 DefaultBuilder 自带的（历史多模态与工具共享
-	// 正/负缓存）；其他 builder（测试桩）没有缓存，manager 自建一份。
-	if db, ok := builder.(*DefaultBuilder); ok {
-		m.images = db.Images()
+	if b, ok := builder.(interface {
+		SetHistoryAttention(agentcontext.HistoryAttention)
+	}); ok {
+		b.SetHistoryAttention(recentAttention)
+	}
+	// Builders that own image resolution share that cache with image tools.
+	if b, ok := builder.(interface{ Images() *imageStore }); ok && b.Images() != nil {
+		m.images = b.Images()
 	} else {
 		m.images = newImageStore(defaultImagesDir, store)
 	}
@@ -171,7 +172,7 @@ func (m *Manager) ApplyConfig(next config.AgentConfig) {
 		m.registryMu.Lock()
 		m.registry = registry
 		m.registryMu.Unlock()
-		if b, ok := m.builder.(*DefaultBuilder); ok {
+		if b, ok := m.builder.(interface{ SetToolDocs(string) }); ok {
 			b.SetToolDocs(registry.PromptDocs())
 		}
 	}
@@ -223,12 +224,7 @@ func (m *Manager) AttachConfigStore(store *config.Store) {
 // wakeFor 防抖窗口的唤醒类型合并：任一消息是 chat（或紧急）即整轮 chat
 // （聊天质量优先），纯后台唤醒才降级到 background 档。
 func wakeFor(pending []TurnMessage) string {
-	for _, m := range pending {
-		if m.Wake == WakeChat || m.Wake == "" {
-			return WakeChat
-		}
-	}
-	return WakeBackground
+	return agentruntime.WakeFor(pending)
 }
 
 // deliverTaskResult 后台任务完成投递：格式化为合成消息入来源会话队列
@@ -319,7 +315,7 @@ func (m *Manager) TryResolveApproval(text string) bool {
 }
 
 // modelPool 返回当前候选池（热重载会整体替换）。
-func (m *Manager) modelPool() *modelPool {
+func (m *Manager) modelPool() *model.Pool {
 	if m == nil {
 		return nil
 	}
@@ -330,10 +326,14 @@ func (m *Manager) modelPool() *modelPool {
 
 // chat 按能力选候选并发请求；可重试错误（网络/超时/429/5xx）自动换下一个
 // 候选，最多 attempts 次。返回实际使用的候选与档位（日志/统计用）。
-func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need modelNeed, attempts int) (*ChatResponse, *modelSlot, string, error) {
+func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need model.Need, attempts int) (*ChatResponse, *model.Candidate, string, error) {
+	return m.chatWithWorking(ctx, turn, req, nil, need, attempts, 0)
+}
+
+func (m *Manager) chatWithWorking(ctx context.Context, turn *Turn, req ChatRequest, working []agentcontext.Message, need model.Need, attempts, round int) (*ChatResponse, *model.Candidate, string, error) {
 	pool := m.modelPool()
 	if pool == nil {
-		return nil, nil, "", errNoModel
+		return nil, nil, "", model.ErrNoModel
 	}
 	if attempts <= 0 {
 		attempts = defaultMaxAttempts
@@ -346,12 +346,12 @@ func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need mo
 	tierName := wake
 	tried := make(map[string]bool, attempts)
 	for attempt := 0; attempt < attempts; attempt++ {
-		slot, tier, err := pool.pick(wake, need, tried)
+		slot, tier, err := pool.Pick(wake, need, tried)
 		if err != nil && need.Vision {
 			// 没有支持视觉的候选：降级为纯文本（图片替换成标注），不报错。
 			fallback := need
 			fallback.Vision = false
-			slot, tier, err = pool.pick(wake, fallback, tried)
+			slot, tier, err = pool.Pick(wake, fallback, tried)
 		}
 		if err != nil {
 			if lastErr != nil {
@@ -360,38 +360,98 @@ func (m *Manager) chat(ctx context.Context, turn *Turn, req ChatRequest, need mo
 			return nil, nil, tier, err
 		}
 		tierName = tier
-		tried[slot.key()] = true
-		req.Model = slot.model
+		tried[slot.Key()] = true
+		req.Model = slot.Model()
 		if len(req.Tools) > 0 {
-			req.ToolChoice = slot.toolChoice
+			req.ToolChoice = slot.ToolChoice()
 		}
-		if need.Vision && !slot.supports("vision") {
+		if need.Vision && !slot.Supports("vision") {
 			// 候选不支持视觉：图片降级为文字标注（不修改会话里的原消息）。
 			req.Messages = stripImageParts(req.Messages)
+		}
+		if working != nil {
+			working = append([]agentcontext.Message(nil), working...)
+			for i := range working {
+				if i < len(req.Messages) {
+					working[i].Wire = req.Messages[i]
+				}
+			}
 		}
 		phase := "summarizing"
 		if len(req.Tools) > 0 {
 			phase = "requesting"
-			m.publishInspection("request", req.Messages, req.Tools)
+			if working == nil {
+				m.publishInspection("request", req.Messages, req.Tools)
+			} else {
+				m.publishContextInspection("request", working, req.Tools)
+			}
 		}
-		m.setInspectionPhase(phase, 0, slot.name, slot.model, tier)
-		resp, chatErr := slot.client.Chat(ctx, req)
+		m.setInspectionPhase(phase, 0, slot.Name(), slot.Model(), tier)
+		var runID uint64
+		if turn != nil {
+			runID = m.events.BeginRun(turn.ChatType, turn.ChatID, round, slot.Name(), slot.Model())
+		}
+		onEvent := func(event StreamEvent) {
+			if runID == 0 {
+				return
+			}
+			calls := make([]RunToolCall, 0, len(event.ToolCallDeltas))
+			received := int64(len(event.ContentDelta) + len(event.ReasoningDelta))
+			for _, delta := range event.ToolCallDeltas {
+				calls = append(calls, RunToolCall{
+					Index: delta.Index, ID: delta.ID, Type: delta.Type,
+					Name: delta.Name, Arguments: delta.Arguments,
+				})
+				received += int64(len(delta.ID) + len(delta.Name) + len(delta.Arguments))
+			}
+			m.events.UpdateRun(runID, RunUpdate{
+				ReasoningDelta: event.ReasoningDelta, ContentDelta: event.ContentDelta,
+				ToolCalls: calls, ReceivedBytes: received,
+			})
+		}
+		resp, chatErr := chatWithModelClientStream(ctx, slot.Client(), req, onEvent)
+		if isImageSizeLimitError(chatErr) && need.Vision {
+			slog.Warn("模型拒绝图片载荷，改用纯文本重试",
+				"candidate", slot.Name(), "round", round, "err", chatErr)
+			req.Messages = stripImageParts(req.Messages)
+			if working != nil {
+				for i := range working {
+					if i < len(req.Messages) {
+						working[i].Wire = req.Messages[i]
+					}
+				}
+				if len(req.Tools) > 0 {
+					m.publishContextInspection("request", working, req.Tools)
+				}
+			} else if len(req.Tools) > 0 {
+				m.publishInspection("request", req.Messages, req.Tools)
+			}
+			resp, chatErr = chatWithModelClientStream(ctx, slot.Client(), req, onEvent)
+		}
 		if chatErr == nil {
+			m.events.EndRun(runID, "completed", "")
 			m.inspectionMu.Lock()
 			m.inspectionRuntime.LastUsage = resp.Usage
 			m.inspectionMu.Unlock()
-			slot.markSuccess()
+			slot.MarkSuccess()
 			return resp, slot, tier, nil
 		}
+		m.events.EndRun(runID, "failed", chatErr.Error())
 		lastErr = chatErr
-		if !retryableError(chatErr) {
+		if !model.IsRetryableError(chatErr) {
 			return nil, slot, tier, chatErr
 		}
-		slot.markFailure(time.Now())
+		slot.MarkFailure(time.Now())
 		slog.Warn("模型候选失败，切换下一个",
-			"candidate", slot.name, "tier", tier, "attempt", attempt+1, "err", chatErr)
+			"candidate", slot.Name(), "tier", tier, "attempt", attempt+1, "err", chatErr)
 	}
 	return nil, nil, tierName, lastErr
+}
+
+func isImageSizeLimitError(err error) bool {
+	var httpErr *model.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Status == 400 &&
+		strings.Contains(strings.ToLower(httpErr.Body), "over image size limit")
 }
 
 // fireTimer P3.5 定时器到点回调：把提醒合成为一条 IncomingMessage 入队
@@ -421,11 +481,30 @@ func (m *Manager) fireTimer(st ScheduledTimer) {
 func (m *Manager) handleTurn(turn *Turn) {
 	m.runMu.Lock()
 	defer m.runMu.Unlock()
+	kept := make([]TurnMessage, 0, len(turn.NewMessages))
+	for _, message := range turn.NewMessages {
+		if !m.sleepGate(IncomingMessage{
+			MessageID: message.MessageID, SelfID: turn.SelfID, ChatType: message.ChatType, ChatID: message.ChatID,
+			SenderID: message.SenderID, SenderName: message.SenderName, Text: message.Text, Wake: message.Wake,
+			Segments: message.Segments, Images: message.Images, Time: message.Time, Mentioned: message.Mentioned,
+		}) {
+			kept = append(kept, message)
+		}
+	}
+	if len(turn.NewMessages) > 0 && len(kept) == 0 {
+		return
+	}
+	turn.NewMessages = kept
+	m.runActivity(turn, true)
+}
+
+// runActivity 的调用方持有 runMu；恢复时沿用原有工作记录。
+func (m *Manager) runActivity(turn *Turn, incoming bool) {
 	m.setInspectionPhase("preparing", 0, "", "", "")
 	var inspectionErr error
 	var inspectionDefs []ToolDef
 	defer func() {
-		m.publishInspection("working", m.conversation.messages, inspectionDefs)
+		m.publishContextInspection("working", m.conversation.Messages, inspectionDefs)
 		m.finishInspection(inspectionErr)
 	}()
 	ctx := context.Background()
@@ -449,346 +528,18 @@ func (m *Manager) handleTurn(turn *Turn) {
 	m.loadTurnState(turn)
 	// Inputs stay pinned for this entire activity, including inserted arrivals.
 	// Older wakes become eligible only after a new handleTurn starts.
-	m.conversation.messages = append([]ChatMessage(nil), m.conversation.messages...)
-	for i := range m.conversation.messages {
-		if m.conversation.messages[i].kind == contextActiveInput {
-			m.conversation.messages[i].kind = contextWork
-		}
+	if incoming {
+		m.conversation.BeginActivity()
+		m.beginTurn(turn)
 	}
-	msgs := m.beginTurn(turn)
-	counted := meaningfulTurn(turn)
-	cfg := m.config()
-	maxRounds := cfg.MaxToolRounds
-	if maxRounds <= 0 {
-		maxRounds = defaultMaxToolRounds
+	m.rememberContextTurn(turn)
+	driver := &activityDriver{manager: m, config: m.config()}
+	loop := &agentruntime.Loop{
+		Conversation: &m.conversation, Driver: driver, Events: m.events,
+		MaxRounds: driver.config.MaxToolRounds,
 	}
-	attempts := cfg.MaxAttempts
-	if attempts <= 0 {
-		attempts = defaultMaxAttempts
-	}
-
-	protocolFailures := 0
-	for round := 1; round <= maxRounds; round++ {
-		m.setInspectionPhase("preparing", round, "", "", "")
-		var toolCtx *ToolContext
-		var tools []Tool
-		var defs []ToolDef
-		for {
-			turn = m.refreshLiveContext(turn)
-			toolCtx = &ToolContext{
-				Store: m.store, Turn: turn, Timer: m.timerStore, Images: m.images,
-				Tasks: m.tasks, Approvals: m.approvals, Browser: m.browser,
-				Events: m.events, Workspace: cfg.WorkspaceDir,
-				NotesPath: m.notesPath, StatePath: m.statePath, Admin: batchIsAdmin(turn),
-			}
-			tools = m.toolRegistry().Build(toolCtx)
-			defs = toolDefs(tools)
-			inspectionDefs = defs
-			revision := m.conversation.compactions
-			if err := m.prepareContext(ctx, turn, defs); err != nil {
-				inspectionErr = err
-				m.events.Record(turn.ChatType, turn.ChatID, KindError, err.Error())
-				slog.Warn("上下文预算不足，暂停活动", "err", err)
-				return
-			}
-			if next := m.takePending(); next != nil {
-				turn = next
-				m.loadTurnState(turn)
-				m.beginTurn(turn)
-				counted = meaningfulTurn(turn)
-				continue
-			}
-			// A summary request may have taken time: refresh files and arrivals
-			// again before issuing the next action request.
-			if revision == m.conversation.compactions {
-				break
-			}
-		}
-		msgs = m.conversation.messages
-		req := ChatRequest{
-			Model:       cfg.Model,
-			Messages:    msgs,
-			Temperature: cfg.Temperature,
-			Tools:       defs,
-		}
-		need := needForMessages(msgs)
-		resp, slot, tier, chatErr := m.chat(ctx, turn, req, need, attempts)
-		if chatErr != nil {
-			inspectionErr = chatErr
-			if cfg.Debug {
-				m.dumpDebug(turn, req, round, nil, nil, chatErr, false)
-			}
-			m.events.Record(turn.ChatType, turn.ChatID, KindError, chatErr.Error())
-			slog.Warn("LLM 请求失败，本轮思考结束",
-				"chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "tier", tier, "err", chatErr)
-			return
-		}
-		// 用量打点：缓存命中率掉坑 = 前缀被打断的信号（webui 概览有累计视图）。
-		u := resp.Usage
-		candidate := ""
-		if slot != nil {
-			candidate = slot.name
-		}
-		m.recordUsageFor(candidate, u)
-		m.conversation.unreadStart = len(msgs)
-		m.events.Record(turn.ChatType, turn.ChatID, KindUsage,
-			fmt.Sprintf("hit=%d miss=%d out=%d candidate=%s tier=%s",
-				u.PromptCacheHitTokens, u.PromptCacheMissTokens, u.CompletionTokens, candidate, tier))
-		slog.Info("用量", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "tier", tier,
-			"candidate", candidate, "cache_hit", u.PromptCacheHitTokens, "cache_miss", u.PromptCacheMissTokens,
-			"prompt", u.PromptTokens, "output", u.CompletionTokens)
-
-		// P2.5 思考链控制台输出：reasoning/content/工具调用/结束全打 Info，
-		// 不截断（要看全文）、不加配置开关。
-		if rc := resp.ReasoningContent(); rc != "" {
-			slog.Info("思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "reasoning", rc)
-			m.events.Record(turn.ChatType, turn.ChatID, KindReasoning, rc)
-		}
-		if content := resp.TextContent(); content != "" {
-			slog.Info("输出", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round, "content", content)
-			m.events.Record(turn.ChatType, turn.ChatID, KindOutput, content)
-		}
-
-		calls := resp.ToolCalls()
-		protocolError := responseProtocolError(resp)
-		if protocolError != "" {
-			// Assistant content is private work, never an implicit QQ send.
-			protocolFailures++
-			if cfg.Debug {
-				m.dumpDebug(turn, req, round, resp, nil, nil, false)
-			}
-			msgs = append(msgs, ChatMessage{
-				Role: "assistant", Content: resp.TextContent(),
-				ReasoningContent: resp.ReplayReasoning(),
-			})
-			feedback, _ := marshalCompact(map[string]any{
-				"error": "tool_call_required", "sent": false, "detail": protocolError,
-				"instruction": "没有消息发出。必须使用完整的 API tool_calls、唯一非空 id 和 function 类型，arguments 为 JSON 对象；不要在 content 中模拟调用。发言用 send_message，暂停用 finish({})。分析、草稿不得放入发送正文。",
-			})
-			msgs = append(msgs, ChatMessage{Role: "user", Content: feedback})
-			m.conversation.messages = msgs
-			m.publishInspection("working", msgs, defs)
-			m.events.Record(turn.ChatType, turn.ChatID, KindError, "tool_call_required: 普通输出未发送")
-			if protocolFailures >= 3 {
-				inspectionErr = errors.New("连续三次工具调用协议错误")
-				return
-			}
-			continue
-		}
-		protocolFailures = 0
-		if !counted {
-			for _, call := range calls {
-				if call.Function.Name != "finish" {
-					m.conversation.wakes++
-					counted = true
-					break
-				}
-			}
-		}
-
-		msgs = append(msgs, ChatMessage{
-			Role: "assistant", Content: resp.TextContent(), ToolCalls: calls,
-			// 思考模式 + tools：该字段必须随消息回传，否则下一次请求 400。
-			ReasoningContent: resp.ReplayReasoning(),
-		})
-		finished := false
-		m.setInspectionPhase("tools", round, "", "", "")
-		type toolOutcome struct {
-			executed bool
-			id       string
-			result   string
-		}
-		// 同轮多工具并发执行、按调用顺序回填（结果顺序=tool_calls 顺序）。
-		outcomes := make([]toolOutcome, len(calls))
-		var wg sync.WaitGroup
-		for i, call := range calls {
-			if call.Function.Name == "finish" {
-				result := "{}"
-				if _, err := validateToolArguments(Tool{Name: "finish", Parameters: objectParams(nil, nil)}, call.Function.Arguments); err != nil {
-					result = toolErrorJSON(err)
-				} else {
-					finished = true
-				}
-				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: result}
-				continue
-			}
-			wg.Add(1)
-			go func(i int, call ToolCall) {
-				defer wg.Done()
-				slog.Info("工具调用", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
-					"tool", call.Function.Name, "args", call.Function.Arguments)
-				m.events.Record(turn.ChatType, turn.ChatID, KindToolCall, call.Function.Name+" "+call.Function.Arguments)
-				result, toolErr := m.execToolCall(toolCtx, tools, call)
-				if toolErr != nil {
-					slog.Info("工具执行失败", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round,
-						"tool", call.Function.Name, "err", toolErr)
-					m.events.Record(turn.ChatType, turn.ChatID, KindToolResult,
-						fmt.Sprintf("%s: %s", call.Function.Name, toolErr))
-					result = toolErrorJSON(toolErr)
-				}
-				outcomes[i] = toolOutcome{executed: true, id: call.ID, result: truncateToolResult(result)}
-			}(i, call)
-		}
-		wg.Wait()
-		var results []string
-		for _, oc := range outcomes {
-			if !oc.executed {
-				continue
-			}
-			results = append(results, oc.result)
-			msgs = append(msgs, ChatMessage{Role: "tool", Content: oc.result, ToolCallID: oc.id})
-		}
-		// P3-4 图片按需上传：本轮工具（view_message_images）申请查看的图片，
-		// 在工具执行完当轮追加为一条 user 多模态消息（下一轮 LLM 请求即可见），
-		// 随后清空；同轮工具均已完成，后续由账号级 worker 串行读取。
-		if len(turn.pendingImages) > 0 {
-			parts := make([]ContentPart, 0, len(turn.pendingImages)+1)
-			parts = append(parts, ContentPart{Type: "text", Text: "以下图片来自上一轮工具结果（查询自动附带或你主动查看）"})
-			for _, du := range turn.pendingImages {
-				parts = append(parts, imagePart(du))
-			}
-			msgs = append(msgs, ChatMessage{Role: "user", Content: parts})
-			turn.pendingImages = nil
-		}
-		if cfg.Debug {
-			m.dumpDebug(turn, req, round, resp, results, nil, false)
-		}
-		m.conversation.messages = msgs
-		m.publishInspection("working", msgs, defs)
-		if finished {
-			m.events.Record(turn.ChatType, turn.ChatID, KindFinish, "结束思考")
-			slog.Info("结束思考", "chat_type", turn.ChatType, "chat_id", turn.ChatID, "round", round)
-			return
-		}
-	}
-
-	m.events.Record(turn.ChatType, turn.ChatID, KindError, "轮数上限")
-	inspectionErr = errors.New("轮数上限")
-	slog.Warn("思考轮数达到上限，强制结束本轮",
-		"chat_type", turn.ChatType, "chat_id", turn.ChatID, "max_tool_rounds", maxRounds)
-}
-
-// execToolCall 执行一次工具调用：普通调用同步执行返回结果；Asyncable 工具
-// 带 {"_async":true,...} 时转入 TaskManager 后台执行，立即返回任务回执
-// （结果完成经 deliverTaskResult 唤醒投递，不阻塞本 turn，spec §2.5 方案 B）。
-// 未知工具 / Run 缺失 / 执行失败返回 error，由调用方包装成 {"error": ...} 回填。
-func (m *Manager) execToolCall(ctx *ToolContext, tools []Tool, call ToolCall) (string, error) {
-	var tool *Tool
-	for i := range tools {
-		if tools[i].Name == call.Function.Name {
-			tool = &tools[i]
-			break
-		}
-	}
-	if tool == nil {
-		return "", fmt.Errorf("未知工具 %q", call.Function.Name)
-	}
-	if tool.Run == nil {
-		return "", fmt.Errorf("工具 %q 不可执行", call.Function.Name)
-	}
-	if asyncRequested(json.RawMessage(call.Function.Arguments)) && !tool.Asyncable {
-		return "", fmt.Errorf("工具 %q 不支持 _async 后台执行", tool.Name)
-	}
-	args, err := validateToolArguments(*tool, call.Function.Arguments)
-	if err != nil {
-		return "", err
-	}
-	call.Function.Arguments = string(args)
-	if asyncRequested(json.RawMessage(call.Function.Arguments)) {
-		if !tool.Asyncable {
-			return "", fmt.Errorf("工具 %q 不支持 _async 后台执行", tool.Name)
-		}
-		if ctx.Turn == nil {
-			return "", fmt.Errorf("无会话上下文，无法后台执行 %q", tool.Name)
-		}
-		args := stripAsyncKey(json.RawMessage(call.Function.Arguments))
-		id := m.tasks.Start(BackgroundTask{
-			Tool:      tool.Name,
-			ArgsBrief: truncateRunes(args, 200),
-			ChatType:  ctx.Turn.ChatType,
-			ChatID:    ctx.Turn.ChatID,
-			SelfID:    ctx.Turn.SelfID,
-		}, func(context.Context) (string, error) {
-			return tool.Run(json.RawMessage(args))
-		})
-		return marshalCompact(map[string]any{
-			"task_id": id,
-			"status":  "started",
-			"note":    "后台执行中，完成后自动送达结果；task_list/task_get 可随时查看，task_cancel 可停止",
-		})
-	}
-	result, toolErr := tool.Run(json.RawMessage(call.Function.Arguments))
-	var need approvalNeeded
-	if errors.As(toolErr, &need) {
-		// 越界/危险操作 → 管理员审批（spec 权限模型）：登记审批单、QQ 通知
-		// 管理员，当轮返回回执；管理员「同意 <id>」后以 Approved ctx 重跑并
-		// 投递结果，「拒绝」投递拒绝回执。不阻塞本 turn。
-		if ctx.Approvals == nil {
-			return "", fmt.Errorf("%s（审批通道不可用）", need.Error())
-		}
-		if ctx.Turn == nil {
-			return "", fmt.Errorf("无会话上下文，无法发起审批")
-		}
-		id, reqErr := ctx.Approvals.Request(Approval{
-			Tool:     tool.Name,
-			Args:     call.Function.Arguments,
-			Reason:   need.reason,
-			ChatType: ctx.Turn.ChatType,
-			ChatID:   ctx.Turn.ChatID,
-			SelfID:   ctx.Turn.SelfID,
-			run: func(bool) (string, error) {
-				c2 := *ctx
-				c2.Approved = true
-				return tool.Run(json.RawMessage(call.Function.Arguments))
-			},
-		})
-		if reqErr != nil {
-			return "", fmt.Errorf("发起审批失败: %w", reqErr)
-		}
-		return marshalCompact(map[string]any{
-			"approval_id": id,
-			"status":      "pending",
-			"note":        "已请求管理员确认，管理员回复「同意 <id>」后自动执行并送达结果；期间你可以继续其他工作",
-		})
-	}
-	return result, toolErr
-}
-
-// asyncRequested 参数顶层是否带 "_async": true（保留键，仅在顶层生效）。
-func asyncRequested(args json.RawMessage) bool {
-	if len(args) == 0 {
-		return false
-	}
-	var peek struct {
-		Async bool `json:"_async"`
-	}
-	if json.Unmarshal(args, &peek) != nil {
-		return false
-	}
-	return peek.Async
-}
-
-// stripAsyncKey 剥离顶层 _async 键；后台任务的 Run 不应看到该保留键。
-func stripAsyncKey(args json.RawMessage) string {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(args, &m); err != nil || m == nil {
-		return string(args)
-	}
-	delete(m, "_async")
-	out, err := json.Marshal(m)
-	if err != nil {
-		return string(args)
-	}
-	return string(out)
-}
-
-// toolErrorJSON 工具错误的标准回填形态。
-func toolErrorJSON(err error) string {
-	data, mErr := json.Marshal(map[string]string{"error": err.Error()})
-	if mErr != nil {
-		return `{"error":"工具执行失败"}`
-	}
-	return string(data)
+	inspectionErr = loop.Run(ctx, turn)
+	inspectionDefs = driver.defs
 }
 
 // loadMood 读取情绪状态；文件缺失/损坏视为无情绪。
@@ -867,4 +618,4 @@ func (m *Manager) dumpDebug(turn *Turn, req ChatRequest, round int, resp *ChatRe
 }
 
 // llmRequestTimeout 单次 LLM 请求超时（defaultNewManager 构造客户端用同一值）。
-const llmRequestTimeout = 120 * time.Second
+const llmRequestTimeout = model.DefaultRequestTimeout

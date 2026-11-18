@@ -119,6 +119,7 @@ func Diff(old, next *Config) Report {
 		hot("agent.self_wake", prev.SelfWake != cur.SelfWake)
 		hot("agent.history", !reflect.DeepEqual(prev.History, cur.History))
 		hot("agent.context", !reflect.DeepEqual(prev.Context, cur.Context))
+		hot("agent.sleep", !reflect.DeepEqual(prev.Sleep, cur.Sleep))
 	}
 	return r
 }

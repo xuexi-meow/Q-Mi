@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 )
+
+const eventLogCapacity = 500
 
 // TestEventLogRecordAfterOrdering Record 后 After 返回 ID 递增的完整快照；
 // After(after) 只返回 ID > after 的部分。
@@ -45,6 +48,91 @@ func TestEventLogRecordAfterOrdering(t *testing.T) {
 	}
 	if got := l.After(3); len(got) != 0 {
 		t.Errorf("After(3) 应为空, got %+v", got)
+	}
+}
+
+func TestEventLogRunUpdatesKeepIdentityAndAdvanceCursor(t *testing.T) {
+	log := NewEventLog()
+	runID := log.BeginRun("group", 77, 2, "主模型", "model-v1")
+
+	started, cursor, reset := log.WaitAfter(context.Background(), 0, 0)
+	if reset || len(started) != 1 || started[0].RunID != runID ||
+		started[0].State != "generating" || started[0].Candidate != "主模型" ||
+		started[0].Model != "model-v1" || cursor != started[0].Cursor {
+		t.Fatalf("started=%+v cursor=%d reset=%v", started, cursor, reset)
+	}
+
+	log.UpdateRun(runID, RunUpdate{
+		ReasoningDelta: "先看上下文",
+		ContentDelta:   "查一下",
+		ToolCalls:      []RunToolCall{{Index: 0, ID: "call-1", Name: "lookup", Arguments: `{"q":`}},
+		ReceivedBytes:  48,
+	})
+	updated, updatedCursor, reset := log.WaitAfter(context.Background(), cursor, 0)
+	if reset || len(updated) != 1 || updated[0].RunID != runID ||
+		updated[0].ID != started[0].ID || updatedCursor <= cursor ||
+		updated[0].Reasoning != "先看上下文" || updated[0].Content != "查一下" ||
+		len(updated[0].ToolCalls) != 1 || updated[0].ToolCalls[0].Arguments != `{"q":` ||
+		updated[0].ReceivedBytes != 48 {
+		t.Fatalf("updated=%+v cursor=%d reset=%v", updated, updatedCursor, reset)
+	}
+
+	log.UpdateRun(runID, RunUpdate{
+		ReasoningDelta: "完成",
+		ToolCalls:      []RunToolCall{{Index: 0, Name: "lookup", Arguments: `"猫"}`}},
+	})
+	log.EndRun(runID, "completed", "")
+	complete, finalCursor, _ := log.WaitAfter(context.Background(), updatedCursor, 0)
+	if len(complete) != 1 || complete[0].RunID != runID || complete[0].ID != started[0].ID ||
+		complete[0].Cursor != finalCursor || complete[0].State != "completed" ||
+		complete[0].Reasoning != "先看上下文完成" || complete[0].ToolCalls[0].Arguments != `{"q":"猫"}` {
+		t.Fatalf("complete=%+v cursor=%d", complete, finalCursor)
+	}
+	if got := log.After(started[0].ID - 1); len(got) != 1 || got[0].ID != started[0].ID {
+		t.Fatalf("legacy After must keep original event id semantics: %+v", got)
+	}
+}
+
+func TestEventLogWaitAfterWakesForUpdateAndHonorsCancellation(t *testing.T) {
+	log := NewEventLog()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan []Event, 1)
+	go func() {
+		events, _, _ := log.WaitAfter(ctx, 0, time.Second)
+		result <- events
+	}()
+	time.Sleep(10 * time.Millisecond)
+	log.Record("private", 88, KindOutput, "唤醒")
+	select {
+	case events := <-result:
+		if len(events) != 1 || events[0].Text != "唤醒" {
+			t.Fatalf("WaitAfter events = %+v", events)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("WaitAfter was not woken by a new event")
+	}
+
+	cancelCtx, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	start := time.Now()
+	_, _, _ = log.WaitAfter(cancelCtx, log.Cursor(), time.Second)
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("WaitAfter did not return promptly after cancellation")
+	}
+}
+
+func TestEventLogWaitAfterSignalsResetOnRingOverwrite(t *testing.T) {
+	log := NewEventLog()
+	for i := 0; i < eventLogCapacity; i++ {
+		log.Record("", 0, KindOutput, "old")
+	}
+	_, _, _ = log.WaitAfter(context.Background(), 0, 0)
+	log.Record("", 0, KindOutput, "new")
+
+	events, current, reset := log.WaitAfter(context.Background(), 0, 0)
+	if !reset || len(events) != eventLogCapacity || current != eventLogCapacity+1 {
+		t.Fatalf("events=%d cursor=%d reset=%v", len(events), current, reset)
 	}
 }
 
@@ -113,6 +201,23 @@ func TestEventsAfterNilSafe(t *testing.T) {
 
 	if evs := EventsAfter(0); len(evs) != 0 {
 		t.Errorf("manager 为 nil 时 EventsAfter 应返回空, got %+v", evs)
+	}
+}
+
+func TestEventsWaitAfterNilManagerIsEmpty(t *testing.T) {
+	managerMu.Lock()
+	saved, savedInited := manager, managerInited
+	manager, managerInited = nil, true
+	managerMu.Unlock()
+	t.Cleanup(func() {
+		managerMu.Lock()
+		manager, managerInited = saved, savedInited
+		managerMu.Unlock()
+	})
+
+	events, cursor, reset := EventsWaitAfter(context.Background(), 0, time.Second)
+	if len(events) != 0 || cursor != 0 || reset {
+		t.Fatalf("EventsWaitAfter without manager = (%+v, %d, %v)", events, cursor, reset)
 	}
 }
 
@@ -296,7 +401,7 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 
 	evs := m.events.After(0)
 	kinds := kindsOf(evs)
-	want := []string{KindTurnStart, KindUsage, KindReasoning, KindOutput, KindToolCall, KindToolResult, KindUsage, KindFinish}
+	want := []string{KindTurnStart, KindModelStream, KindUsage, KindReasoning, KindOutput, KindToolCall, KindToolResult, KindModelStream, KindUsage, KindFinish}
 	if !kindsEqual(kinds, want) {
 		t.Fatalf("事件 kind 序列 = %v, want %v", kinds, want)
 	}
@@ -306,23 +411,23 @@ func TestHandleTurnRecordsThinkingChainEvents(t *testing.T) {
 	if evs[0].Text != "测试用户: 在吗" {
 		t.Errorf("turn_start 摘要 = %q, want 「测试用户: 在吗」", evs[0].Text)
 	}
-	if evs[1].Kind != KindUsage || !strings.HasPrefix(evs[1].Text, "hit=0 miss=0 out=0") {
-		t.Errorf("usage 事件 = %q, want hit=0 miss=0 out=0 前缀", evs[1].Text)
+	if evs[2].Kind != KindUsage || !strings.HasPrefix(evs[2].Text, "hit=0 miss=0 out=0") {
+		t.Errorf("usage 事件 = %q, want hit=0 miss=0 out=0 前缀", evs[2].Text)
 	}
-	if !strings.Contains(evs[1].Text, "candidate=") {
-		t.Errorf("usage 事件应带候选名: %q", evs[1].Text)
+	if !strings.Contains(evs[2].Text, "candidate=") {
+		t.Errorf("usage 事件应带候选名: %q", evs[2].Text)
 	}
-	if evs[2].Text != "先查查记录" {
-		t.Errorf("reasoning 事件文本 = %q, want 全文", evs[2].Text)
+	if evs[3].Text != "先查查记录" {
+		t.Errorf("reasoning 事件文本 = %q, want 全文", evs[3].Text)
 	}
-	if evs[3].Text != "让我想想" {
-		t.Errorf("output 事件文本 = %q, want 全文", evs[3].Text)
+	if evs[4].Text != "让我想想" {
+		t.Errorf("output 事件文本 = %q, want 全文", evs[4].Text)
 	}
-	if !strings.Contains(evs[4].Text, "no_such_tool") || !strings.Contains(evs[4].Text, "{}") {
-		t.Errorf("tool_call 事件 = %q, want 含工具名与参数", evs[4].Text)
+	if !strings.Contains(evs[5].Text, "no_such_tool") || !strings.Contains(evs[5].Text, "{}") {
+		t.Errorf("tool_call 事件 = %q, want 含工具名与参数", evs[5].Text)
 	}
-	if !strings.Contains(evs[5].Text, "no_such_tool") || !strings.Contains(evs[5].Text, "未知工具") {
-		t.Errorf("tool_result 事件 = %q, want 含工具名与错误简述", evs[5].Text)
+	if !strings.Contains(evs[6].Text, "no_such_tool") || !strings.Contains(evs[6].Text, "未知工具") {
+		t.Errorf("tool_result 事件 = %q, want 含工具名与错误简述", evs[6].Text)
 	}
 }
 

@@ -600,6 +600,48 @@ func TestAPIEvents(t *testing.T) {
 	}
 }
 
+func TestAPIEventsWaitValidatesCursorTimeoutAndAuthentication(t *testing.T) {
+	srv := startTestServer(t, "tok")
+	base := "http://" + srv.Addr
+
+	resp, _ := get(t, base+"/api/events/wait?after=0&timeout_ms=0", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized wait status = %d, want 401", resp.StatusCode)
+	}
+
+	resp, body := get(t, base+"/api/events/wait?after=0&timeout_ms=0", "tok")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("wait status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var snapshot struct {
+		Events []json.RawMessage `json:"events"`
+		Cursor uint64            `json:"cursor"`
+		Reset  bool              `json:"reset"`
+	}
+	if err := json.Unmarshal([]byte(body), &snapshot); err != nil {
+		t.Fatalf("decode wait response: %v (%s)", err, body)
+	}
+	if snapshot.Events == nil || snapshot.Cursor != 0 || snapshot.Reset {
+		t.Fatalf("wait snapshot = %+v, want empty non-null snapshot", snapshot)
+	}
+
+	for _, query := range []string{
+		"?after=-1&timeout_ms=0",
+		"?after=0&timeout_ms=-1",
+		"?after=0&timeout_ms=30001",
+	} {
+		resp, body := get(t, base+"/api/events/wait"+query, "tok")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("wait%s status = %d, want 400: %s", query, resp.StatusCode, body)
+		}
+	}
+
+	resp, body = get(t, base+"/api/events?after=abc", "tok")
+	if resp.StatusCode != http.StatusOK || body != "[]\n" {
+		t.Fatalf("legacy endpoint changed: %d %q", resp.StatusCode, body)
+	}
+}
+
 // ================= W3 agent 控制页（notes/mood/timers/wake/file） =================
 
 // recBuilder 记录 Build 调用的桩 builder（webui 测试构造真实 Manager 用）。
